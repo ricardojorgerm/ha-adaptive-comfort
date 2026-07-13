@@ -62,4 +62,4 @@ Use this after installing via HACS or manual copy on your Home Assistant instanc
 logger: custom_components.adaptive_comfort
 ```
 
-Report issues at https://github.com/ricmacas/ha-adaptive-comfort/issues with diagnostics attached.
+Report issues at https://github.com/ricardojorgerm/ha-adaptive-comfort/issues with diagnostics attached.

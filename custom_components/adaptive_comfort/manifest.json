@@ -1,13 +1,13 @@
 {
   "domain": "adaptive_comfort",
   "name": "Adaptive Comfort",
-  "codeowners": ["@ricmacas"],
+  "codeowners": ["@ricardojorgerm"],
   "config_flow": true,
   "dependencies": [],
-  "documentation": "https://github.com/ricmacas/ha-adaptive-comfort",
+  "documentation": "https://github.com/ricardojorgerm/ha-adaptive-comfort",
   "integration_type": "hub",
   "iot_class": "calculated",
-  "issue_tracker": "https://github.com/ricmacas/ha-adaptive-comfort/issues",
+  "issue_tracker": "https://github.com/ricardojorgerm/ha-adaptive-comfort/issues",
   "requirements": [],
   "version": "0.1.0"
 }
