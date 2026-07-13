@@ -1,0 +1,192 @@
+"""Power pipeline: load composition, baseline, event deltas, shedding math.
+
+The house only has a meter-side (grid) power sensor. The AC draw is
+inferred by combining a time-of-day baseline (learned while all heads
+are off) with robust step deltas measured when heads switch. An optional
+battery sensor lets consumption exceed the grid reading while discharging.
+"""
+
+from __future__ import annotations
+
+from collections import deque
+from statistics import median
+
+BASELINE_SLOTS = 48  # 30-minute time-of-day slots
+EVENT_PRE_S = (-240.0, -15.0)
+EVENT_POST_S = (60.0, 240.0)
+MIN_PLAUSIBLE_STEP_W = 60.0
+MAX_PLAUSIBLE_STEP_W = 4000.0
+
+
+def compose_load(
+    p_grid: float,
+    p_battery: float | None = None,
+    battery_positive_discharging: bool = True,
+    known_loads: list[float] | None = None,
+) -> float:
+    """Total house load attributable to unmonitored devices (incl. the AC)."""
+    load = p_grid
+    if p_battery is not None:
+        discharge = p_battery if battery_positive_discharging else -p_battery
+        load += max(0.0, discharge)
+    for p in known_loads or []:
+        load -= p
+    return max(0.0, load)
+
+
+class BaselineModel:
+    """EWMA baseline of non-AC load per 30-min time-of-day slot."""
+
+    def __init__(self, alpha: float = 0.1) -> None:
+        self.alpha = alpha
+        self.slots: list[float | None] = [None] * BASELINE_SLOTS
+
+    @staticmethod
+    def slot_for(local_hour: float) -> int:
+        return int(local_hour * 2.0) % BASELINE_SLOTS
+
+    def update(self, local_hour: float, p_load: float) -> None:
+        """Feed only while all heads have been off >= 10 min (caller gates)."""
+        idx = self.slot_for(local_hour)
+        cur = self.slots[idx]
+        self.slots[idx] = p_load if cur is None else cur + self.alpha * (p_load - cur)
+
+    def value(self, local_hour: float) -> float | None:
+        idx = self.slot_for(local_hour)
+        if self.slots[idx] is not None:
+            return self.slots[idx]
+        known = [s for s in self.slots if s is not None]
+        return median(known) if known else None
+
+    def to_dict(self) -> dict:
+        return {"slots": list(self.slots)}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> BaselineModel:
+        model = cls()
+        slots = data.get("slots") or []
+        if len(slots) == BASELINE_SLOTS:
+            model.slots = [None if s is None else float(s) for s in slots]
+        return model
+
+
+def measure_step(pre_samples: list[float], post_samples: list[float]) -> float | None:
+    """Robust load step across a head on/off event (medians of both windows)."""
+    if len(pre_samples) < 3 or len(post_samples) < 3:
+        return None
+    return median(post_samples) - median(pre_samples)
+
+
+class DrawEstimator:
+    """Robust per-(zone, mode) electrical-draw statistics from step events.
+
+    Mirrored heads switch together, so a measured step is the combined
+    zone draw; callers divide by the head count for per-head figures.
+    """
+
+    def __init__(self, max_events: int = 50) -> None:
+        self.events: dict[str, deque[float]] = {}
+
+    @staticmethod
+    def _key(zone_id: str, mode: str) -> str:
+        return f"{zone_id}|{mode}"
+
+    def add_event(self, zone_id: str, mode: str, delta_w: float) -> bool:
+        """Add one |step| observation; returns False if rejected as outlier."""
+        mag = abs(delta_w)
+        if not (MIN_PLAUSIBLE_STEP_W <= mag <= MAX_PLAUSIBLE_STEP_W):
+            return False
+        key = self._key(zone_id, mode)
+        bucket = self.events.setdefault(key, deque(maxlen=50))
+        if len(bucket) >= 5:
+            med = median(bucket)
+            mad = median([abs(x - med) for x in bucket])
+            # MAD can be zero for a stable draw; keep a relative floor so
+            # gross outliers (another appliance switching) are still rejected.
+            threshold = max(5.0 * mad, 0.3 * med, 150.0)
+            if abs(mag - med) > threshold:
+                return False
+        bucket.append(mag)
+        return True
+
+    def draw_w(self, zone_id: str, mode: str) -> float | None:
+        bucket = self.events.get(self._key(zone_id, mode))
+        if bucket:
+            return median(bucket)
+        # Fall back to the other mode's draw for the same zone.
+        for key, other in self.events.items():
+            if key.startswith(f"{zone_id}|") and other:
+                return median(other)
+        return None
+
+    def to_dict(self) -> dict:
+        return {"events": {k: list(v) for k, v in self.events.items()}}
+
+    @classmethod
+    def from_dict(cls, data: dict) -> DrawEstimator:
+        est = cls()
+        for key, values in data.get("events", {}).items():
+            est.events[key] = deque([float(v) for v in values], maxlen=50)
+        return est
+
+
+def estimate_ac_power(
+    p_load: float,
+    baseline: float | None,
+    p_max_plausible: float = 6000.0,
+) -> float | None:
+    """Continuous AC power estimate while any head is on."""
+    if baseline is None:
+        return None
+    return min(max(0.0, p_load - baseline), p_max_plausible)
+
+
+def allocate_power(
+    p_ac_w: float,
+    zones: list[tuple[str, float, float]],
+) -> dict[str, float]:
+    """Split total AC power across active zones.
+
+    zones: (zone_id, learned_draw_w, modulation_proxy) for each active zone,
+    where modulation_proxy is |T_set - T_in| clamped to a small floor so a
+    zone at setpoint still gets standby share.
+    """
+    weights = {z: max(draw, 1.0) * max(mod, 0.2) for z, draw, mod in zones}
+    total = sum(weights.values())
+    if total <= 0:
+        return dict.fromkeys(weights, 0.0)
+    return {z: p_ac_w * w / total for z, w in weights.items()}
+
+
+# -- contracted-power shedding ------------------------------------------------
+
+
+def shed_needed(
+    p_grid: float | None,
+    limit_w: float,
+    start_pct: float,
+    over_since_s: float | None,
+    sustained_s: float = 15.0,
+) -> bool:
+    """True when the grid draw has exceeded the shed threshold long enough."""
+    if p_grid is None:
+        return False
+    if p_grid <= start_pct * limit_w:
+        return False
+    return over_since_s is not None and over_since_s >= sustained_s
+
+
+def restore_allowed(
+    p_grid: float | None,
+    limit_w: float,
+    restore_pct: float,
+    zone_draw_w: float | None,
+    margin_w: float = 100.0,
+) -> bool:
+    """True when there is headroom to restore a zone with the given draw."""
+    if p_grid is None:
+        return False
+    if p_grid >= restore_pct * limit_w:
+        return False
+    draw = zone_draw_w if zone_draw_w is not None else 800.0  # conservative default
+    return (limit_w - p_grid) > (draw + margin_w)

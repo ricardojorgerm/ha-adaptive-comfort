@@ -1,0 +1,216 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "House setup",
+        "description": "Configure the whole-home controller. Only the grid power sensor is required; everything else improves the model when available.",
+        "data": {
+          "grid_power_entity": "Grid power sensor (W, meter side)",
+          "battery_power_entity": "Battery power sensor (optional)",
+          "battery_positive_discharging": "Battery sensor is positive when discharging",
+          "known_load_entities": "Known load power sensors (optional)",
+          "outdoor_temp_entity": "Outdoor temperature sensor (optional)",
+          "weather_entity": "Weather entity (optional)",
+          "presence_entity": "House presence entity (optional)",
+          "multisplit": "System is a multi-split (one outdoor unit)",
+          "contracted_kva": "Contracted power (kVA)",
+          "power_factor": "Power factor",
+          "default_target": "Default target temperature"
+        },
+        "data_description": {
+          "grid_power_entity": "Real-time whole-house power at the meter; used for AC power inference and load shedding.",
+          "known_load_entities": "Monitored appliances subtracted from the load before disaggregating the AC.",
+          "contracted_kva": "3.45 kVA converts to a 3450 W limit at power factor 1.0."
+        }
+      },
+      "reconfigure": {
+        "title": "House setup",
+        "data": {
+          "grid_power_entity": "Grid power sensor (W, meter side)",
+          "battery_power_entity": "Battery power sensor (optional)",
+          "battery_positive_discharging": "Battery sensor is positive when discharging",
+          "known_load_entities": "Known load power sensors (optional)",
+          "outdoor_temp_entity": "Outdoor temperature sensor (optional)",
+          "weather_entity": "Weather entity (optional)",
+          "presence_entity": "House presence entity (optional)",
+          "multisplit": "System is a multi-split (one outdoor unit)",
+          "contracted_kva": "Contracted power (kVA)",
+          "power_factor": "Power factor",
+          "default_target": "Default target temperature"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "Adaptive Comfort is already configured. Add zones from the integration page.",
+      "reconfigure_successful": "Configuration updated."
+    }
+  },
+  "config_subentries": {
+    "zone": {
+      "title": "Climate zone",
+      "initiate_flow": {
+        "user": "Add climate zone",
+        "reconfigure": "Reconfigure climate zone"
+      },
+      "entry_type": "Climate zone",
+      "step": {
+        "user": {
+          "title": "Climate zone",
+          "description": "A zone groups one or more AC heads that are commanded identically. Each head sits in its own room; you will enter each room's area next (areas are modeled per room, never summed).",
+          "data": {
+            "name": "Zone name",
+            "climate_entities": "AC climate entities (heads)",
+            "ceiling_height": "Ceiling height",
+            "temp_sensor": "Room temperature sensor (optional)",
+            "humidity_sensor": "Room humidity sensor (optional)",
+            "door_sensor": "Door sensor (optional)",
+            "presence_sensor": "Presence / motion sensor (optional)"
+          },
+          "data_description": {
+            "temp_sensor": "External reference in the room hosting the first head; used to learn each head's internal-sensor drift."
+          }
+        },
+        "areas": {
+          "title": "Room areas",
+          "description": "Floor area of each room, one per selected head ({count} rooms). The zone is modeled as small rooms occurring in multiple, not one large room.",
+          "data": {
+            "area_1": "Room 1 area",
+            "area_2": "Room 2 area",
+            "area_3": "Room 3 area",
+            "area_4": "Room 4 area",
+            "area_5": "Room 5 area",
+            "area_6": "Room 6 area"
+          }
+        },
+        "reconfigure": {
+          "title": "Climate zone",
+          "data": {
+            "name": "Zone name",
+            "climate_entities": "AC climate entities (heads)",
+            "ceiling_height": "Ceiling height",
+            "temp_sensor": "Room temperature sensor (optional)",
+            "humidity_sensor": "Room humidity sensor (optional)",
+            "door_sensor": "Door sensor (optional)",
+            "presence_sensor": "Presence / motion sensor (optional)"
+          }
+        },
+        "reconfigure_areas": {
+          "title": "Room areas",
+          "description": "Floor area of each room, one per selected head ({count} rooms).",
+          "data": {
+            "area_1": "Room 1 area",
+            "area_2": "Room 2 area",
+            "area_3": "Room 3 area",
+            "area_4": "Room 4 area",
+            "area_5": "Room 5 area",
+            "area_6": "Room 6 area"
+          }
+        }
+      },
+      "abort": {
+        "reconfigure_successful": "Zone updated."
+      }
+    },
+    "unconditioned_room": {
+      "title": "Unconditioned room",
+      "initiate_flow": {
+        "user": "Add unconditioned room",
+        "reconfigure": "Reconfigure unconditioned room"
+      },
+      "entry_type": "Unconditioned room",
+      "step": {
+        "user": {
+          "title": "Unconditioned room",
+          "description": "Rooms without AC, used for whole-house volume, humidity accounting, and (with a sensor) extra indoor evidence.",
+          "data": {
+            "name": "Room name",
+            "area_m2": "Floor area",
+            "room_type": "Room type",
+            "ceiling_height": "Ceiling height",
+            "temp_sensor": "Temperature sensor (optional)"
+          }
+        },
+        "reconfigure": {
+          "title": "Unconditioned room",
+          "data": {
+            "name": "Room name",
+            "area_m2": "Floor area",
+            "room_type": "Room type",
+            "ceiling_height": "Ceiling height",
+            "temp_sensor": "Temperature sensor (optional)"
+          }
+        }
+      },
+      "abort": {
+        "reconfigure_successful": "Room updated."
+      }
+    }
+  },
+  "selector": {
+    "room_type": {
+      "options": {
+        "regular": "Regular room",
+        "wet": "Wet room (bathroom / laundry)"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "house_load": { "name": "House load" },
+      "ac_power_estimate": { "name": "Estimated AC power" },
+      "power_headroom": { "name": "Power headroom" },
+      "outdoor_effective": { "name": "Outdoor temperature (effective)" },
+      "outdoor_running_mean": { "name": "Outdoor running mean (7 d)" },
+      "dominant_mode": {
+        "name": "Dominant mode",
+        "state": { "off": "Off", "heat": "Heat", "cool": "Cool" }
+      },
+      "free_float_bias": { "name": "Free-float bias" },
+      "warm_excess": { "name": "Predicted warm excess" },
+      "cold_deficit": { "name": "Predicted cold deficit" },
+      "total_sensible": { "name": "Total sensible power" },
+      "total_latent": { "name": "Total latent power" },
+      "house_cop": { "name": "House COP" },
+      "model_confidence": { "name": "Model confidence" },
+      "zone_temperature": { "name": "Temperature (corrected)" },
+      "predicted_60m": { "name": "Predicted temperature +60 min" },
+      "k_exchange": { "name": "Exchange constant k" },
+      "ach": { "name": "Air changes per hour" },
+      "airflow": { "name": "Air-exchange flow" },
+      "ua": { "name": "UA (heat loss coefficient)" },
+      "c_eff": { "name": "Effective capacitance" },
+      "furniture_factor": { "name": "Furniture factor" },
+      "zone_cop": { "name": "COP" },
+      "sensible_power": { "name": "Sensible power" },
+      "latent_power": { "name": "Latent power" },
+      "drift_offset": { "name": "Sensor drift offset" },
+      "zone_confidence": { "name": "Fit confidence" },
+      "allocated_power": { "name": "Allocated AC power" }
+    },
+    "binary_sensor": {
+      "shedding_active": { "name": "Shedding active" },
+      "conditioning_active": { "name": "Conditioning" },
+      "zone_shed": { "name": "Shed" },
+      "window_suggestion": { "name": "Open windows suggested" },
+      "zone_window_suggestion": { "name": "Open window suggested" }
+    },
+    "number": {
+      "band": { "name": "Comfort band (±)" },
+      "min_on": { "name": "Minimum runtime" },
+      "min_off": { "name": "Minimum off time" },
+      "contracted_kva": { "name": "Contracted power" },
+      "shed_start": { "name": "Shed start threshold" },
+      "shed_restore": { "name": "Shed restore threshold" },
+      "adaptive_blend": { "name": "Seasonal adaptation weight" },
+      "comfort_offset": { "name": "Comfort offset" }
+    },
+    "switch": {
+      "coordination": { "name": "Multi-split coordination" },
+      "presence_adaptation": { "name": "Presence adaptation" },
+      "shedding_enabled": { "name": "Power shedding" },
+      "fan_assist": { "name": "Fan assist (opposite-demand zones)" },
+      "window_suggest": { "name": "Suggest opening windows" },
+      "zone_enabled": { "name": "Zone enabled" }
+    }
+  }
+}

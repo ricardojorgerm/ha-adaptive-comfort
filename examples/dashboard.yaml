@@ -1,0 +1,112 @@
+# Lovelace examples for Adaptive Comfort
+# Replace entity IDs with yours from Settings → Devices → Adaptive Comfort.
+
+# --- Main control card ---
+type: vertical-stack
+cards:
+  - type: thermostat
+    entity: climate.adaptive_comfort_house
+    name: House climate
+
+  - type: glance
+    title: Power & mode
+    entities:
+      - entity: sensor.adaptive_comfort_house_load
+        name: House load
+      - entity: sensor.adaptive_comfort_ac_power_estimate
+        name: AC estimate
+      - entity: sensor.adaptive_comfort_power_headroom
+        name: Headroom
+      - entity: sensor.adaptive_comfort_dominant_mode
+        name: Mode
+
+  - type: entities
+    title: Alerts
+    entities:
+      - entity: binary_sensor.adaptive_comfort_shedding_active
+      - entity: binary_sensor.adaptive_comfort_window_suggestion
+
+---
+# --- Zone diagnostics (per zone device) ---
+type: entities
+title: Bedroom diagnostics
+show_header_toggle: false
+entities:
+  - entity: sensor.adaptive_comfort_bedroom_zone_temperature
+    name: Corrected temp
+  - entity: sensor.adaptive_comfort_bedroom_predicted_60m
+    name: Predicted +60 min
+  - entity: sensor.adaptive_comfort_bedroom_k_exchange
+    name: Exchange k
+  - entity: sensor.adaptive_comfort_bedroom_ach
+    name: ACH
+  - entity: sensor.adaptive_comfort_bedroom_zone_cop
+    name: COP
+  - entity: sensor.adaptive_comfort_bedroom_zone_confidence
+    name: Fit confidence
+  - entity: binary_sensor.adaptive_comfort_bedroom_conditioning_active
+  - entity: binary_sensor.adaptive_comfort_bedroom_zone_window_suggestion
+
+---
+# --- History graph ---
+type: history-graph
+title: Comfort & power (24 h)
+hours_to_show: 24
+entities:
+  - entity: climate.adaptive_comfort_house
+    attribute: current_temperature
+  - entity: sensor.adaptive_comfort_outdoor_effective
+  - entity: sensor.adaptive_comfort_house_load
+  - entity: sensor.adaptive_comfort_ac_power_estimate
+
+---
+# --- Gauge: headroom vs contracted limit ---
+type: gauge
+entity: sensor.adaptive_comfort_power_headroom
+name: Power headroom
+min: 0
+max: 3500
+severity:
+  green: 500
+  yellow: 200
+  red: 0
+
+---
+# --- Markdown status panel (template card) ---
+type: markdown
+content: >
+  **Outdoor:** {{ states('sensor.adaptive_comfort_outdoor_effective') }} °C
+  ({{ state_attr('sensor.adaptive_comfort_outdoor_effective', 'source') }})
+
+  **7-day mean:** {{ states('sensor.adaptive_comfort_outdoor_running_mean') }} °C
+
+  **Mode:** {{ states('sensor.adaptive_comfort_dominant_mode') }}
+  ({{ state_attr('sensor.adaptive_comfort_dominant_mode', 'source') }})
+
+  **COP:** {{ states('sensor.adaptive_comfort_house_cop') }}
+
+  {% if is_state('binary_sensor.adaptive_comfort_window_suggestion', 'on') %}
+  🪟 Consider opening: {{ state_attr('binary_sensor.adaptive_comfort_window_suggestion', 'zones') | join(', ') }}
+  {% endif %}
+
+---
+# --- Automation: notify when open windows suggested ---
+# Add to automations.yaml or create via UI (paste trigger/condition/action):
+
+# alias: Adaptive Comfort — open windows
+# description: Notify when mechanical cooling is deferred in favour of ventilation
+# trigger:
+#   - platform: state
+#     entity_id: binary_sensor.adaptive_comfort_window_suggestion
+#     to: "on"
+# condition:
+#   - condition: state
+#     entity_id: switch.adaptive_comfort_window_suggest
+#     state: "on"
+# action:
+#   - service: notify.mobile_app_your_phone
+#     data:
+#       title: Cooler outside
+#       message: >-
+#         Open windows in {{ state_attr('binary_sensor.adaptive_comfort_window_suggestion', 'zones') | join(', ') }}.
+#         Mechanical cooling paused for 15 minutes.
