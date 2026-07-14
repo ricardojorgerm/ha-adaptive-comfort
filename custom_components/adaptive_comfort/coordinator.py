@@ -702,7 +702,7 @@ class AdaptiveComfortRuntime:
         earlier = zone.w_series.value_at(latest[0] - FIT_STEP_S) if latest else None
         if latest is None or earlier is None:
             return
-        dw_dt = (latest[1] - earlier[1]) / (FIT_STEP_S / 3600.0)
+        dw_dt = (latest[1] - earlier) / (FIT_STEP_S / 3600.0)
         w_out = self._outdoor_humidity_ratio()
         infiltration = 0.0
         if w_out is not None:
@@ -724,7 +724,7 @@ class AdaptiveComfortRuntime:
         earlier = zone.w_series.value_at(latest[0] - FIT_STEP_S) if latest else None
         if latest is None or earlier is None:
             return 0.0
-        dw_dt = (latest[1] - earlier[1]) / (FIT_STEP_S / 3600.0)
+        dw_dt = (latest[1] - earlier) / (FIT_STEP_S / 3600.0)
         w_out = self._outdoor_humidity_ratio()
         removed = psychro.moisture_removal_kg_h(
             zone.config.sensed_room.volume_m3,
