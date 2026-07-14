@@ -115,7 +115,9 @@ class Settings:
     shedding_enabled: bool = True
     multisplit: bool = True
     fan_assist: bool = True  # fan-only for opposite-demand zones on a multi-split
-    window_suggest: bool = False  # propose opening windows instead of cooling
+    # Delay mechanical cooling while a window would beat it (grace period).
+    # The ventilation suggestion itself is always reported regardless.
+    window_suggest: bool = False
     hvac_mode: str = MODE_AUTO
     preset: str = PRESET_NONE
     zone_offsets: dict[str, float] = field(default_factory=dict)

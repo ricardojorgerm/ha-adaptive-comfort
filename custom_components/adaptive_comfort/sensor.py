@@ -157,10 +157,17 @@ HOUSE_SENSORS: tuple[HouseSensorDescription, ...] = (
 )
 
 
-def _per_room_airflow(zone: ZoneRuntime, _r: AdaptiveComfortRuntime) -> dict:
-    k = zone.model.k(zone.door_open)
+def _k_exchange_attrs(zone: ZoneRuntime, _r: AdaptiveComfortRuntime) -> dict:
     return {
-        f"room_{i + 1}_m3h": round(k * room.volume_m3, 1)
+        "k_out_h-1": round(zone.model.k(zone.door_open), 3),
+        "k_mix_h-1": round(zone.model.k_mix(zone.door_open), 3),
+    }
+
+
+def _per_room_airflow(zone: ZoneRuntime, _r: AdaptiveComfortRuntime) -> dict:
+    k_out = zone.model.k(zone.door_open)
+    return {
+        f"room_{i + 1}_m3h": round(k_out * room.volume_m3, 1)
         for i, room in enumerate(zone.config.rooms)
     }
 
@@ -197,6 +204,15 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z, r: _round(z.model.k(z.door_open), 3),
+        attr_fn=_k_exchange_attrs,
+    ),
+    ZoneSensorDescription(
+        key="k_mix",
+        translation_key="k_mix",
+        native_unit_of_measurement="1/h",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: _round(z.model.k_mix(z.door_open), 3),
     ),
     ZoneSensorDescription(
         key="ach",
@@ -212,7 +228,7 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         native_unit_of_measurement="m³/h",
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda z, r: _round(z.model.k(z.door_open) * z.config.total_volume_m3, 1),
+        value_fn=lambda z, r: _round(z.model.airflow_m3h, 1),
         attr_fn=_per_room_airflow,
     ),
     ZoneSensorDescription(
@@ -221,7 +237,8 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         native_unit_of_measurement="W/K",
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda z, r: _round(0.34 * z.model.k(z.door_open) * z.config.total_volume_m3, 1),
+        value_fn=lambda z, r: _round(z.model.ua_w_per_k, 1),
+        attr_fn=lambda z, r: {"ua_mix_w_per_k": round(z.model.ua_mix_w_per_k, 1)},
     ),
     ZoneSensorDescription(
         key="c_eff",

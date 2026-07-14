@@ -5,6 +5,7 @@ from custom_components.adaptive_comfort.core.types import (
     MODE_AUTO,
     MODE_COOL,
     MODE_FAN,
+    MODE_HEAT,
     MODE_OFF,
     STATE_COOLING,
     ControllerState,
@@ -100,7 +101,7 @@ def test_wet_coil_tracked_from_head_state():
     assert state.zone_last_cool["bed"] == NOW
 
 
-def test_window_suggested_instead_of_cooling():
+def test_window_suggested_and_cooling_delayed_when_option_on():
     settings = Settings(hvac_mode=MODE_AUTO, window_suggest=True)
     zone = make_zone("bed", 25.5, occupied=True)
     snap = make_snapshot([zone], settings, t_out=18.0)
@@ -108,6 +109,15 @@ def test_window_suggested_instead_of_cooling():
     decision = controller.tick(snap, state)
     assert decision.window_suggestions == ["bed"]
     assert not any(c.hvac_mode == MODE_COOL for c in decision.commands)
+
+
+def test_window_suggested_but_cooling_proceeds_when_option_off():
+    # The advisory is always reported; the option only controls the delay.
+    zone = make_zone("bed", 25.5, occupied=True)
+    snap = make_snapshot([zone], Settings(hvac_mode=MODE_AUTO), t_out=18.0)
+    decision = controller.tick(snap, warmed_state([zone]))
+    assert decision.window_suggestions == ["bed"]
+    assert any(c.hvac_mode == MODE_COOL for c in decision.commands)
 
 
 def test_window_grace_expires_then_cools():
@@ -132,15 +142,29 @@ def test_window_not_suggested_without_presence():
     assert any(c.hvac_mode == MODE_COOL for c in decision.commands)
 
 
-def test_window_not_suggested_when_option_off_or_warm_outside():
+def test_window_not_suggested_when_outdoors_not_helpful():
     zone = make_zone("bed", 25.5, occupied=True)
-    # Option off (default): cool immediately.
-    snap = make_snapshot([zone], Settings(hvac_mode=MODE_AUTO), t_out=18.0)
-    decision = controller.tick(snap, warmed_state([zone]))
-    assert decision.window_suggestions == []
-    assert any(c.hvac_mode == MODE_COOL for c in decision.commands)
-    # Option on but outdoors not clearly colder.
+    # Outdoors not clearly colder than the room.
     settings = Settings(hvac_mode=MODE_AUTO, window_suggest=True)
     snap = make_snapshot([zone], settings, t_out=24.5)
     decision = controller.tick(snap, warmed_state([zone]))
     assert decision.window_suggestions == []
+    assert any(c.hvac_mode == MODE_COOL for c in decision.commands)
+
+
+def test_window_suggested_for_heating_when_outdoors_warmer():
+    settings = Settings(hvac_mode=MODE_HEAT, window_suggest=True)
+    zone = make_zone("bed", 18.0, occupied=True)
+    snap = make_snapshot([zone], settings, t_out=22.0)
+    state = warmed_state([zone])
+    decision = controller.tick(snap, state)
+    assert decision.window_suggestions == ["bed"]
+    assert not any(c.hvac_mode == MODE_HEAT for c in decision.commands)
+
+
+def test_window_suggested_for_heating_but_proceeds_when_option_off():
+    zone = make_zone("bed", 18.0, occupied=True)
+    snap = make_snapshot([zone], Settings(hvac_mode=MODE_HEAT), t_out=22.0)
+    decision = controller.tick(snap, warmed_state([zone]))
+    assert decision.window_suggestions == ["bed"]
+    assert any(c.hvac_mode == MODE_HEAT for c in decision.commands)

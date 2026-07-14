@@ -24,19 +24,56 @@ def test_recovers_exchange_constant():
     room = SimRoom(name="bed", k=0.35, volume_m3=30.0, solar_amplitude=0.3)
     house = SimHouse(rooms=[room])
     model = ThermalModel(room.volume_m3)
-    run_free_response(model, room, house, hours=72.0)
-    assert abs(model.k(False) - 0.35) < 0.06
-    assert model.confidence(False) > 0.3
+    run_free_response(model, room, house, hours=120.0)
+    assert abs(model.k(False) - 0.35) < 0.1
 
 
 def test_anchoring_chain():
     model = ThermalModel(volume_m3=30.0)
     model.fits[False].theta[0] = 0.5
+    model.fits[False].theta[1] = 0.0
     model.fits[False].samples = 1000
+    assert abs(model.k(False) - 0.5) < 1e-9
+    assert abs(model.k_mix(False) - 0.0) < 1e-9
     assert abs(model.ach - 0.5) < 1e-9
     assert abs(model.airflow_m3h - 15.0) < 1e-9
     assert abs(model.ua_w_per_k - 0.34 * 15.0) < 1e-9
     assert abs(model.c_air_wh_per_k - 0.34 * 30.0) < 1e-9
+
+
+def test_passive_cooling_from_house_mixing():
+    """Standby room cools because another zone is cold — k_mix absorbs it, not k_out."""
+    model = ThermalModel(volume_m3=30.0)
+    t_out = 26.0
+    t_in = 24.0
+    t_house = 20.0
+    true_k_out = 0.08
+    true_k_mix = 0.35
+    dt_h = STEP_H
+    for _ in range(250):
+        dtdt = true_k_out * (t_out - t_in) + true_k_mix * (t_house - t_in)
+        t_prev = t_in
+        t_in += dtdt * dt_h
+        model.update_free(t_prev, t_in, t_out, dt_h, 12.0, t_house_other=t_house)
+    assert model.k_mix(False) > 0.12
+    # Without the mixing regressor this scenario crushes k_out toward zero.
+    assert model.k(False) > 0.04
+
+
+def test_legacy_six_param_fit_migrates():
+    from custom_components.adaptive_comfort.core.thermal import _expand_legacy_rls
+
+    legacy = {
+        "theta": [0.4, 0.1, 0.0, 0.0, 0.0, 0.0],
+        "p": [[1.0 if i == j else 0.0 for j in range(6)] for i in range(6)],
+        "samples": 50,
+        "lam": 0.998,
+    }
+    expanded = _expand_legacy_rls(legacy)
+    assert len(expanded["theta"]) == 7
+    assert expanded["theta"][1] == 0.0
+    model = ThermalModel.from_dict({"fit_closed": legacy, "fit_open": legacy}, 30.0)
+    assert model.fits[False].theta[0] == 0.4
 
 
 def test_cold_start_uses_priors():

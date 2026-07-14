@@ -1,0 +1,217 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Configuração da casa",
+        "description": "Configure o controlador de toda a casa. Apenas o sensor de potência da rede é obrigatório; tudo o resto melhora o modelo quando disponível.",
+        "data": {
+          "grid_power_entity": "Sensor de potência da rede (W, lado do contador)",
+          "battery_power_entity": "Sensor de potência da bateria (opcional)",
+          "battery_positive_discharging": "Sensor da bateria positivo quando descarrega",
+          "known_load_entities": "Sensores de potência de cargas conhecidas (opcional)",
+          "outdoor_temp_entity": "Sensor de temperatura exterior (opcional)",
+          "weather_entity": "Entidade meteorológica (opcional)",
+          "presence_entity": "Entidade de presença na casa (opcional)",
+          "multisplit": "Sistema multi-split (uma unidade exterior)",
+          "contracted_kva": "Potência contratada (kVA)",
+          "power_factor": "Fator de potência",
+          "default_target": "Temperatura alvo predefinida"
+        },
+        "data_description": {
+          "grid_power_entity": "Potência em tempo real da casa no contador; usada para inferir a potência do AC e limitar cargas.",
+          "known_load_entities": "Eletrodomésticos monitorizados subtraídos da carga antes de isolar o AC.",
+          "contracted_kva": "3,45 kVA convertem-se num limite de 3450 W com fator de potência 1,0."
+        }
+      },
+      "reconfigure": {
+        "title": "Configuração da casa",
+        "data": {
+          "grid_power_entity": "Sensor de potência da rede (W, lado do contador)",
+          "battery_power_entity": "Sensor de potência da bateria (opcional)",
+          "battery_positive_discharging": "Sensor da bateria positivo quando descarrega",
+          "known_load_entities": "Sensores de potência de cargas conhecidas (opcional)",
+          "outdoor_temp_entity": "Sensor de temperatura exterior (opcional)",
+          "weather_entity": "Entidade meteorológica (opcional)",
+          "presence_entity": "Entidade de presença na casa (opcional)",
+          "multisplit": "Sistema multi-split (uma unidade exterior)",
+          "contracted_kva": "Potência contratada (kVA)",
+          "power_factor": "Fator de potência",
+          "default_target": "Temperatura alvo predefinida"
+        }
+      }
+    },
+    "abort": {
+      "already_configured": "O Adaptive Comfort já está configurado. Adicione zonas a partir da página da integração.",
+      "reconfigure_successful": "Configuração atualizada."
+    }
+  },
+  "config_subentries": {
+    "zone": {
+      "title": "Zona climatizada",
+      "initiate_flow": {
+        "user": "Adicionar zona climatizada",
+        "reconfigure": "Reconfigurar zona climatizada"
+      },
+      "entry_type": "Zona climatizada",
+      "step": {
+        "user": {
+          "title": "Zona climatizada",
+          "description": "Uma zona agrupa uma ou mais unidades interiores de AC comandadas em conjunto. Cada unidade fica numa divisão; a seguir indique a área de cada divisão (as áreas são por divisão, nunca somadas).",
+          "data": {
+            "name": "Nome da zona",
+            "climate_entities": "Entidades climate do AC (unidades interiores)",
+            "ceiling_height": "Altura do teto",
+            "temp_sensor": "Sensor de temperatura da divisão (opcional)",
+            "humidity_sensor": "Sensor de humidade da divisão (opcional)",
+            "door_sensor": "Sensor de porta (opcional)",
+            "presence_sensor": "Sensor de presença / movimento (opcional)"
+          },
+          "data_description": {
+            "temp_sensor": "Referência externa na divisão da primeira unidade interior; usada para aprender o desvio do sensor interno de cada cabeça."
+          }
+        },
+        "areas": {
+          "title": "Áreas das divisões",
+          "description": "Área útil de cada divisão, uma por unidade interior selecionada ({count} divisões). A zona é modelada como divisões pequenas repetidas, não como uma divisão grande.",
+          "data": {
+            "area_1": "Área da divisão 1",
+            "area_2": "Área da divisão 2",
+            "area_3": "Área da divisão 3",
+            "area_4": "Área da divisão 4",
+            "area_5": "Área da divisão 5",
+            "area_6": "Área da divisão 6"
+          }
+        },
+        "reconfigure": {
+          "title": "Zona climatizada",
+          "data": {
+            "name": "Nome da zona",
+            "climate_entities": "Entidades climate do AC (unidades interiores)",
+            "ceiling_height": "Altura do teto",
+            "temp_sensor": "Sensor de temperatura da divisão (opcional)",
+            "humidity_sensor": "Sensor de humidade da divisão (opcional)",
+            "door_sensor": "Sensor de porta (opcional)",
+            "presence_sensor": "Sensor de presença / movimento (opcional)"
+          }
+        },
+        "reconfigure_areas": {
+          "title": "Áreas das divisões",
+          "description": "Área útil de cada divisão, uma por unidade interior selecionada ({count} divisões).",
+          "data": {
+            "area_1": "Área da divisão 1",
+            "area_2": "Área da divisão 2",
+            "area_3": "Área da divisão 3",
+            "area_4": "Área da divisão 4",
+            "area_5": "Área da divisão 5",
+            "area_6": "Área da divisão 6"
+          }
+        }
+      },
+      "abort": {
+        "reconfigure_successful": "Zona atualizada."
+      }
+    },
+    "unconditioned_room": {
+      "title": "Divisão não climatizada",
+      "initiate_flow": {
+        "user": "Adicionar divisão não climatizada",
+        "reconfigure": "Reconfigurar divisão não climatizada"
+      },
+      "entry_type": "Divisão não climatizada",
+      "step": {
+        "user": {
+          "title": "Divisão não climatizada",
+          "description": "Divisões sem AC, usadas para o volume da casa, contabilização de humidade e (com sensor) evidência interior adicional.",
+          "data": {
+            "name": "Nome da divisão",
+            "area_m2": "Área útil",
+            "room_type": "Tipo de divisão",
+            "ceiling_height": "Altura do teto",
+            "temp_sensor": "Sensor de temperatura (opcional)"
+          }
+        },
+        "reconfigure": {
+          "title": "Divisão não climatizada",
+          "data": {
+            "name": "Nome da divisão",
+            "area_m2": "Área útil",
+            "room_type": "Tipo de divisão",
+            "ceiling_height": "Altura do teto",
+            "temp_sensor": "Sensor de temperatura (opcional)"
+          }
+        }
+      },
+      "abort": {
+        "reconfigure_successful": "Divisão atualizada."
+      }
+    }
+  },
+  "selector": {
+    "room_type": {
+      "options": {
+        "regular": "Divisão normal",
+        "wet": "Divisão húmida (casa de banho / lavandaria)"
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "house_load": { "name": "Carga da casa" },
+      "ac_power_estimate": { "name": "Potência estimada do AC" },
+      "power_headroom": { "name": "Margem de potência" },
+      "outdoor_effective": { "name": "Temperatura exterior (efetiva)" },
+      "outdoor_running_mean": { "name": "Média móvel exterior (7 d)" },
+      "dominant_mode": {
+        "name": "Modo dominante",
+        "state": { "off": "Desligado", "heat": "Aquecer", "cool": "Arrefecer" }
+      },
+      "free_float_bias": { "name": "Desvio em flutuação livre" },
+      "warm_excess": { "name": "Excesso térmico previsto" },
+      "cold_deficit": { "name": "Défice térmico previsto" },
+      "total_sensible": { "name": "Potência sensível total" },
+      "total_latent": { "name": "Potência latente total" },
+      "house_cop": { "name": "COP da casa" },
+      "model_confidence": { "name": "Confiança do modelo" },
+      "zone_temperature": { "name": "Temperatura (corrigida)" },
+      "predicted_60m": { "name": "Temperatura prevista +60 min" },
+      "k_exchange": { "name": "Constante de troca exterior k" },
+      "k_mix": { "name": "Constante de mistura interior k" },
+      "ach": { "name": "Renovações de ar por hora (total)" },
+      "airflow": { "name": "Fluxo de renovação de ar" },
+      "ua": { "name": "UA (coeficiente de perda térmica)" },
+      "c_eff": { "name": "Capacitância efetiva" },
+      "furniture_factor": { "name": "Fator de mobiliário" },
+      "zone_cop": { "name": "COP" },
+      "sensible_power": { "name": "Potência sensível" },
+      "latent_power": { "name": "Potência latente" },
+      "drift_offset": { "name": "Desvio do sensor" },
+      "zone_confidence": { "name": "Confiança do ajuste" },
+      "allocated_power": { "name": "Potência AC atribuída" }
+    },
+    "binary_sensor": {
+      "shedding_active": { "name": "Limitação de potência ativa" },
+      "conditioning_active": { "name": "Climatização" },
+      "zone_shed": { "name": "Limitada" },
+      "window_suggestion": { "name": "Abrir janelas sugerido" },
+      "zone_window_suggestion": { "name": "Abrir janela sugerido" }
+    },
+    "number": {
+      "band": { "name": "Banda de conforto (±)" },
+      "min_on": { "name": "Tempo mínimo ligado" },
+      "min_off": { "name": "Tempo mínimo desligado" },
+      "contracted_kva": { "name": "Potência contratada" },
+      "shed_start": { "name": "Limite para iniciar limitação" },
+      "shed_restore": { "name": "Limite para repor conforto" },
+      "adaptive_blend": { "name": "Peso da adaptação sazonal" },
+      "comfort_offset": { "name": "Desvio de conforto" }
+    },
+    "switch": {
+      "coordination": { "name": "Coordenação multi-split" },
+      "presence_adaptation": { "name": "Adaptação à presença" },
+      "shedding_enabled": { "name": "Limitação de potência" },
+      "fan_assist": { "name": "Ventilação auxiliar (zonas com pedido oposto)" },
+      "window_suggest": { "name": "Sugerir abrir janelas" },
+      "zone_enabled": { "name": "Zona ativa" }
+    }
+  }
+}

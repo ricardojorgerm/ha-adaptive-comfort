@@ -51,7 +51,7 @@ from .core import comfort, controller, power, psychro
 from .core.drift import DriftEstimator
 from .core.power import BaselineModel, DrawEstimator
 from .core.series import TimeSeries
-from .core.thermal import DiurnalModel, ThermalModel
+from .core.thermal import DiurnalModel, ThermalModel, house_other_temperature
 from .core.types import (
     MODE_COOL,
     MODE_FAN,
@@ -409,6 +409,29 @@ class AdaptiveComfortRuntime:
                     return float(rh)
         return None
 
+    def _volume_readings(self) -> dict[str, tuple[float, float]]:
+        """Zone_id -> (temperature, volume m3) for all zones with a reading."""
+        readings: dict[str, tuple[float, float]] = {}
+        for zone in self.zones.values():
+            if zone.temp is None:
+                continue
+            readings[zone.config.zone_id] = (zone.temp, zone.config.total_volume_m3)
+        return readings
+
+    def _aux_volume_readings(self) -> list[tuple[float, float]]:
+        """Unconditioned-room (temp, volume) pairs for house-mean mixing."""
+        aux: list[tuple[float, float]] = []
+        for room in self.rooms:
+            temp = _float_state(self.hass, room.temp_sensor)
+            if temp is not None:
+                aux.append((temp, room.volume_m3))
+        return aux
+
+    def _house_other_temp(self, zone_id: str) -> float | None:
+        return house_other_temperature(
+            zone_id, self._volume_readings(), self._aux_volume_readings()
+        )
+
     def _zone_temp(self, zone: ZoneRuntime) -> float | None:
         """Corrected zone temperature: external sensor, else drift-corrected head."""
         external = _float_state(self.hass, zone.config.temp_sensor)
@@ -669,7 +692,13 @@ class AdaptiveComfortRuntime:
             # would corrupt the exchange-constant identification.
             if self.outdoor_source != "climatology":
                 zone.model.update_free(
-                    prev_temp, smoothed, self.t_out, dt_h, local_hour, zone.door_open
+                    prev_temp,
+                    smoothed,
+                    self.t_out,
+                    dt_h,
+                    local_hour,
+                    zone.door_open,
+                    self._house_other_temp(zone.config.zone_id),
                 )
             zone.sensible_w = 0.0
             zone.latent_w = 0.0
@@ -682,15 +711,25 @@ class AdaptiveComfortRuntime:
         # Conditioning: close COP / capacitance and derive live heat flows.
         per_head_w = zone.allocated_w / zone.config.n_rooms if zone.allocated_w else 0.0
         heating = zone.head_state == STATE_HEATING
+        t_house = self._house_other_temp(zone.config.zone_id)
         if per_head_w > 50.0 and self.outdoor_source != "climatology":
             if abs(dtdt) < QUASI_STEADY_K_H:
-                zone.model.update_cop(per_head_w, smoothed, self.t_out, local_hour, zone.door_open)
+                zone.model.update_cop(
+                    per_head_w, smoothed, self.t_out, local_hour, zone.door_open, t_house
+                )
             elif abs(dtdt) > TRANSIENT_K_H:
                 zone.model.update_c_eff(
-                    per_head_w, heating, smoothed, self.t_out, dtdt, local_hour, zone.door_open
+                    per_head_w,
+                    heating,
+                    smoothed,
+                    self.t_out,
+                    dtdt,
+                    local_hour,
+                    zone.door_open,
+                    t_house,
                 )
         zone.sensible_w = zone.model.sensible_power_w(
-            smoothed, self.t_out, dtdt, local_hour, zone.door_open
+            smoothed, self.t_out, dtdt, local_hour, zone.door_open, t_house
         )
         zone.latent_w = self._latent_power(zone, dt_h)
 
@@ -741,12 +780,21 @@ class AdaptiveComfortRuntime:
     def _build_snapshot(self, now_ts: float, local_hour: float) -> HouseSnapshot:
         zone_snaps: list[ZoneSnapshot] = []
         forecast = self.forecast or ([self.t_out] * FORECAST_HOURS if self.t_out else [])
+        volume_readings = self._volume_readings()
+        aux_readings = self._aux_volume_readings()
         for zone in self.zones.values():
             free_float: tuple[float, ...] = ()
             pred_60m = None
             if zone.temp is not None and forecast:
+                zid = zone.config.zone_id
+                t_house = house_other_temperature(zid, volume_readings, aux_readings)
                 trajectory = zone.model.predict_free(
-                    zone.temp, forecast, local_hour, hours=FORECAST_HOURS, door_open=zone.door_open
+                    zone.temp,
+                    forecast,
+                    local_hour,
+                    hours=FORECAST_HOURS,
+                    door_open=zone.door_open,
+                    t_house_other=t_house,
                 )
                 free_float = tuple(trajectory)
                 if len(trajectory) > 1:
@@ -918,8 +966,8 @@ class AdaptiveComfortRuntime:
                     "name": z.config.name,
                     "temp": z.temp,
                     "head_state": z.head_state,
-                    "k": z.model.k(z.door_open),
-                    "ua_w_per_k": z.model.ua_w_per_k,
+                    "door_open": z.door_open,
+                    "coupling": self._coupling_diag(z),
                     "c_eff_wh_per_k": z.model.c_eff_wh_per_k,
                     "furniture_factor": z.model.furniture_factor,
                     "cop": z.model.cop,
@@ -931,6 +979,40 @@ class AdaptiveComfortRuntime:
                 }
                 for zid, z in self.zones.items()
             },
+        }
+
+    def _coupling_diag(self, zone: ZoneRuntime) -> dict[str, Any]:
+        """Thermal couplings split by destination (outdoor vs house) and door regime.
+
+        k values are in h⁻¹ (equivalent ACH for that leg); UA values in W/K.
+        t_house_other is the volume-weighted mean of the *other* zones plus
+        unconditioned-room sensors — the temperature the mixing leg pulls toward.
+        """
+        model = zone.model
+        per_regime = {}
+        for regime, label in ((False, "door_closed"), (True, "door_open")):
+            per_regime[label] = {
+                "k_out_h": round(model.k(regime), 4),
+                "k_mix_h": round(model.k_mix(regime), 4),
+                "fit_samples": model.fit_samples(regime),
+                "fit_stage": model.fit_stage(regime),
+            }
+        active = zone.door_open
+        return {
+            "outdoor": {
+                "k_out_h": round(model.k(active), 4),
+                "ua_w_per_k": round(model.ua_w_per_k, 2),
+                "description": "envelope exchange with outside air",
+            },
+            "house_mixing": {
+                "k_mix_h": round(model.k_mix(active), 4),
+                "ua_mix_w_per_k": round(model.ua_mix_w_per_k, 2),
+                "t_house_other": self._house_other_temp(zone.config.zone_id),
+                "description": "air mixing with other zones and unconditioned rooms",
+            },
+            "ach_total": round(model.ach, 4),
+            "active_regime": "door_open" if active else "door_closed",
+            "regimes": per_regime,
         }
 
 

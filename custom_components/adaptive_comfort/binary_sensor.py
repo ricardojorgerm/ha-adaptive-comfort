@@ -84,7 +84,7 @@ class ZoneShedSensor(AdaptiveComfortZoneEntity, BinarySensorEntity):
 
 
 class WindowSuggestionSensor(AdaptiveComfortEntity, BinarySensorEntity):
-    """On when opening a window somewhere would beat mechanical cooling."""
+    """On when opening a window somewhere would beat mechanical conditioning."""
 
     _attr_translation_key = "window_suggestion"
 

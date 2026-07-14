@@ -118,16 +118,26 @@ def _opposite_deviation(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> 
 
 
 def _window_would_help(
-    zone: ZoneSnapshot, t_out: float | None, house_occupied: bool | None
+    zone: ZoneSnapshot,
+    t_out: float | None,
+    mode: str,
+    house_occupied: bool | None,
 ) -> bool:
-    """Outdoor air is clearly colder than the room and someone can act on it.
+    """Outdoor air would move the room toward comfort and someone can act on it.
+
+    Cooling demand: outdoors clearly colder (free cooling / flush).
+    Heating demand: outdoors clearly warmer (free warming / ventilate).
 
     Without any presence information (zone and house both unknown) we do not
-    assume a person is available to open a window, and just cool.
+    assume a person is available to open a window.
     """
     if t_out is None or zone.temp is None:
         return False
-    if zone.temp - t_out < WINDOW_DELTA_K:
+    if mode == MODE_COOL and zone.temp - t_out < WINDOW_DELTA_K:
+        return False
+    if mode == MODE_HEAT and t_out - zone.temp < WINDOW_DELTA_K:
+        return False
+    if mode not in (MODE_COOL, MODE_HEAT):
         return False
     if zone.occupied is True:
         return True
@@ -223,18 +233,20 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         if zone.head_state == STATE_COOLING:
             state.zone_last_cool[zone.zone_id] = now
 
-    # Window suggestion: when outdoor air is much colder than a room that
-    # wants cooling and someone is around to act, propose opening a window
-    # and hold mechanical cooling for a grace period. Purely optional; when
-    # the option is off (or nobody is detectably present) we just cool.
+    # Window suggestion: when outdoor air would help a room in demand (cooler
+    # outdoors for cooling, warmer outdoors for heating) and someone is around
+    # to act, flag the zone as a ventilation opportunity (always advisory).
+    # The window_suggest option additionally *delays* mechanical conditioning
+    # for a grace period so the user can open a window first; with the option
+    # off the suggestion is still reported but conditioning starts immediately.
     window_suggestions: list[str] = []
-    if s.window_suggest and mode == MODE_COOL:
+    if mode in (MODE_HEAT, MODE_COOL):
         for zone in demand:
             zid = zone.zone_id
-            if _window_would_help(zone, snap.t_out, snap.house_occupied):
+            if _window_would_help(zone, snap.t_out, mode, snap.house_occupied):
                 since = state.window_suggest_since.setdefault(zid, now)
                 window_suggestions.append(zid)
-                if now - since < WINDOW_GRACE_S:
+                if s.window_suggest and now - since < WINDOW_GRACE_S:
                     want_on[zid] = False  # give the user a chance first
             else:
                 state.window_suggest_since.pop(zid, None)
