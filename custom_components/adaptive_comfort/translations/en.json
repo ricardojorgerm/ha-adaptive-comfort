@@ -11,7 +11,7 @@
           "known_load_entities": "Known load power sensors (optional)",
           "outdoor_temp_entity": "Outdoor temperature sensor (optional)",
           "weather_entity": "Weather entity (optional)",
-          "presence_entity": "House presence entity (optional)",
+          "presence_entity": "House presence (person or sensor, optional)",
           "multisplit": "System is a multi-split (one outdoor unit)",
           "contracted_kva": "Contracted power (kVA)",
           "power_factor": "Power factor",
@@ -20,11 +20,13 @@
         "data_description": {
           "grid_power_entity": "Real-time whole-house power at the meter; used for AC power inference and load shedding.",
           "known_load_entities": "Monitored appliances subtracted from the load before disaggregating the AC.",
+          "presence_entity": "Person (home/not_home) or presence sensor. Falls back to zone sensors if unavailable.",
           "contracted_kva": "3.45 kVA converts to a 3450 W limit at power factor 1.0."
         }
       },
       "reconfigure": {
         "title": "House setup",
+        "description": "Update grid power, known loads, outdoor sensors, presence, and other house-wide settings.",
         "data": {
           "grid_power_entity": "Grid power sensor (W, meter side)",
           "battery_power_entity": "Battery power sensor (optional)",
@@ -32,7 +34,7 @@
           "known_load_entities": "Known load power sensors (optional)",
           "outdoor_temp_entity": "Outdoor temperature sensor (optional)",
           "weather_entity": "Weather entity (optional)",
-          "presence_entity": "House presence entity (optional)",
+          "presence_entity": "House presence (person or sensor, optional)",
           "multisplit": "System is a multi-split (one outdoor unit)",
           "contracted_kva": "Contracted power (kVA)",
           "power_factor": "Power factor",
@@ -64,10 +66,14 @@
             "temp_sensor": "Room temperature sensor (optional)",
             "humidity_sensor": "Room humidity sensor (optional)",
             "door_sensor": "Door sensor (optional)",
-            "presence_sensor": "Presence / motion sensor (optional)"
+            "presence_sensor": "Presence sensor (optional)",
+            "indoor_fan_entities": "Indoor mixing fans (optional)",
+            "outdoor_exhaust_fan_entities": "Outdoor exhaust fans (optional)"
           },
           "data_description": {
-            "temp_sensor": "External reference in the room hosting the first head; used to learn each head's internal-sensor drift."
+            "temp_sensor": "External reference in the room hosting the first head; used to learn each head's internal-sensor drift.",
+            "indoor_fan_entities": "Fans or switches that circulate air within the house (boosts inter-zone mixing in the model).",
+            "outdoor_exhaust_fan_entities": "Fans or switches that vent air outdoors (boosts outdoor exchange in the model)."
           }
         },
         "areas": {
@@ -91,7 +97,9 @@
             "temp_sensor": "Room temperature sensor (optional)",
             "humidity_sensor": "Room humidity sensor (optional)",
             "door_sensor": "Door sensor (optional)",
-            "presence_sensor": "Presence / motion sensor (optional)"
+            "presence_sensor": "Presence sensor (optional)",
+            "indoor_fan_entities": "Indoor mixing fans (optional)",
+            "outdoor_exhaust_fan_entities": "Outdoor exhaust fans (optional)"
           }
         },
         "reconfigure_areas": {
@@ -210,7 +218,7 @@
       "presence_adaptation": { "name": "Presence adaptation" },
       "shedding_enabled": { "name": "Power shedding" },
       "fan_assist": { "name": "Fan assist (opposite-demand zones)" },
-      "window_suggest": { "name": "Suggest opening windows" },
+      "window_suggest": { "name": "Wait for manual ventilation" },
       "zone_enabled": { "name": "Zone enabled" }
     }
   }

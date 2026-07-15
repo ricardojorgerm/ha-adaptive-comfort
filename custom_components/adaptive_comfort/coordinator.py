@@ -30,8 +30,10 @@ from .const import (
     CONF_HEADS,
     CONF_HEIGHT,
     CONF_HUMIDITY_SENSOR,
+    CONF_INDOOR_FANS,
     CONF_KNOWN_LOADS,
     CONF_MULTISPLIT,
+    CONF_OUTDOOR_EXHAUST_FANS,
     CONF_OUTDOOR_TEMP,
     CONF_POWER_FACTOR,
     CONF_PRESENCE,
@@ -48,6 +50,8 @@ from .const import (
     SUBENTRY_ZONE,
 )
 from .core import comfort, controller, power, psychro
+from .fans import fan_entities_on
+from .presence import house_presence, presence_state
 from .core.drift import DriftEstimator
 from .core.power import BaselineModel, DrawEstimator
 from .core.series import TimeSeries
@@ -101,20 +105,6 @@ def _float_state(hass: HomeAssistant, entity_id: str | None) -> float | None:
         return None
 
 
-def _presence_state(hass: HomeAssistant, entity_id: str | None) -> bool | None:
-    if not entity_id:
-        return None
-    state = hass.states.get(entity_id)
-    if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
-        return None
-    if entity_id.startswith("zone."):
-        try:
-            return float(state.state) > 0
-        except (ValueError, TypeError):
-            return None
-    return state.state in ("home", STATE_ON)
-
-
 def _head_state(hass: HomeAssistant, entity_id: str) -> str:
     """Classify a climate entity into a drift/operating state."""
     state = hass.states.get(entity_id)
@@ -158,6 +148,8 @@ class ZoneRuntime:
         self.temp: float | None = None
         self.rh: float | None = None
         self.door_open = False
+        self.indoor_fans_on = False
+        self.outdoor_exhaust_on = False
         self.occupied: bool | None = None
         self.free_float: tuple[float, ...] = ()
         self.pred_60m: float | None = None
@@ -267,6 +259,8 @@ class AdaptiveComfortRuntime:
                 humidity_sensor=data.get(CONF_HUMIDITY_SENSOR),
                 door_sensor=data.get(CONF_DOOR_SENSOR),
                 presence_sensor=data.get(CONF_PRESENCE_SENSOR),
+                indoor_fan_entities=tuple(data.get(CONF_INDOOR_FANS, ())),
+                outdoor_exhaust_fan_entities=tuple(data.get(CONF_OUTDOOR_EXHAUST_FANS, ())),
             )
             self.zones[subentry_id] = ZoneRuntime(config)
 
@@ -539,7 +533,11 @@ class AdaptiveComfortRuntime:
         if self.t_out is not None and self.outdoor_source != "climatology":
             self.t_rm = comfort.update_running_mean(self.t_rm, self.t_out, dt_h)
             self.outdoor_diurnal.update(local_hour, self.t_out)
-        self.house_occupied = _presence_state(self.hass, data.get(CONF_PRESENCE))
+        self.house_occupied = house_presence(
+            self.hass,
+            data.get(CONF_PRESENCE),
+            [zone.config.presence_sensor for zone in self.zones.values()],
+        )
 
     def _sample_zones(self, now_ts: float, local_hour: float) -> None:
         any_on = False
@@ -573,7 +571,11 @@ class AdaptiveComfortRuntime:
                 zone.w_series.append(now_ts, psychro.humidity_ratio(zone.temp, zone.rh))
             door = self.hass.states.get(cfg.door_sensor) if cfg.door_sensor else None
             zone.door_open = door is not None and door.state == STATE_ON
-            zone.occupied = _presence_state(self.hass, cfg.presence_sensor)
+            zone.indoor_fans_on = fan_entities_on(self.hass, cfg.indoor_fan_entities)
+            zone.outdoor_exhaust_on = fan_entities_on(
+                self.hass, cfg.outdoor_exhaust_fan_entities
+            )
+            zone.occupied = presence_state(self.hass, cfg.presence_sensor)
 
             # Drift learning: stable state >= 10 min with an external reference.
             external = _float_state(self.hass, cfg.temp_sensor)
@@ -699,6 +701,8 @@ class AdaptiveComfortRuntime:
                     local_hour,
                     zone.door_open,
                     self._house_other_temp(zone.config.zone_id),
+                    indoor_fans_on=zone.indoor_fans_on,
+                    outdoor_exhaust_on=zone.outdoor_exhaust_on,
                 )
             zone.sensible_w = 0.0
             zone.latent_w = 0.0
@@ -729,7 +733,14 @@ class AdaptiveComfortRuntime:
                     t_house,
                 )
         zone.sensible_w = zone.model.sensible_power_w(
-            smoothed, self.t_out, dtdt, local_hour, zone.door_open, t_house
+            smoothed,
+            self.t_out,
+            dtdt,
+            local_hour,
+            zone.door_open,
+            t_house,
+            indoor_fans_on=zone.indoor_fans_on,
+            outdoor_exhaust_on=zone.outdoor_exhaust_on,
         )
         zone.latent_w = self._latent_power(zone, dt_h)
 
@@ -795,6 +806,8 @@ class AdaptiveComfortRuntime:
                     hours=FORECAST_HOURS,
                     door_open=zone.door_open,
                     t_house_other=t_house,
+                    indoor_fans_on=zone.indoor_fans_on,
+                    outdoor_exhaust_on=zone.outdoor_exhaust_on,
                 )
                 free_float = tuple(trajectory)
                 if len(trajectory) > 1:
@@ -967,6 +980,8 @@ class AdaptiveComfortRuntime:
                     "temp": z.temp,
                     "head_state": z.head_state,
                     "door_open": z.door_open,
+                    "indoor_fans_on": z.indoor_fans_on,
+                    "outdoor_exhaust_on": z.outdoor_exhaust_on,
                     "coupling": self._coupling_diag(z),
                     "c_eff_wh_per_k": z.model.c_eff_wh_per_k,
                     "furniture_factor": z.model.furniture_factor,

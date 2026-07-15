@@ -189,11 +189,15 @@ def demand_integrals(
     bands: dict[str, tuple[float, float]],
 ) -> tuple[float, float]:
     """Occupancy-weighted (warm excess, cold deficit) in K*h over the horizon,
-    integrated from each zone's hourly free-float trajectory."""
+    integrated from each zone's hourly free-float trajectory.
+
+    Zones actively conditioning are skipped: free-float trajectories are not
+    meaningful while the AC is driving the room.
+    """
     warm = 0.0
     cold = 0.0
     for zone in zones:
-        if not zone.free_float or zone.zone_id not in bands:
+        if zone.is_on or not zone.free_float or zone.zone_id not in bands:
             continue
         lo, hi = bands[zone.zone_id]
         weight = UNOCCUPIED_WEIGHT if zone.occupied is False else 1.0
@@ -277,10 +281,19 @@ def dominant_mode(
         return ModeDecision(mode, "fallback")
 
     warm, cold = demand_integrals(confident, bands)
+    indoor_dev = indoor_deviation(zones, bands, snap.aux_indoor)
+    season_heat = snap.t_rm is not None and snap.t_rm < FALLBACK_HEAT_BELOW_C
+    season_cool = snap.t_rm is not None and snap.t_rm > FALLBACK_COOL_ABOVE_C
+
     if warm - cold > MODE_DEADBAND_KH:
         desired = MODE_COOL
+        if season_heat and (indoor_dev is None or indoor_dev < 2.0):
+            desired = MODE_OFF
     elif cold - warm > MODE_DEADBAND_KH:
         desired = MODE_HEAT
+        # Do not heat on forecast alone in summer when the house is not cold now.
+        if season_cool and (indoor_dev is None or indoor_dev > -2.0):
+            desired = MODE_OFF
     else:
         desired = MODE_OFF
 

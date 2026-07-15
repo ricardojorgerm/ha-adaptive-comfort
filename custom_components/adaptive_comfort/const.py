@@ -40,6 +40,8 @@ CONF_TEMP_SENSOR = "temp_sensor"
 CONF_HUMIDITY_SENSOR = "humidity_sensor"
 CONF_DOOR_SENSOR = "door_sensor"
 CONF_PRESENCE_SENSOR = "presence_sensor"
+CONF_INDOOR_FANS = "indoor_fan_entities"
+CONF_OUTDOOR_EXHAUST_FANS = "outdoor_exhaust_fan_entities"
 
 # Unconditioned-room subentry keys
 CONF_AREA = "area_m2"

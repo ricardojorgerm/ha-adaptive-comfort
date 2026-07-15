@@ -37,6 +37,9 @@ K_PRIOR = 0.2
 K_MIX_PRIOR = 0.15
 COP_PRIOR = 3.0
 MIN_FIT_SAMPLES = 36
+# Effective exchange boost while configured vent fans are running (identification + prediction).
+OUTDOOR_FAN_K_OUT_MULT = 2.5
+INDOOR_FAN_K_MIX_MULT = 2.0
 
 
 def house_other_temperature(
@@ -112,6 +115,17 @@ class ThermalModel:
         self.cop: float | None = None
         self.cop_samples = 0
 
+    def _scaled_k(
+        self,
+        door_open: bool,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
+    ) -> tuple[float, float]:
+        out_mult = OUTDOOR_FAN_K_OUT_MULT if outdoor_exhaust_on else 1.0
+        mix_mult = INDOOR_FAN_K_MIX_MULT if indoor_fans_on else 1.0
+        return self.k(door_open) * out_mult, self.k_mix(door_open) * mix_mult
+
     def update_free(
         self,
         t_in_prev: float,
@@ -121,6 +135,9 @@ class ThermalModel:
         local_hour: float,
         door_open: bool = False,
         t_house_other: float | None = None,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
     ) -> float | None:
         """One free-response sample (heads fully off). Returns residual [K/h]."""
         if dt_h <= 0:
@@ -128,9 +145,14 @@ class ThermalModel:
         y = (t_in_now - t_in_prev) / dt_h
         if abs(y) > 8.0:
             return None
+        delta_out = t_out - t_in_now
+        if outdoor_exhaust_on:
+            delta_out *= OUTDOOR_FAN_K_OUT_MULT
         delta_house = 0.0 if t_house_other is None else t_house_other - t_in_now
+        if indoor_fans_on:
+            delta_house *= INDOOR_FAN_K_MIX_MULT
         fit = self.fits[door_open]
-        residual = fit.update(_phi(t_out - t_in_now, delta_house, local_hour), y)
+        residual = fit.update(_phi(delta_out, delta_house, local_hour), y)
         fit.theta[0] = min(max(fit.theta[0], K_MIN), K_MAX)
         fit.theta[1] = min(max(fit.theta[1], K_MIX_MIN), K_MIX_MAX)
         return residual
@@ -186,10 +208,18 @@ class ThermalModel:
         local_hour: float,
         door_open: bool = False,
         t_house_other: float | None = None,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
     ) -> float:
         """Free-float attractor at fixed outdoor and house-other temperatures."""
-        k_out = self.k(door_open)
-        k_mix = self.k_mix(door_open) if t_house_other is not None else 0.0
+        k_out, k_mix = self._scaled_k(
+            door_open,
+            indoor_fans_on=indoor_fans_on,
+            outdoor_exhaust_on=outdoor_exhaust_on,
+        )
+        if t_house_other is None:
+            k_mix = 0.0
         q = self.q_hat(local_hour, door_open)
         denom = k_out + k_mix
         if denom <= 1e-9:
@@ -252,15 +282,24 @@ class ThermalModel:
         local_hour: float,
         door_open: bool = False,
         t_house_other: float | None = None,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
     ) -> float:
         """Heat added by the AC (signed W; negative while cooling)."""
         c = self.c_eff_wh_per_k
+        k_out, k_mix = self._scaled_k(
+            door_open,
+            indoor_fans_on=indoor_fans_on,
+            outdoor_exhaust_on=outdoor_exhaust_on,
+        )
         mix_w = 0.0
         if t_house_other is not None:
-            mix_w = self.ua_mix_w_per_k * (t_house_other - t_in)
+            mix_w = AIR_HEAT_WH_M3K * k_mix * self.volume_m3 * (t_house_other - t_in)
+        ua_out = AIR_HEAT_WH_M3K * k_out * self.volume_m3
         return (
             c * dtdt_per_h
-            - self.ua_w_per_k * (t_out - t_in)
+            - ua_out * (t_out - t_in)
             - mix_w
             - self.q_hat(local_hour, door_open) * c
         )
@@ -333,12 +372,20 @@ class ThermalModel:
         door_open: bool = False,
         t_house_other: float | None = None,
         t_house_hourly: list[float] | None = None,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
     ) -> list[float]:
         """Euler-integrated free-float trajectory; returns hourly samples."""
         if not t_out_hourly:
             return []
-        k_out = self.k(door_open)
-        k_mix = self.k_mix(door_open) if t_house_other is not None or t_house_hourly else 0.0
+        k_out, k_mix = self._scaled_k(
+            door_open,
+            indoor_fans_on=indoor_fans_on,
+            outdoor_exhaust_on=outdoor_exhaust_on,
+        )
+        if t_house_other is None and not t_house_hourly:
+            k_mix = 0.0
         temps: list[float] = []
         t = t_in
         elapsed = 0.0

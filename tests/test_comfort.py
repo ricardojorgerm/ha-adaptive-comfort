@@ -152,7 +152,36 @@ def test_fallback_uses_aux_bathroom_sensor():
     assert decision.mode == MODE_HEAT
 
 
-def test_indoor_deviation_weights_aux():
+def test_model_mode_does_not_heat_summer_warm_house_on_forecast():
+    """Regression: bogus cold-deficit forecast must not heat a 24 °C house in July."""
+    # Standby west zone only; east is actively cooling so its trajectory is ignored.
+    west = make_zone(
+        temp=24.4,
+        free_float=[18.0] * 24,
+        is_on=False,
+        zone_id="west",
+    )
+    east = make_zone(
+        temp=24.4,
+        free_float=[26.0] * 24,
+        is_on=True,
+        zone_id="east",
+    )
+    snap = make_snapshot([west, east], t_rm=23.3)
+    state = ControllerState(mode=MODE_COOL, mode_since=0.0)
+    bands = {"west": (21.7, 26.1), "east": (23.2, 24.6)}
+    decision = comfort.dominant_mode(snap, state, bands)
+    assert decision.mode != MODE_HEAT
+    assert decision.mode in (MODE_COOL, MODE_OFF)
+
+
+def test_demand_integrals_skips_conditioning_zones():
+    on = make_zone(free_float=[30.0] * 24, is_on=True)
+    off = make_zone(free_float=[22.5] * 24, is_on=False)
+    warm, cold = comfort.demand_integrals([on, off], {"z1": (21.8, 23.2)})
+    assert warm == 0.0
+    assert cold == 0.0
+
     zones = [make_zone(temp=23.0)]
     bands = {"z1": (21.8, 23.2)}
     dev = comfort.indoor_deviation(zones, bands, aux_indoor=((26.0, 1.0),))

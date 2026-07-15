@@ -37,9 +37,11 @@ from .const import (
     CONF_HEADS,
     CONF_HEIGHT,
     CONF_HUMIDITY_SENSOR,
+    CONF_INDOOR_FANS,
     CONF_KNOWN_LOADS,
     CONF_MULTISPLIT,
     CONF_NAME,
+    CONF_OUTDOOR_EXHAUST_FANS,
     CONF_OUTDOOR_TEMP,
     CONF_POWER_FACTOR,
     CONF_PRESENCE,
@@ -60,8 +62,19 @@ POWER_SENSOR = EntitySelector(EntitySelectorConfig(domain="sensor", device_class
 TEMP_SENSOR = EntitySelector(EntitySelectorConfig(domain="sensor", device_class="temperature"))
 HUMIDITY_SENSOR = EntitySelector(EntitySelectorConfig(domain="sensor", device_class="humidity"))
 PRESENCE_ENTITY = EntitySelector(
-    EntitySelectorConfig(domain=["person", "group", "binary_sensor", "device_tracker", "zone"])
+    EntitySelectorConfig(domain=["person", "device_tracker", "binary_sensor", "group", "zone"])
 )
+FAN_ENTITY = EntitySelector(
+    EntitySelectorConfig(domain=["fan", "switch"], multiple=True)
+)
+
+
+def _entity_tuple(value: Any) -> tuple[str, ...]:
+    if not value:
+        return ()
+    if isinstance(value, list):
+        return tuple(value)
+    return (str(value),)
 
 
 def _house_schema(defaults: dict[str, Any]) -> vol.Schema:
@@ -186,6 +199,10 @@ def _zone_base_schema(defaults: dict[str, Any]) -> vol.Schema:
             vol.Optional(
                 CONF_PRESENCE_SENSOR, description=d(CONF_PRESENCE_SENSOR)
             ): PRESENCE_ENTITY,
+            vol.Optional(CONF_INDOOR_FANS, description=d(CONF_INDOOR_FANS)): FAN_ENTITY,
+            vol.Optional(
+                CONF_OUTDOOR_EXHAUST_FANS, description=d(CONF_OUTDOOR_EXHAUST_FANS)
+            ): FAN_ENTITY,
         }
     )
 
@@ -228,6 +245,10 @@ class ZoneSubentryFlowHandler(ConfigSubentryFlow):
         if user_input is not None:
             areas = [float(user_input[f"area_{i + 1}"]) for i in range(len(heads))]
             data = {**self._base, CONF_AREAS: areas}
+            data[CONF_INDOOR_FANS] = _entity_tuple(data.get(CONF_INDOOR_FANS))
+            data[CONF_OUTDOOR_EXHAUST_FANS] = _entity_tuple(
+                data.get(CONF_OUTDOOR_EXHAUST_FANS)
+            )
             name = data.pop(CONF_NAME)
             return self.async_create_entry(title=name, data=data)
         return self.async_show_form(
@@ -254,6 +275,10 @@ class ZoneSubentryFlowHandler(ConfigSubentryFlow):
         if user_input is not None:
             areas = [float(user_input[f"area_{i + 1}"]) for i in range(len(heads))]
             data = {**self._base, CONF_AREAS: areas}
+            data[CONF_INDOOR_FANS] = _entity_tuple(data.get(CONF_INDOOR_FANS))
+            data[CONF_OUTDOOR_EXHAUST_FANS] = _entity_tuple(
+                data.get(CONF_OUTDOOR_EXHAUST_FANS)
+            )
             name = data.pop(CONF_NAME)
             return self.async_update_and_abort(self._get_entry(), subentry, title=name, data=data)
         old_areas = list(subentry.data.get(CONF_AREAS, []))

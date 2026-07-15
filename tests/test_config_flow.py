@@ -157,6 +157,49 @@ async def test_zone_subentry_flow(hass: HomeAssistant) -> None:
     assert stored.data[CONF_AREAS] == [12.0]
 
 
+async def test_hub_reconfigure_flow(hass: HomeAssistant) -> None:
+    _seed_entities(hass)
+    flow = await hass.config_entries.flow.async_init(
+        DOMAIN, context={"source": config_entries.SOURCE_USER}
+    )
+    await hass.config_entries.flow.async_configure(
+        flow["flow_id"],
+        {
+            CONF_GRID_POWER: "sensor.grid_power",
+            CONF_MULTISPLIT: True,
+            CONF_CONTRACTED_KVA: 3.45,
+            CONF_POWER_FACTOR: 1.0,
+            CONF_DEFAULT_TARGET: 22.5,
+        },
+    )
+    config_entry = hass.config_entries.async_entries(DOMAIN)[0]
+    result = await hass.config_entries.flow.async_init(
+        DOMAIN,
+        context={
+            "source": config_entries.SOURCE_RECONFIGURE,
+            "entry_id": config_entry.entry_id,
+        },
+    )
+    assert result["type"] == FlowResultType.FORM
+    assert result["step_id"] == "reconfigure"
+    result = await hass.config_entries.flow.async_configure(
+        result["flow_id"],
+        {
+            CONF_GRID_POWER: "sensor.grid_power",
+            CONF_MULTISPLIT: True,
+            CONF_CONTRACTED_KVA: 4.6,
+            CONF_POWER_FACTOR: 1.0,
+            CONF_DEFAULT_TARGET: 23.0,
+        },
+    )
+    assert result["type"] == FlowResultType.ABORT
+    assert result["reason"] == "reconfigure_successful"
+    config_entry = hass.config_entries.async_get_entry(config_entry.entry_id)
+    assert config_entry is not None
+    assert config_entry.data[CONF_CONTRACTED_KVA] == 4.6
+    assert config_entry.data[CONF_DEFAULT_TARGET] == 23.0
+
+
 async def test_unconditioned_room_subentry_flow(hass: HomeAssistant) -> None:
     _seed_entities(hass)
     flow = await hass.config_entries.flow.async_init(

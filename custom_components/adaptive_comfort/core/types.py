@@ -54,6 +54,8 @@ class ZoneConfig:
     humidity_sensor: str | None = None
     door_sensor: str | None = None
     presence_sensor: str | None = None
+    indoor_fan_entities: tuple[str, ...] = ()
+    outdoor_exhaust_fan_entities: tuple[str, ...] = ()
 
     @property
     def n_rooms(self) -> int:
@@ -115,8 +117,7 @@ class Settings:
     shedding_enabled: bool = True
     multisplit: bool = True
     fan_assist: bool = True  # fan-only for opposite-demand zones on a multi-split
-    # Delay mechanical cooling while a window would beat it (grace period).
-    # The ventilation suggestion itself is always reported regardless.
+    # Hold mechanical conditioning briefly while the user is expected to ventilate manually.
     window_suggest: bool = False
     hvac_mode: str = MODE_AUTO
     preset: str = PRESET_NONE

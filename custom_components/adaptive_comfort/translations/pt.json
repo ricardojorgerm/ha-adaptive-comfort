@@ -11,7 +11,7 @@
           "known_load_entities": "Sensores de potência de cargas conhecidas (opcional)",
           "outdoor_temp_entity": "Sensor de temperatura exterior (opcional)",
           "weather_entity": "Entidade meteorológica (opcional)",
-          "presence_entity": "Entidade de presença na casa (opcional)",
+          "presence_entity": "Presença na casa (pessoa ou sensor, opcional)",
           "multisplit": "Sistema multi-split (uma unidade exterior)",
           "contracted_kva": "Potência contratada (kVA)",
           "power_factor": "Fator de potência",
@@ -20,11 +20,13 @@
         "data_description": {
           "grid_power_entity": "Potência em tempo real da casa no contador; usada para inferir a potência do AC e limitar cargas.",
           "known_load_entities": "Eletrodomésticos monitorizados subtraídos da carga antes de isolar o AC.",
+          "presence_entity": "Pessoa (em casa/fora) ou sensor de presença. Recorre aos sensores das zonas se indisponível.",
           "contracted_kva": "3,45 kVA convertem-se num limite de 3450 W com fator de potência 1,0."
         }
       },
       "reconfigure": {
         "title": "Configuração da casa",
+        "description": "Atualize potência da rede, cargas conhecidas, sensores exteriores, presença e outras definições globais.",
         "data": {
           "grid_power_entity": "Sensor de potência da rede (W, lado do contador)",
           "battery_power_entity": "Sensor de potência da bateria (opcional)",
@@ -32,7 +34,7 @@
           "known_load_entities": "Sensores de potência de cargas conhecidas (opcional)",
           "outdoor_temp_entity": "Sensor de temperatura exterior (opcional)",
           "weather_entity": "Entidade meteorológica (opcional)",
-          "presence_entity": "Entidade de presença na casa (opcional)",
+          "presence_entity": "Presença na casa (pessoa ou sensor, opcional)",
           "multisplit": "Sistema multi-split (uma unidade exterior)",
           "contracted_kva": "Potência contratada (kVA)",
           "power_factor": "Fator de potência",
@@ -64,10 +66,14 @@
             "temp_sensor": "Sensor de temperatura da divisão (opcional)",
             "humidity_sensor": "Sensor de humidade da divisão (opcional)",
             "door_sensor": "Sensor de porta (opcional)",
-            "presence_sensor": "Sensor de presença / movimento (opcional)"
+            "presence_sensor": "Sensor de presença (opcional)",
+            "indoor_fan_entities": "Ventoinhas de mistura interior (opcional)",
+            "outdoor_exhaust_fan_entities": "Ventoinhas de exaustão para o exterior (opcional)"
           },
           "data_description": {
-            "temp_sensor": "Referência externa na divisão da primeira unidade interior; usada para aprender o desvio do sensor interno de cada cabeça."
+            "temp_sensor": "Referência externa na divisão da primeira unidade interior; usada para aprender o desvio do sensor interno de cada cabeça.",
+            "indoor_fan_entities": "Ventoinhas ou interruptores que circulam ar dentro da casa (reforçam a mistura entre zonas no modelo).",
+            "outdoor_exhaust_fan_entities": "Ventoinhas ou interruptores que expulsam ar para o exterior (reforçam a troca com o exterior no modelo)."
           }
         },
         "areas": {
@@ -91,7 +97,9 @@
             "temp_sensor": "Sensor de temperatura da divisão (opcional)",
             "humidity_sensor": "Sensor de humidade da divisão (opcional)",
             "door_sensor": "Sensor de porta (opcional)",
-            "presence_sensor": "Sensor de presença / movimento (opcional)"
+            "presence_sensor": "Sensor de presença (opcional)",
+            "indoor_fan_entities": "Ventoinhas de mistura interior (opcional)",
+            "outdoor_exhaust_fan_entities": "Ventoinhas de exaustão para o exterior (opcional)"
           }
         },
         "reconfigure_areas": {
@@ -210,7 +218,7 @@
       "presence_adaptation": { "name": "Adaptação à presença" },
       "shedding_enabled": { "name": "Limitação de potência" },
       "fan_assist": { "name": "Ventilação auxiliar (zonas com pedido oposto)" },
-      "window_suggest": { "name": "Sugerir abrir janelas" },
+      "window_suggest": { "name": "Aguardar ventilação manual" },
       "zone_enabled": { "name": "Zona ativa" }
     }
   }
