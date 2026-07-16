@@ -15,7 +15,7 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import ATTR_TEMPERATURE, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
-from homeassistant.helpers.event import async_track_time_interval
+from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
 from homeassistant.util import dt as dt_util
 
 from .const import (
@@ -80,6 +80,7 @@ from .storage import AdaptiveComfortStore
 _LOGGER = logging.getLogger(__name__)
 
 SAMPLE_INTERVAL = timedelta(seconds=60)
+POWER_REACT_DEBOUNCE_S = 2.0
 SAVE_INTERVAL = timedelta(minutes=15)
 FORECAST_INTERVAL = timedelta(minutes=30)
 FIT_STEP_S = 300.0  # 5-minute smoothed steps for the RC fit
@@ -205,6 +206,12 @@ class AdaptiveComfortRuntime:
         self.p_grid: float | None = None
         self.p_load: float | None = None
         self.p_ac: float | None = None
+        self.p_demand: float | None = None
+        self.known_load_total: float = 0.0
+        self.shed_urgent: bool = False
+        self._prev_known_total: float | None = None
+        self._demand_spike_until: float = 0.0
+        self._last_power_react: float = 0.0
         self.p_grid_series = TimeSeries(horizon_s=2 * 3600.0)
         self.p_load_series = TimeSeries(horizon_s=2 * 3600.0)
         self.grid_over_since: float | None = None
@@ -271,6 +278,81 @@ class AdaptiveComfortRuntime:
         self._restore(data)
         self._unsub.append(async_track_time_interval(self.hass, self._async_tick, SAMPLE_INTERVAL))
         self._unsub.append(async_track_time_interval(self.hass, self._async_save, SAVE_INTERVAL))
+        watch = self._power_watch_entities()
+        if watch:
+            self._unsub.append(
+                async_track_state_change_event(self.hass, watch, self._on_power_entity_change)
+            )
+
+    @callback
+    def _on_power_entity_change(self, event) -> None:
+        """React quickly when grid or a known load changes (oven, etc.)."""
+        self.hass.async_create_task(self._async_power_react())
+
+    async def _async_power_react(self) -> None:
+        now_ts = time.time()
+        if now_ts - self._last_power_react < POWER_REACT_DEBOUNCE_S:
+            return
+        self._last_power_react = now_ts
+        local_hour = self._local_hour()
+        dt_h = (now_ts - self._last_sample_ts) / 3600.0 if self._last_sample_ts else 1.0 / 60.0
+        self._sample_house(now_ts, local_hour, dt_h)
+        self._sample_zones(now_ts, local_hour)
+        if self.p_load is not None:
+            active = [z for z in self.zones.values() if z.is_on]
+            if active:
+                self.p_ac = power.estimate_ac_power(self.p_load, self.baseline.value(local_hour))
+            else:
+                self.p_ac = 0.0
+        self._finalize_demand(now_ts)
+        if self.settings.shedding_enabled:
+            await self._async_control(now_ts, local_hour)
+            self.notify()
+
+    def _power_watch_entities(self) -> list[str]:
+        data = self.entry.data
+        entities: list[str] = []
+        if grid := data.get(CONF_GRID_POWER):
+            entities.append(grid)
+        entities.extend(data.get(CONF_KNOWN_LOADS, []))
+        return entities
+
+    def _known_load_readings(self) -> list[float]:
+        return [
+            v
+            for eid in self.entry.data.get(CONF_KNOWN_LOADS, [])
+            if (v := _float_state(self.hass, eid)) is not None
+        ]
+
+    def _finalize_demand(self, now_ts: float) -> None:
+        """Conservative contracted demand for shedding (handles meter lag)."""
+        known = self._known_load_readings()
+        self.known_load_total = sum(known)
+        active = [z for z in self.zones.values() if z.is_on]
+        mode = MODE_HEAT if any(z.head_state == STATE_HEATING for z in active) else MODE_COOL
+        draws = [self.draws.draw_w(z.config.zone_id, mode) for z in active]
+        ac_w = power.estimated_active_ac_draw_w(draws, self.p_ac)
+        peak = self.p_grid_series.max_window(now_ts - power.SHED_PEAK_WINDOW_S, now_ts)
+        self.p_demand = power.contracted_demand_w(self.p_grid, known, ac_w, peak)
+
+        if self._prev_known_total is not None:
+            if self.known_load_total - self._prev_known_total >= power.KNOWN_LOAD_SPIKE_W:
+                self._demand_spike_until = now_ts + 90.0
+        self._prev_known_total = self.known_load_total
+
+        threshold = self.settings.shed_start_pct * self.settings.limit_w
+        if self.p_demand is not None and self.p_demand > threshold:
+            if self.grid_over_since is None:
+                self.grid_over_since = now_ts
+        elif self.p_demand is None or self.p_demand <= threshold:
+            peak_demand = power.contracted_demand_w(None, known, ac_w, peak)
+            if peak_demand is None or peak_demand <= threshold:
+                self.grid_over_since = None
+
+        critical = power.SHED_CRITICAL_PCT * self.settings.limit_w
+        self.shed_urgent = now_ts < self._demand_spike_until or (
+            self.p_demand is not None and self.p_demand >= critical
+        )
 
     async def async_unload(self) -> None:
         for unsub in self._unsub:
@@ -497,6 +579,7 @@ class AdaptiveComfortRuntime:
         self._sample_zones(now_ts, local_hour)
         self._process_power_events(now_ts)
         self._update_estimators(now_ts, local_hour)
+        self._finalize_demand(now_ts)
         await self._async_control(now_ts, local_hour)
         self.notify()
 
@@ -504,11 +587,7 @@ class AdaptiveComfortRuntime:
         data = self.entry.data
         self.p_grid = _float_state(self.hass, data.get(CONF_GRID_POWER))
         battery = _float_state(self.hass, data.get(CONF_BATTERY_POWER))
-        known = [
-            v
-            for eid in data.get(CONF_KNOWN_LOADS, [])
-            if (v := _float_state(self.hass, eid)) is not None
-        ]
+        known = self._known_load_readings()
         if self.p_grid is not None:
             self.p_grid_series.append(now_ts, self.p_grid)
             self.p_load = power.compose_load(
@@ -518,12 +597,6 @@ class AdaptiveComfortRuntime:
                 known,
             )
             self.p_load_series.append(now_ts, self.p_load)
-            threshold = self.settings.shed_start_pct * self.settings.limit_w
-            if self.p_grid > threshold:
-                if self.grid_over_since is None:
-                    self.grid_over_since = now_ts
-            else:
-                self.grid_over_since = None
 
         self.t_out, self.outdoor_source = self._read_outdoor()
         if self.t_rm is None:
@@ -853,9 +926,11 @@ class AdaptiveComfortRuntime:
             t_rm=self.t_rm,
             house_occupied=self.house_occupied,
             p_grid=self.p_grid,
+            p_demand=self.p_demand,
             p_grid_over_since=(
                 now_ts - self.grid_over_since if self.grid_over_since is not None else None
             ),
+            shed_urgent=self.shed_urgent,
             forecast_hours=tuple(forecast),
             cop_by_head_count=cop_hints,
             aux_indoor=tuple(aux_indoor),
@@ -941,9 +1016,10 @@ class AdaptiveComfortRuntime:
 
     @property
     def power_headroom_w(self) -> float | None:
-        if self.p_grid is None:
+        demand = self.p_demand if self.p_demand is not None else self.p_grid
+        if demand is None:
             return None
-        return self.settings.limit_w - self.p_grid
+        return self.settings.limit_w - demand
 
     @property
     def shedding_active(self) -> bool:
@@ -969,6 +1045,9 @@ class AdaptiveComfortRuntime:
             "t_out": self.t_out,
             "t_rm": self.t_rm,
             "p_grid": self.p_grid,
+            "p_demand": self.p_demand,
+            "known_load_total": self.known_load_total,
+            "shed_urgent": self.shed_urgent,
             "p_load": self.p_load,
             "p_ac": self.p_ac,
             "forecast": self.forecast,

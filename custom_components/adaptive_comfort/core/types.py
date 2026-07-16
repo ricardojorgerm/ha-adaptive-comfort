@@ -109,7 +109,7 @@ class Settings:
     min_off_min: float = 10.0
     contracted_kva: float = 3.45
     power_factor: float = 1.0
-    shed_start_pct: float = 0.92
+    shed_start_pct: float = 0.88
     shed_restore_pct: float = 0.75
     adaptive_blend: float = 0.3
     coordination: bool = True
@@ -162,7 +162,9 @@ class HouseSnapshot:
     t_rm: float | None = None  # 7-day running-mean outdoor temperature
     house_occupied: bool | None = None
     p_grid: float | None = None
-    p_grid_over_since: float | None = None  # ts since grid power > shed threshold
+    p_demand: float | None = None  # conservative demand used for shedding
+    p_grid_over_since: float | None = None  # s demand has exceeded shed threshold
+    shed_urgent: bool = False  # immediate shed (critical overload or known-load spike)
     forecast_hours: tuple[float, ...] = ()  # hourly outdoor forecast, aligned with free_float
     cop_by_head_count: dict[int, float] = field(default_factory=dict)  # empirical COP hints
     # Temperatures from unconditioned rooms as (temp, weight) pairs; weak

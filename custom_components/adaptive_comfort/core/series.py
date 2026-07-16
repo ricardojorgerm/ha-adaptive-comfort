@@ -39,6 +39,10 @@ class TimeSeries:
         vals = self.window(start_ts, end_ts)
         return sum(vals) / len(vals) if vals else None
 
+    def max_window(self, start_ts: float, end_ts: float) -> float | None:
+        vals = self.window(start_ts, end_ts)
+        return max(vals) if vals else None
+
     def value_at(self, ts: float, max_age_s: float = 900.0) -> float | None:
         """Most recent value at or before ts, if fresh enough."""
         best: tuple[float, float] | None = None

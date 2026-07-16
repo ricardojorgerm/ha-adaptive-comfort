@@ -49,9 +49,23 @@ def test_estimate_and_allocate():
 
 def test_shed_thresholds_for_345_kva():
     limit = 3.45 * 1000.0  # the contracted 3.45 kVA -> 3450 W
-    assert not power.shed_needed(3000.0, limit, 0.92, None)
-    assert not power.shed_needed(3300.0, limit, 0.92, 5.0)  # not sustained
-    assert power.shed_needed(3300.0, limit, 0.92, 20.0)
+    start = power.SHED_DEFAULT_START_PCT
+    assert not power.shed_needed(3000.0, limit, start, None)
+    assert not power.shed_needed(3300.0, limit, start, 3.0)  # not sustained
+    assert power.shed_needed(3300.0, limit, start, 6.0)
+    assert power.shed_needed(3400.0, limit, start, None, urgent=True)
+    assert power.shed_needed(3320.0, limit, start, None)  # >= 96% critical
     assert power.restore_allowed(1500.0, limit, 0.75, 700.0)
     assert not power.restore_allowed(2900.0, limit, 0.75, 700.0)
     assert not power.restore_allowed(2500.0, limit, 0.75, 900.0)
+
+
+def test_contracted_demand_uses_known_loads_when_meter_lags():
+    demand = power.contracted_demand_w(
+        p_grid=600.0,
+        known_loads=[2300.0, 50.0],
+        active_ac_w=500.0,
+        p_grid_peak=2900.0,
+    )
+    assert demand == 2900.0
+    assert demand >= 2850.0

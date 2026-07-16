@@ -152,7 +152,8 @@ def test_shedding_prefers_unoccupied_and_overrides_min_on():
     snap = make_snapshot(
         [living, guest],
         settings,
-        p_grid=3400.0,  # over 92% of 3450 W
+        p_demand=3400.0,
+        p_grid=3400.0,
         p_grid_over_since=30.0,
     )
     state = warmed_state([living, guest])
@@ -164,9 +165,28 @@ def test_shedding_prefers_unoccupied_and_overrides_min_on():
     assert "guest" in state.shed
 
 
+def test_urgent_shedding_drops_all_active_zones():
+    living = make_zone("living", 26.0, occupied=True, is_on=True)
+    guest = make_zone("guest", 24.0, occupied=False, is_on=True)
+    settings = Settings(hvac_mode=MODE_COOL)
+    snap = make_snapshot(
+        [living, guest],
+        settings,
+        p_demand=3350.0,
+        p_grid=600.0,
+        shed_urgent=True,
+    )
+    state = warmed_state([living, guest])
+    state.zone_on = {"living": True, "guest": True}
+    decision = controller.tick(snap, state)
+    off = {c.zone_id for c in decision.commands if c.hvac_mode == MODE_OFF}
+    assert off == {"living", "guest"}
+    assert set(state.shed) == {"living", "guest"}
+
+
 def test_shed_restores_with_headroom():
     zone = make_zone("bed", 25.0, draw_w=700.0)
-    snap = make_snapshot([zone], Settings(hvac_mode=MODE_COOL), p_grid=1200.0)
+    snap = make_snapshot([zone], Settings(hvac_mode=MODE_COOL), p_demand=1200.0, p_grid=1200.0)
     state = warmed_state([zone])
     state.shed["bed"] = NOW - 600.0
     decision = controller.tick(snap, state)
@@ -177,7 +197,7 @@ def test_shed_restores_with_headroom():
 
 def test_no_restore_without_headroom():
     zone = make_zone("bed", 25.0, draw_w=700.0)
-    snap = make_snapshot([zone], Settings(hvac_mode=MODE_COOL), p_grid=3000.0)
+    snap = make_snapshot([zone], Settings(hvac_mode=MODE_COOL), p_demand=3000.0, p_grid=3000.0)
     state = warmed_state([zone])
     state.shed["bed"] = NOW - 600.0
     controller.tick(snap, state)

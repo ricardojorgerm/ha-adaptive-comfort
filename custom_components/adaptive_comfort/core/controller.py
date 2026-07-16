@@ -27,6 +27,7 @@ PREDICT_MARGIN_K = 0.1
 HELPER_BAND_FRACTION = 0.5
 MAX_MODE_CHANGES_PER_H = 3
 SHED_ACTION_SPACING_S = 30.0
+SHED_URGENT_SPACING_S = 3.0
 COMMAND_SPACING_S = 180.0
 SETPOINT_EPSILON_K = 0.25
 COP_TABLE_ADVANTAGE = 1.05
@@ -277,21 +278,28 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
     # 4. Shedding overrides everything else.
     shed_active = bool(state.shed)
+    p_demand = snap.p_demand if snap.p_demand is not None else snap.p_grid
     if s.shedding_enabled:
-        if power.shed_needed(snap.p_grid, s.limit_w, s.shed_start_pct, snap.p_grid_over_since):
-            if now - state.last_shed_action >= SHED_ACTION_SPACING_S:
+        if power.shed_needed(
+            p_demand,
+            s.limit_w,
+            s.shed_start_pct,
+            snap.p_grid_over_since,
+            urgent=snap.shed_urgent,
+        ):
+            spacing = SHED_URGENT_SPACING_S if snap.shed_urgent else SHED_ACTION_SPACING_S
+            if now - state.last_shed_action >= spacing:
                 candidates = [
                     z for z in zones if state.zone_on.get(z.zone_id) and z.zone_id not in state.shed
                 ]
-                # Unoccupied first, then the zone that needs conditioning least.
                 candidates.sort(
                     key=lambda z: (
                         0 if z.occupied is False else 1,
                         _comfort_error(z, centers[z.zone_id], mode),
                     )
                 )
-                if candidates:
-                    victim = candidates[0]
+                victims = candidates if snap.shed_urgent else candidates[:1]
+                for victim in victims:
                     state.shed[victim.zone_id] = now
                     state.last_shed_action = now
                     shed_active = True
@@ -302,7 +310,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 key=lambda z: -_comfort_error(z, centers[z.zone_id], mode),
             )
             for zone in restorable:
-                if power.restore_allowed(snap.p_grid, s.limit_w, s.shed_restore_pct, zone.draw_w):
+                if power.restore_allowed(p_demand, s.limit_w, s.shed_restore_pct, zone.draw_w):
                     del state.shed[zone.zone_id]
                     state.last_shed_action = now
                     break

@@ -160,18 +160,68 @@ def allocate_power(
 
 # -- contracted-power shedding ------------------------------------------------
 
+SHED_SUSTAINED_S = 5.0
+SHED_CRITICAL_PCT = 0.96
+SHED_PEAK_WINDOW_S = 120.0
+SHED_DEFAULT_START_PCT = 0.88
+KNOWN_LOAD_SPIKE_W = 800.0
+DEFAULT_AC_DRAW_W = 400.0
+
+
+def estimated_active_ac_draw_w(
+    zone_draws: list[float | None],
+    p_ac_est: float | None = None,
+) -> float:
+    """Conservative in-service AC draw when the meter lags or under-reports."""
+    learned = sum(w for w in zone_draws if w is not None)
+    if p_ac_est is not None and p_ac_est > 0:
+        return max(learned, p_ac_est)
+    if learned > 0:
+        return learned
+    if any(w is None for w in zone_draws):
+        return DEFAULT_AC_DRAW_W * len(zone_draws)
+    return 0.0
+
+
+def contracted_demand_w(
+    p_grid: float | None,
+    known_loads: list[float] | None = None,
+    active_ac_w: float = 0.0,
+    p_grid_peak: float | None = None,
+) -> float | None:
+    """Best-effort whole-house demand for shedding (max of meter and parts sum).
+
+    When the grid sensor lags (common with energy-style meters), a large known
+    load such as an oven plus running AC can exceed the contract limit even
+    though the latest grid sample still looks low.
+    """
+    parts: list[float] = []
+    if p_grid is not None:
+        parts.append(p_grid)
+    if p_grid_peak is not None:
+        parts.append(p_grid_peak)
+    known_sum = sum(known_loads or [])
+    if known_sum > 0.0 or active_ac_w > 0.0:
+        parts.append(known_sum + active_ac_w)
+    return max(parts) if parts else None
+
 
 def shed_needed(
-    p_grid: float | None,
+    p_demand: float | None,
     limit_w: float,
     start_pct: float,
     over_since_s: float | None,
-    sustained_s: float = 15.0,
+    *,
+    sustained_s: float = SHED_SUSTAINED_S,
+    critical_pct: float = SHED_CRITICAL_PCT,
+    urgent: bool = False,
 ) -> bool:
-    """True when the grid draw has exceeded the shed threshold long enough."""
-    if p_grid is None:
+    """True when contracted demand has exceeded the shed threshold long enough."""
+    if p_demand is None:
         return False
-    if p_grid <= start_pct * limit_w:
+    if urgent or p_demand >= critical_pct * limit_w:
+        return True
+    if p_demand <= start_pct * limit_w:
         return False
     return over_since_s is not None and over_since_s >= sustained_s
 
