@@ -161,3 +161,16 @@ def test_fit_is_fallback_marks_unlearned_regime():
     model = _cool_capable_model()  # only the door_closed regime is fitted
     assert model.fit_is_fallback(True) is True
     assert model.fit_is_fallback(False) is False
+
+
+def test_update_cop_includes_latent():
+    """Sensible-only heat flow undercounts delivered cooling by the latent
+    share; here the sensible-only sample even falls below COP_MIN and is
+    rejected (the field bug: implausibly low zone COPs), while the
+    latent-inclusive sample lands in the plausible band."""
+    a = _cool_capable_model()
+    b = _cool_capable_model()
+    a.update_cop(400.0, 24.0, 30.0, 12.0, dtdt_per_h=-3.0)
+    b.update_cop(400.0, 24.0, 30.0, 12.0, dtdt_per_h=-3.0, latent_w=200.0)
+    assert a.cop is None  # sensible-only: 147 W / 400 W -> below COP_MIN
+    assert b.cop is not None and b.cop > 0.8  # latent counted as delivered heat

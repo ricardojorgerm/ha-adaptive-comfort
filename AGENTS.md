@@ -75,7 +75,27 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   in the conditioning direction (up to `PARK_MARGIN_MAX_K`), and settles the preferred
   depth on a clean exit. Devices differ (thermo-off vs keep-temperature trickle) and the
   estimator learns which; nothing hardcodes either answer. Shed zones never park. Helper
-  selection outranks parking.
+  selection outranks parking. The overcorrection release sits `PARK_OVERCOOL_BUFFER_K`
+  *below* the band floor (cool; above the ceiling in heat) — zones exit demand AT the floor,
+  so a guard placed on the floor itself kills every park at entry (a real field failure).
+  Probe budget is charged at *release* and only when the probe produced observations;
+  stillborn probes get the short `PARK_PROBE_RETRY_S` clock instead of the 6 h spacing.
+- **Run-out is the free probe window.** A zone wanting off while `min_on` forces it to run
+  is parked immediately — no sibling requirement, no probe budget — because the compressor
+  is alive regardless: observations are free, and an idling head saves energy versus tracked
+  run-out. Parked releases honor `min_on`; continued exploitation beyond it requires a live
+  sibling (`want_on`); park direction follows `head_mode` when the house's dominant mode goes
+  idle; overcorrected-but-unstoppable zones hold at `PARK_MARGIN_MAX_K` rather than being
+  released into a forbidden off. Tracked `runout` commands are the `park_learning`-off
+  fallback only.
+- **Zone COP counts latent.** `update_cop` heat flow is sensible + latent; sensible-only
+  samples in humid rooms undercount delivered cooling by 30–50% and can fall below
+  `COP_MIN`, producing absurd or silently-rejected readings.
+- **Control/park history is entity-backed.** Zone sensors expose `control_state`,
+  `track_delta`, `park_classification`, `park_preferred_margin`, `park_margin`,
+  `park_extraction`, and `command_reason` (plus `binary_sensor` `zone_parked` and
+  house `parked_zones`) so HA history can chart behaviors that only lived in
+  controller memory before.
 
 ## Control-loop cheatsheet (what happens each 60 s tick)
 

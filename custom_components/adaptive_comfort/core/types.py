@@ -160,6 +160,14 @@ class ZoneSnapshot:
     enabled: bool = True
     # Park-behavior knowledge (from ParkEstimator): None until classified.
     park_trickles: bool | None = None
+    # Parked observations accumulated so far (probe bookkeeping: a probe
+    # only counts against the probe budget if it produced observations).
+    park_samples: int = 0
+    # Physical conditioning direction of the head right now (MODE_COOL /
+    # MODE_HEAT / None), independent of the house's dominant mode. Lets the
+    # controller keep tracking a zone that is running out its minimum
+    # runtime after the house has gone idle.
+    head_mode: str | None = None
     park_extraction_w: float | None = None
     # Learned park depth (K) to start from on the next park entry.
     park_preferred_margin_k: float | None = None
@@ -230,7 +238,13 @@ class ControllerState:
     window_suggest_since: dict[str, float] = field(default_factory=dict)
     zone_track_delta: dict[str, float] = field(default_factory=dict)  # tracking-control depth (K)
     zone_parked_since: dict[str, float] = field(default_factory=dict)  # parked-state entry time
-    zone_last_park_probe: dict[str, float] = field(default_factory=dict)  # probe rate limiting
+    zone_last_park_probe: dict[str, float] = field(default_factory=dict)  # consumed-probe spacing
+    zone_last_park_abort: dict[str, float] = field(
+        default_factory=dict
+    )  # stillborn-probe retry spacing
+    zone_park_probe_entry: dict[str, int] = field(
+        default_factory=dict
+    )  # park_samples at probe entry
     zone_park_margin: dict[str, float] = field(
         default_factory=dict
     )  # adaptive margin above internal (K)
@@ -251,7 +265,9 @@ class ControllerState:
             "zone_track_delta": dict(self.zone_track_delta),
             "zone_parked_since": dict(self.zone_parked_since),
             "zone_last_park_probe": dict(self.zone_last_park_probe),
+            "zone_park_probe_entry": dict(self.zone_park_probe_entry),
             "zone_park_margin": dict(self.zone_park_margin),
+            "zone_last_park_abort": dict(self.zone_last_park_abort),
             "zone_park_preferred": dict(self.zone_park_preferred),
         }
 
@@ -271,8 +287,14 @@ class ControllerState:
         st.zone_last_park_probe = {
             str(k): float(v) for k, v in data.get("zone_last_park_probe", {}).items()
         }
+        st.zone_park_probe_entry = {
+            str(k): int(v) for k, v in data.get("zone_park_probe_entry", {}).items()
+        }
         st.zone_park_margin = {
             str(k): float(v) for k, v in data.get("zone_park_margin", {}).items()
+        }
+        st.zone_last_park_abort = {
+            str(k): float(v) for k, v in data.get("zone_last_park_abort", {}).items()
         }
         st.zone_park_preferred = {
             str(k): float(v) for k, v in data.get("zone_park_preferred", {}).items()

@@ -103,8 +103,12 @@ def test_estimator_settle_preferred_blends_down():
 def test_park_preferred_state_round_trips():
     state = ControllerState()
     state.zone_park_preferred["z1"] = 2.0
+    state.zone_park_probe_entry["z1"] = 3
+    state.zone_last_park_abort["z1"] = 123.0
     restored = ControllerState.from_dict(state.to_dict())
     assert restored.zone_park_preferred == {"z1": 2.0}
+    assert restored.zone_park_probe_entry == {"z1": 3}
+    assert restored.zone_last_park_abort == {"z1": 123.0}
 
 
 def test_park_exit_clears_session_margin():
@@ -141,7 +145,9 @@ def test_unclassified_satisfied_zone_gets_probe_parked():
     cmd = find_cmd(decision, "sat")
     assert cmd is not None and cmd.park is True
     assert "sat" in state.zone_parked_since
-    assert state.zone_last_park_probe["sat"] == NOW
+    # Probe budget is charged at release (only if observed), not at entry.
+    assert "sat" not in state.zone_last_park_probe
+    assert state.zone_park_probe_entry["sat"] == 0
 
 
 def test_probe_rate_limited():
@@ -242,17 +248,31 @@ def test_parked_zone_refreshes_park_command_on_spacing():
 
 
 def test_parked_zone_released_when_pushed_through_far_edge():
-    """Non-idling head out-cools the load: comfort floor breach releases
-    immediately, even before the dwell elapses."""
+    """Non-idling head out-cools the load: release only below lo - buffer
+    (at the floor itself must survive — that is the field bug)."""
     satisfied, hot, state = _two_zone_setup(
         park_trickles=True, park_extraction_w=400.0, standing_load_w=100.0
     )
     tick([satisfied, hot], state)
     assert "sat" in state.zone_parked_since
     soon = NOW + 120.0  # well inside PARK_MIN_DWELL_S
-    frozen = make_zone("sat", 21.0, is_on=True, park_trickles=True)  # below band lo
+    # Band lo = target - band_k = 22.3; at the floor the session must live.
+    at_floor = make_zone(
+        "sat", 22.3, is_on=True, park_trickles=True, park_extraction_w=400.0
+    )
     state.zone_last_cmd["sat"] = soon - 3600.0
-    decision = tick([frozen, hot], state, now=soon)
+    tick([at_floor, hot], state, now=soon)
+    assert "sat" in state.zone_parked_since
+    # Past the buffer: release immediately (sibling still alive, off allowed).
+    frozen = make_zone(
+        "sat",
+        22.3 - controller.PARK_OVERCOOL_BUFFER_K - 0.05,
+        is_on=True,
+        park_trickles=True,
+    )
+    later = soon + 60.0
+    state.zone_last_cmd["sat"] = later - 3600.0
+    decision = tick([frozen, hot], state, now=later)
     assert "sat" not in state.zone_parked_since
     cmd = find_cmd(decision, "sat")
     assert cmd is None or cmd.park is False
@@ -394,9 +414,7 @@ def test_heating_park_entry_and_far_edge_release():
 
     # Overheat past band hi (center 23 ± 0.7 → hi 23.7): release immediately.
     soon = NOW + 120.0
-    hot_room = make_zone(
-        "sat", 27.0, is_on=True, park_trickles=True, park_extraction_w=200.0
-    )
+    hot_room = make_zone("sat", 27.0, is_on=True, park_trickles=True, park_extraction_w=200.0)
     state.zone_last_cmd["sat"] = soon - 3600.0
     decision = tick([hot_room, cold], state, settings=settings, now=soon)
     assert "sat" not in state.zone_parked_since
@@ -434,3 +452,119 @@ def test_heating_margin_escalates_while_room_keeps_warming():
     cmd = find_cmd(decision, "sat")
     assert cmd is not None and cmd.park is True
     assert cmd.park_margin == state.zone_park_margin["sat"]
+
+
+# --- field-bug regressions: floor entry, probe budget, run-out ------------------
+
+
+def test_park_entered_at_band_floor_survives():
+    """Zones exit demand AT the floor, so entry temp == lo must not trip the
+    overcorrection release (the field failure: every probe died in one tick)."""
+    satisfied, hot, state = _two_zone_setup(satisfied_temp=23.0)
+    tick([satisfied, hot], state)
+    assert "sat" in state.zone_parked_since
+    # Next tick, same temperature (at/near the floor, inside the buffer):
+    later = NOW + 65.0
+    tick([satisfied, hot], state, now=later)
+    assert "sat" in state.zone_parked_since, "buffer must keep floor-parked zones alive"
+
+
+def test_stillborn_probe_charges_retry_not_budget():
+    satisfied, hot, state = _two_zone_setup()
+    tick([satisfied, hot], state)  # probe park, park_samples == 0
+    assert "sat" in state.zone_park_probe_entry
+    # Probe window elapses with zero observations gathered:
+    later = NOW + controller.PARK_PROBE_S + 60.0
+    state.zone_last_cmd["sat"] = later - 3600.0
+    tick([satisfied, hot], state, now=later)
+    assert "sat" not in state.zone_parked_since
+    assert "sat" not in state.zone_last_park_probe, "no observations -> budget unchanged"
+    assert state.zone_last_park_abort.get("sat") == later
+    # Immediately satisfied again: retry clock blocks a new probe...
+    tick([satisfied, hot], state, now=later + 120.0)
+    assert "sat" not in state.zone_parked_since
+    # ...but after the short retry interval a new probe is allowed (the zone
+    # has run again in the meantime, so it is on and past min_on).
+    retry_at = later + controller.PARK_PROBE_RETRY_S + 60.0
+    state.zone_on["sat"] = True
+    state.zone_since["sat"] = retry_at - 3600.0
+    state.zone_last_cmd["sat"] = retry_at - 3600.0
+    tick([satisfied, hot], state, now=retry_at)
+    assert "sat" in state.zone_parked_since
+
+
+def test_observed_probe_charges_budget():
+    satisfied, hot, state = _two_zone_setup()
+    tick([satisfied, hot], state)  # probe park at samples == 0
+    later = NOW + controller.PARK_PROBE_S + 60.0
+    observed = make_zone("sat", 23.0, is_on=True, park_samples=4)
+    state.zone_last_cmd["sat"] = later - 3600.0
+    tick([observed, hot], state, now=later)
+    assert "sat" not in state.zone_parked_since
+    assert state.zone_last_park_probe.get("sat") == later
+    assert "sat" not in state.zone_last_park_abort
+
+
+def test_runout_zone_parks_for_free_observation():
+    """A zone wanting off but blocked by min_on parks (no sibling needed, no
+    probe budget): the compressor runs regardless, so observation is free.
+    This is the field case: East satisfied at ~25 C, sibling idle, min_on
+    running out - previously it just waited and hard-cooled at a stale
+    setpoint, then turned off having learned nothing."""
+    zone = make_zone("z1", 23.0, is_on=True, head_mode=MODE_COOL)
+    state = ControllerState()
+    state.zone_on["z1"] = True
+    state.zone_since["z1"] = NOW - 300.0  # inside min_on: off blocked
+    state.mode_since = NOW - 24 * 3600.0
+    decision = tick([zone], state)
+    cmd = find_cmd(decision, "z1")
+    assert cmd is not None and cmd.park is True
+    assert "z1" in state.zone_parked_since
+    assert "z1" not in state.zone_park_probe_entry  # free: no budget involved
+
+
+def test_runout_park_survives_probe_window_while_min_on_blocks():
+    zone = make_zone("z1", 23.0, is_on=True, head_mode=MODE_COOL)
+    state = ControllerState()
+    state.zone_on["z1"] = True
+    state.zone_since["z1"] = NOW - 60.0  # just turned on: min_on has ~19 min left
+    state.mode_since = NOW - 24 * 3600.0
+    tick([zone], state)
+    # Probe window (15 min) elapses but min_on (20 min) still blocks off:
+    later = NOW + controller.PARK_PROBE_S + 30.0
+    state.zone_last_cmd["z1"] = later - 3600.0
+    tick([make_zone("z1", 23.0, is_on=True, head_mode=MODE_COOL)], state, now=later)
+    assert "z1" in state.zone_parked_since, "off not allowed yet -> stay parked"
+
+
+def test_runout_park_releases_when_off_allowed_and_no_sibling():
+    zone = make_zone("z1", 23.0, is_on=True, head_mode=MODE_COOL)
+    state = ControllerState()
+    state.zone_on["z1"] = True
+    state.zone_since["z1"] = NOW - 300.0
+    state.mode_since = NOW - 24 * 3600.0
+    tick([zone], state)
+    # Past min_on and past dwell, no sibling wants on: release to off.
+    later = NOW + 1500.0  # 25 min after zone_since: min_on satisfied
+    state.zone_last_cmd["z1"] = later - 3600.0
+    tick([make_zone("z1", 23.0, is_on=True, head_mode=MODE_COOL)], state, now=later)
+    assert "z1" not in state.zone_parked_since
+
+
+def test_runout_falls_back_to_min_delta_when_park_learning_off():
+    from custom_components.adaptive_comfort.core.types import MODE_AUTO
+
+    settings = Settings(hvac_mode=MODE_AUTO, target=23.0, park_learning=False)
+    zone = make_zone("z1", 23.0, is_on=True, head_mode=MODE_COOL)
+    state = ControllerState()
+    state.zone_on["z1"] = True
+    state.zone_since["z1"] = NOW - 300.0
+    state.mode_since = NOW - 24 * 3600.0
+    snap = HouseSnapshot(now_ts=NOW, local_hour=12.0, settings=settings, zones=[zone], t_out=23.0)
+    decision = controller.tick(snap, state)
+    cmd = find_cmd(decision, "z1")
+    if decision.state.mode not in ("cool", "heat"):
+        assert cmd is not None and cmd.reason == "runout"
+        assert cmd.track_delta == controller.TRACK_DELTA_MIN_K
+    else:
+        assert cmd is None or cmd.park is False

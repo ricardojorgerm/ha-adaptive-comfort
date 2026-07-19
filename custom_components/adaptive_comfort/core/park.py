@@ -76,9 +76,7 @@ class ParkEstimator:
         """Blend preferred toward a margin that held without overcorrection."""
         m = min(max(margin_k, MARGIN_MIN_K), MARGIN_MAX_K)
         self.preferred_margin_k += MARGIN_SETTLE_ALPHA * (m - self.preferred_margin_k)
-        self.preferred_margin_k = min(
-            max(self.preferred_margin_k, MARGIN_MIN_K), MARGIN_MAX_K
-        )
+        self.preferred_margin_k = min(max(self.preferred_margin_k, MARGIN_MIN_K), MARGIN_MAX_K)
 
     @property
     def classification(self) -> str:

@@ -42,6 +42,13 @@ TRACK_DELTA_DEFAULT_K = 0.7
 # internal reading, minimum dwell in/out of the parked state, probe length
 # and per-zone probe spacing while behavior is still unclassified.
 PARK_MARGIN_K = 1.0
+# Zones normally exit demand at the band floor, so a freshly parked room sits
+# AT lo by construction. The overcorrection release must therefore sit a
+# buffer BELOW the floor - otherwise every park dies on its first tick (as
+# observed in the field: samples stayed 0 and probes burned their budget).
+PARK_OVERCOOL_BUFFER_K = 0.4
+# A probe that never produced an observation should be cheap to retry.
+PARK_PROBE_RETRY_S = 1800.0
 PARK_MARGIN_MAX_K = 3.0
 PARK_MARGIN_STEP_K = 0.5
 # Enter each park one step below the learned preferred depth (still >=
@@ -178,7 +185,20 @@ def _settle_park_preferred(state: ControllerState, zid: str, margin: float) -> N
     )
 
 
-def _clear_park_session(state: ControllerState, zid: str) -> None:
+def _clear_park_session(
+    state: ControllerState, zid: str, zone: ZoneSnapshot | None = None, now: float = 0.0
+) -> None:
+    # Probe bookkeeping: the 6 h probe spacing is only charged when the probe
+    # produced at least one observation; a stillborn probe gets the short
+    # retry clock instead, so a killed session cannot lock learning out.
+    entry_samples = state.zone_park_probe_entry.pop(zid, None)
+    if entry_samples is not None and zone is not None:
+        if zone.park_samples > entry_samples:
+            state.zone_last_park_probe[zid] = now
+            state.zone_last_park_abort.pop(zid, None)
+        else:
+            state.zone_last_park_abort[zid] = now
+            state.zone_last_park_probe.pop(zid, None)
     state.zone_parked_since.pop(zid, None)
     state.zone_park_ref.pop(zid, None)
     state.zone_park_margin.pop(zid, None)
@@ -416,18 +436,32 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             state.zone_park_preferred[zid] = _park_preferred(zone, state)
         parked_since = state.zone_parked_since.get(zid)
         if parked_since is not None:
+            # Direction: dominant mode when conditioning, else the head's own
+            # physical mode - run-out parks must survive the house going idle.
+            pmode = mode if mode in (MODE_HEAT, MODE_COOL) else zone.head_mode
+            off_allowed = (
+                s.hvac_mode == MODE_OFF
+                or zid in state.shed
+                or _transition_allowed(state, zid, now, False, s)
+            )
+            sibling_alive = any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones)
             dwell_ok = now - parked_since >= PARK_MIN_DWELL_S
             probing = zone.park_trickles is None
             probe_done = probing and now - parked_since >= PARK_PROBE_S
             lo_b, hi_b = bands[zid]
             out_of_band = zone.temp is not None and (
-                zone.temp > hi_b if mode == MODE_COOL else zone.temp < lo_b
+                pmode is not None and (zone.temp > hi_b if pmode == MODE_COOL else zone.temp < lo_b)
             )
             # Far-edge breach: the parked head is out-conditioning the load
             # and pushed the room through the opposite comfort edge. Releases
             # immediately (no dwell): comfort beats characterization.
             overcorrected = zone.temp is not None and (
-                zone.temp <= lo_b if mode == MODE_COOL else zone.temp >= hi_b
+                pmode is not None
+                and (
+                    zone.temp <= lo_b - PARK_OVERCOOL_BUFFER_K
+                    if pmode == MODE_COOL
+                    else zone.temp >= hi_b + PARK_OVERCOOL_BUFFER_K
+                )
             )
 
             # Margin escalation: if the room keeps moving in the conditioning
@@ -439,12 +473,12 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             margin = state.zone_park_margin.get(zid, preferred)
             margin_exhausted = False
             margin_changed = False
-            if zone.temp is not None:
+            if zone.temp is not None and pmode in (MODE_HEAT, MODE_COOL):
                 ref = state.zone_park_ref.get(zid)
                 if ref is None:
                     state.zone_park_ref[zid] = zone.temp
                 else:
-                    moved = ref - zone.temp if mode == MODE_COOL else zone.temp - ref
+                    moved = ref - zone.temp if pmode == MODE_COOL else zone.temp - ref
                     if moved >= PARK_ADAPT_EPS_K:
                         if margin < PARK_MARGIN_MAX_K:
                             margin = min(margin + PARK_MARGIN_STEP_K, PARK_MARGIN_MAX_K)
@@ -465,38 +499,57 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                             margin_changed = True
                         state.zone_park_ref[zid] = zone.temp
 
+            if (overcorrected or margin_exhausted) and not off_allowed:
+                # Head cannot hold temperature, but min-runtime forbids off:
+                # hold at maximum depth (the gentlest expressible output).
+                state.zone_park_margin[zid] = PARK_MARGIN_MAX_K
+                diag.setdefault("park_overcorrected_held", []).append(zid)
+                if (
+                    now - state.zone_last_cmd.get(zid, 0.0) >= COMMAND_SPACING_S
+                    and pmode is not None
+                ):
+                    commands.append(
+                        Command(zid, pmode, None, "park", park=True, park_margin=PARK_MARGIN_MAX_K)
+                    )
+                    state.zone_last_cmd[zid] = now
+                continue
             if overcorrected or margin_exhausted:
                 # Head cannot hold temperature at any depth: idle it.
                 # Keep preferred high-water so the next park starts deeper.
-                _clear_park_session(state, zid)
+                _clear_park_session(state, zid, zone, now)
                 diag.setdefault("park_overcorrected", []).append(zid)
                 desired_on = False
             elif out_of_band and dwell_ok:
                 # Load beat the parked output: fall through to normal
                 # demand handling below (zone re-enters as wanting on).
                 _settle_park_preferred(state, zid, margin)
-                _clear_park_session(state, zid)
+                _clear_park_session(state, zid, zone, now)
             elif zid in state.shed or (
                 dwell_ok
+                and off_allowed
                 and (
                     probe_done
                     or zone.park_trickles is False
-                    or not _park_exploit_ok(zone, mode)
-                    or mode not in (MODE_HEAT, MODE_COOL)
+                    or not _park_exploit_ok(zone, pmode)
+                    or not sibling_alive
+                    or pmode is None
                 )
             ):
                 # Probe finished, head classified as idler, or exploitation
                 # no longer justified: release to normal off handling.
-                if zid not in state.shed and mode in (MODE_HEAT, MODE_COOL):
+                # Settle even when the house mode is already idle (run-out parks).
+                if zid not in state.shed:
                     _settle_park_preferred(state, zid, margin)
-                _clear_park_session(state, zid)
+                _clear_park_session(state, zid, zone, now)
                 desired_on = False
             else:
                 # Stay parked: refresh when spacing elapses *or* margin moved
                 # so the head sees the new depth immediately.
                 last_cmd = state.zone_last_cmd.get(zid, 0.0)
-                if margin_changed or now - last_cmd >= COMMAND_SPACING_S:
-                    commands.append(Command(zid, mode, None, "park", park=True, park_margin=margin))
+                if (margin_changed or now - last_cmd >= COMMAND_SPACING_S) and pmode is not None:
+                    commands.append(
+                        Command(zid, pmode, None, "park", park=True, park_margin=margin)
+                    )
                     state.zone_last_cmd[zid] = now
                 continue
         elif (
@@ -512,6 +565,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             probe_due = (
                 zone.park_trickles is None
                 and now - state.zone_last_park_probe.get(zid, 0.0) >= PARK_PROBE_SPACING_S
+                and now - state.zone_last_park_abort.get(zid, 0.0) >= PARK_PROBE_RETRY_S
             )
             exploit = zone.park_trickles is True and _park_exploit_ok(zone, mode)
             if probe_due or exploit:
@@ -523,10 +577,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 if zone.temp is not None:
                     state.zone_park_ref[zid] = zone.temp
                 if probe_due:
-                    state.zone_last_park_probe[zid] = now
-                commands.append(
-                    Command(zid, mode, None, "park", park=True, park_margin=entry)
-                )
+                    state.zone_park_probe_entry[zid] = zone.park_samples
+                commands.append(Command(zid, mode, None, "park", park=True, park_margin=entry))
                 state.zone_last_cmd[zid] = now
                 diag.setdefault("parked", []).append(zid)
                 continue
@@ -539,11 +591,49 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 _record_transition(state, zid, now, desired_on)
                 transitioned = True
             else:
+                if (
+                    not desired_on
+                    and currently_on
+                    and s.park_learning
+                    and zid not in state.shed
+                    and zid not in state.zone_parked_since
+                    and zone.head_mode in (MODE_HEAT, MODE_COOL)
+                ):
+                    # Run-out park: the zone wants off but min-runtime forces
+                    # it to keep running - the compressor is alive regardless,
+                    # so parking is free. No sibling requirement and no probe
+                    # budget: observations accrue, and if the head idles above
+                    # setpoint this *saves* energy versus tracked run-out.
+                    entry = _park_entry_margin(zone, state)
+                    state.zone_parked_since[zid] = now
+                    state.zone_park_margin[zid] = entry
+                    if zone.temp is not None:
+                        state.zone_park_ref[zid] = zone.temp
+                    commands.append(
+                        Command(zid, zone.head_mode, None, "park", park=True, park_margin=entry)
+                    )
+                    state.zone_last_cmd[zid] = now
+                    diag.setdefault("parked", []).append(zid)
+                    continue
                 desired_on = currently_on  # guard blocks the change this tick
 
         if desired_on and mode not in (MODE_HEAT, MODE_COOL):
-            # Zone must keep running out its minimum runtime while the house
-            # has gone idle: leave the head as-is, no command this tick.
+            # Zone is running out its minimum runtime while the house has
+            # gone idle. Do not leave the head at a stale (possibly deep)
+            # tracked setpoint: ease it to minimum tracking depth in its own
+            # physical direction so it trickles instead of cooling hard into
+            # a room nobody asked to condition further.
+            if (
+                s.tracking
+                and zone.is_on
+                and zone.head_mode in (MODE_HEAT, MODE_COOL)
+                and now - state.zone_last_cmd.get(zid, 0.0) >= COMMAND_SPACING_S
+            ):
+                state.zone_track_delta[zid] = TRACK_DELTA_MIN_K
+                commands.append(
+                    Command(zid, zone.head_mode, None, "runout", track_delta=TRACK_DELTA_MIN_K)
+                )
+                state.zone_last_cmd[zid] = now
             continue
 
         if desired_on:
@@ -611,7 +701,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             state.zone_last_cmd[zid] = now
             state.zone_last_setpoint.pop(zid, None)
             state.zone_track_delta.pop(zid, None)
-            _clear_park_session(state, zid)
+            _clear_park_session(state, zid, zone, now)
 
     diag["shedding_active"] = shed_active
     return Decision(commands, state, diag, window_suggestions)

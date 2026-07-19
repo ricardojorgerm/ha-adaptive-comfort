@@ -180,6 +180,7 @@
       "total_latent": { "name": "Total latent power" },
       "house_cop": { "name": "House COP" },
       "model_confidence": { "name": "Model confidence" },
+      "parked_zones": { "name": "Parked zones" },
       "zone_temperature": { "name": "Temperature (corrected)" },
       "predicted_60m": { "name": "Predicted temperature +60 min" },
       "k_exchange": { "name": "Outdoor exchange constant k" },
@@ -194,11 +195,47 @@
       "latent_power": { "name": "Latent power" },
       "drift_offset": { "name": "Sensor drift offset" },
       "zone_confidence": { "name": "Fit confidence" },
-      "allocated_power": { "name": "Allocated AC power" }
+      "allocated_power": { "name": "Allocated AC power" },
+      "control_state": {
+        "name": "Control state",
+        "state": {
+          "off": "Off",
+          "demand": "Demand",
+          "helper": "Helper",
+          "park": "Parked",
+          "runout": "Run-out",
+          "fan_assist": "Fan assist",
+          "shed": "Shed",
+          "conditioning": "Conditioning"
+        }
+      },
+      "track_delta": { "name": "Tracking depth" },
+      "park_classification": {
+        "name": "Park classification",
+        "state": { "unknown": "Unknown", "idle": "Idle", "trickle": "Trickle" }
+      },
+      "park_preferred_margin": { "name": "Preferred park margin" },
+      "park_margin": { "name": "Park margin" },
+      "park_extraction": { "name": "Park extraction" },
+      "command_reason": {
+        "name": "Last command reason",
+        "state": {
+          "none": "None",
+          "demand": "Demand",
+          "helper": "Helper",
+          "park": "Park",
+          "runout": "Run-out",
+          "off": "Off",
+          "shed": "Shed",
+          "fan_assist": "Fan assist",
+          "fan_off": "Fan off"
+        }
+      }
     },
     "binary_sensor": {
       "shedding_active": { "name": "Shedding active" },
       "conditioning_active": { "name": "Conditioning" },
+      "zone_parked": { "name": "Parked" },
       "zone_shed": { "name": "Shed" },
       "window_suggestion": { "name": "Open windows suggested" },
       "zone_window_suggestion": { "name": "Open window suggested" }

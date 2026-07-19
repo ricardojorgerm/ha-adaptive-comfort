@@ -154,6 +154,20 @@ HOUSE_SENSORS: tuple[HouseSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda r: _round(r.model_confidence * 100.0, 0),
     ),
+    HouseSensorDescription(
+        key="parked_zones",
+        translation_key="parked_zones",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda r: len(r.controller_state.zone_parked_since),
+        attr_fn=lambda r: {
+            "zones": sorted(
+                r.zones[zid].config.name
+                for zid in r.controller_state.zone_parked_since
+                if zid in r.zones
+            )
+        },
+    ),
 )
 
 
@@ -315,6 +329,98 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z, r: _round(z.allocated_w, 0),
+    ),
+    ZoneSensorDescription(
+        key="control_state",
+        translation_key="control_state",
+        device_class=SensorDeviceClass.ENUM,
+        options=[
+            "off",
+            "demand",
+            "helper",
+            "park",
+            "runout",
+            "fan_assist",
+            "shed",
+            "conditioning",
+        ],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: r.zone_control_state(z),
+        attr_fn=lambda z, r: {"last_reason": z.last_control_reason},
+    ),
+    ZoneSensorDescription(
+        key="track_delta",
+        translation_key="track_delta",
+        native_unit_of_measurement="K",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: _round(
+            r.controller_state.zone_track_delta.get(z.config.zone_id), 2
+        ),
+    ),
+    ZoneSensorDescription(
+        key="park_classification",
+        translation_key="park_classification",
+        device_class=SensorDeviceClass.ENUM,
+        options=["unknown", "idle", "trickle"],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: z.park.classification,
+        attr_fn=lambda z, r: {
+            "samples": z.park.samples,
+            "active_ratio": None
+            if z.park.active_ratio is None
+            else round(z.park.active_ratio, 3),
+        },
+    ),
+    ZoneSensorDescription(
+        key="park_preferred_margin",
+        translation_key="park_preferred_margin",
+        native_unit_of_measurement="K",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: _round(
+            r.controller_state.zone_park_preferred.get(
+                z.config.zone_id, z.park.preferred_margin_k
+            ),
+            2,
+        ),
+    ),
+    ZoneSensorDescription(
+        key="park_margin",
+        translation_key="park_margin",
+        native_unit_of_measurement="K",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: _round(
+            r.controller_state.zone_park_margin.get(z.config.zone_id), 2
+        ),
+    ),
+    ZoneSensorDescription(
+        key="park_extraction",
+        translation_key="park_extraction",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: _round(z.park.extraction_w, 0),
+    ),
+    ZoneSensorDescription(
+        key="command_reason",
+        translation_key="command_reason",
+        device_class=SensorDeviceClass.ENUM,
+        options=[
+            "none",
+            "demand",
+            "helper",
+            "park",
+            "runout",
+            "off",
+            "shed",
+            "fan_assist",
+            "fan_off",
+        ],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: z.last_control_reason or "none",
     ),
 )
 

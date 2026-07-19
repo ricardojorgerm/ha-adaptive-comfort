@@ -90,6 +90,7 @@ BASELINE_OFF_S = 600.0
 EVENT_SETTLE_S = 240.0
 QUASI_STEADY_K_H = 0.2
 TRANSIENT_K_H = 0.5
+PARK_OBS_DELAY_S = 120.0  # parked observations start after this settle time
 COP_TABLE_MIN_SAMPLES = 20
 # House-COP publication: gate out low-power cycle edges (small heat flow over
 # small power swings wildly) and smooth what the sensor reports.
@@ -160,6 +161,8 @@ class ZoneRuntime:
         self.free_float: tuple[float, ...] = ()
         self.pred_60m: float | None = None
         self.allocated_w = 0.0
+        # Last controller command reason for this zone (demand/helper/park/…).
+        self.last_control_reason: str | None = None
 
     @property
     def is_on(self) -> bool:
@@ -854,9 +857,16 @@ class AdaptiveComfortRuntime:
         heating = zone.head_state == STATE_HEATING
         t_house = self._house_other_temp(zone.config.zone_id)
         if per_head_w > 50.0 and self.outdoor_source != "climatology":
+            latent_w = max(0.0, self._latent_power(zone, dt_h))
             if abs(dtdt) < QUASI_STEADY_K_H:
                 zone.model.update_cop(
-                    per_head_w, smoothed, self.t_out, local_hour, zone.door_open, t_house
+                    per_head_w,
+                    smoothed,
+                    self.t_out,
+                    local_hour,
+                    zone.door_open,
+                    t_house,
+                    latent_w=latent_w,
                 )
             elif abs(dtdt) <= TRANSIENT_K_H:
                 # Moderate transient: small rooms on short cycles are never
@@ -872,6 +882,7 @@ class AdaptiveComfortRuntime:
                     zone.door_open,
                     t_house,
                     dtdt_per_h=dtdt,
+                    latent_w=latent_w,
                 )
             else:
                 zone.model.update_c_eff(
@@ -900,7 +911,7 @@ class AdaptiveComfortRuntime:
         # head's above-setpoint output (the model separates AC action from
         # free-float drift). Feed the learner instead of assuming.
         parked_since = self.controller_state.zone_parked_since.get(zone.config.zone_id)
-        if parked_since is not None and now_ts - parked_since >= STABLE_STATE_S / 2.0:
+        if parked_since is not None and now_ts - parked_since >= PARK_OBS_DELAY_S:
             # Conditioning direction matters: cooling removes heat
             # (sensible_w < 0), heating adds it (sensible_w > 0).
             if zone.head_state == STATE_HEATING or self.controller_state.mode == MODE_HEAT:
@@ -1000,6 +1011,14 @@ class AdaptiveComfortRuntime:
                     park_trickles=zone.park.trickles,
                     park_extraction_w=zone.park.extraction_w,
                     park_preferred_margin_k=zone.park.preferred_margin_k,
+                    park_samples=zone.park.samples,
+                    head_mode=(
+                        MODE_HEAT
+                        if zone.head_state == STATE_HEATING
+                        else MODE_COOL
+                        if zone.head_state == STATE_COOLING
+                        else None
+                    ),
                     standing_load_w=self._standing_load_w(zone),
                 )
             )
@@ -1046,9 +1065,35 @@ class AdaptiveComfortRuntime:
             zone = self.zones.get(zid)
             if zone is not None:
                 zone.park.preferred_margin_k = preferred
+        for command in decision.commands:
+            zone = self.zones.get(command.zone_id)
+            if zone is not None:
+                zone.last_control_reason = command.reason
         self._update_free_float_bias(snapshot)
         for command in decision.commands:
             await self._async_execute(command)
+
+    def zone_control_state(self, zone: ZoneRuntime) -> str:
+        """Coarse per-zone role for history charts."""
+        zid = zone.config.zone_id
+        st = self.controller_state
+        if zid in st.shed:
+            return "shed"
+        if zid in st.zone_parked_since:
+            return "park"
+        if st.zone_fan.get(zid):
+            return "fan_assist"
+        if zone.last_control_reason == "runout":
+            return "runout"
+        demand = set(self.last_diag.get("demand") or [])
+        helpers = set(self.last_diag.get("helpers") or [])
+        if zid in demand:
+            return "demand"
+        if zid in helpers:
+            return "helper"
+        if st.zone_on.get(zid) or zone.is_on:
+            return "conditioning"
+        return "off"
 
     def _update_free_float_bias(self, snapshot: HouseSnapshot) -> None:
         center = comfort.band_center(self.settings, self.t_rm)

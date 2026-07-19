@@ -27,6 +27,7 @@ async def async_setup_entry(
         async_add_entities(
             [
                 ZoneConditioningSensor(runtime, zone),
+                ZoneParkedSensor(runtime, zone),
                 ZoneShedSensor(runtime, zone),
                 ZoneWindowSuggestionSensor(runtime, zone),
             ],
@@ -68,6 +69,33 @@ class ZoneConditioningSensor(AdaptiveComfortZoneEntity, BinarySensorEntity):
     @property
     def extra_state_attributes(self) -> dict:
         return {"head_state": self.zone.head_state}
+
+
+class ZoneParkedSensor(AdaptiveComfortZoneEntity, BinarySensorEntity):
+    """True while the controller is holding the zone in a parked setpoint."""
+
+    _attr_translation_key = "zone_parked"
+    _attr_device_class = BinarySensorDeviceClass.RUNNING
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, runtime: AdaptiveComfortRuntime, zone) -> None:
+        super().__init__(runtime, zone, "parked")
+
+    @property
+    def is_on(self) -> bool:
+        return self.zone.config.zone_id in self.runtime.controller_state.zone_parked_since
+
+    @property
+    def extra_state_attributes(self) -> dict:
+        zid = self.zone.config.zone_id
+        st = self.runtime.controller_state
+        return {
+            "margin_k": st.zone_park_margin.get(zid),
+            "preferred_margin_k": st.zone_park_preferred.get(
+                zid, self.zone.park.preferred_margin_k
+            ),
+            "classification": self.zone.park.classification,
+        }
 
 
 class ZoneShedSensor(AdaptiveComfortZoneEntity, BinarySensorEntity):

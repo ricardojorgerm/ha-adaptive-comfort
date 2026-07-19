@@ -317,12 +317,16 @@ class ThermalModel:
         t_house_other: float | None = None,
         alpha: float = 0.05,
         dtdt_per_h: float = 0.0,
+        latent_w: float = 0.0,
     ) -> None:
         if p_ac_w < 50.0:
             return
+        # Delivered heat is sensible + latent: dehumidification is real
+        # compressor work (omitting it undercounted COP by the latent share,
+        # ~30-50% in humid rooms).
         q_hvac = abs(
             self.sensible_power_w(t_in, t_out, dtdt_per_h, local_hour, door_open, t_house_other)
-        )
+        ) + max(0.0, latent_w)
         cop = q_hvac / p_ac_w
         if not (COP_MIN <= cop <= COP_MAX):
             return
