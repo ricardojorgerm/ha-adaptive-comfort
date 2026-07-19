@@ -218,6 +218,8 @@
       "presence_adaptation": { "name": "Presence adaptation" },
       "shedding_enabled": { "name": "Power shedding" },
       "fan_assist": { "name": "Fan assist (opposite-demand zones)" },
+      "tracking": { "name": "Tracking setpoint control" },
+      "park_learning": { "name": "Park-behavior learning" },
       "window_suggest": { "name": "Wait for manual ventilation" },
       "zone_enabled": { "name": "Zone enabled" }
     }

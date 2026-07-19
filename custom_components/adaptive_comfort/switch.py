@@ -47,6 +47,20 @@ HOUSE_SWITCHES: tuple[SettingSwitchDescription, ...] = (
         set_fn=lambda s, v: setattr(s, "shedding_enabled", v),
     ),
     SettingSwitchDescription(
+        key="tracking",
+        translation_key="tracking",
+        entity_category=EntityCategory.CONFIG,
+        get_fn=lambda s: s.tracking,
+        set_fn=lambda s, v: setattr(s, "tracking", v),
+    ),
+    SettingSwitchDescription(
+        key="park_learning",
+        translation_key="park_learning",
+        entity_category=EntityCategory.CONFIG,
+        get_fn=lambda s: s.park_learning,
+        set_fn=lambda s, v: setattr(s, "park_learning", v),
+    ),
+    SettingSwitchDescription(
         key="fan_assist",
         translation_key="fan_assist",
         entity_category=EntityCategory.CONFIG,

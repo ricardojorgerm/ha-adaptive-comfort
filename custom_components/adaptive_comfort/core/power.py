@@ -18,6 +18,22 @@ MIN_PLAUSIBLE_STEP_W = 60.0
 MAX_PLAUSIBLE_STEP_W = 4000.0
 
 
+def outdoor_band(t_out: float | None) -> str | None:
+    """Coarse outdoor-condition band for empirical COP bookkeeping.
+
+    Head-count and weather are confounded in practice (many heads run in hot
+    afternoons, single heads at mild night), so per-band tables let the two
+    effects be separated during analysis.
+    """
+    if t_out is None:
+        return None
+    if t_out < 25.0:
+        return "mild"
+    if t_out < 30.0:
+        return "warm"
+    return "hot"
+
+
 def compose_load(
     p_grid: float,
     p_battery: float | None = None,

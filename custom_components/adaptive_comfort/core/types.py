@@ -117,6 +117,16 @@ class Settings:
     shedding_enabled: bool = True
     multisplit: bool = True
     fan_assist: bool = True  # fan-only for opposite-demand zones on a multi-split
+    # Tracking setpoint control: command device setpoints relative to the
+    # head's *live* internal sensor (internal - delta) instead of a static
+    # drift translation, so the inverter sees a small, steady error and
+    # modulates at low speed instead of ramping and self-terminating.
+    tracking: bool = True
+    # Characterize and exploit above-setpoint head behavior instead of
+    # assuming it: bounded probes measure whether parked heads idle or
+    # trickle, then parking replaces hard-off when trickle output can
+    # carry a satisfied zone's standing load (multi-split, siblings on).
+    park_learning: bool = True
     # Hold mechanical conditioning briefly while the user is expected to ventilate manually.
     window_suggest: bool = False
     hvac_mode: str = MODE_AUTO
@@ -148,6 +158,14 @@ class ZoneSnapshot:
     confidence: float = 0.0
     draw_w: float | None = None  # learned total electrical draw of the zone
     enabled: bool = True
+    # Park-behavior knowledge (from ParkEstimator): None until classified.
+    park_trickles: bool | None = None
+    park_extraction_w: float | None = None
+    # Learned park depth (K) to start from on the next park entry.
+    park_preferred_margin_k: float | None = None
+    # Estimated standing heat load of the zone at current conditions (W, >=0);
+    # lets the controller judge whether trickle output can carry the zone.
+    standing_load_w: float | None = None
 
 
 @dataclass
@@ -180,6 +198,18 @@ class Command:
     hvac_mode: str  # MODE_OFF | MODE_HEAT | MODE_COOL
     setpoint: float | None = None  # desired *room* temperature (pre drift translation)
     reason: str = ""
+    # When set, the runtime commands the head at (internal - track_delta) in
+    # cooling / (internal + track_delta) in heating, falling back to the
+    # drift translation of `setpoint` if the internal reading is unusable.
+    track_delta: float | None = None
+    # Park the head: command a setpoint just above its internal reading
+    # while keeping the compressor mode, to observe/exploit the device's
+    # own keep-temperature behavior instead of turning off.
+    park: bool = False
+    # Adaptive park depth: setpoint rides internal + margin (cool) or
+    # internal - margin (heat). Escalated by the controller while the room
+    # keeps moving in the conditioning direction despite being parked.
+    park_margin: float | None = None
 
 
 @dataclass
@@ -198,6 +228,17 @@ class ControllerState:
     zone_fan: dict[str, bool] = field(default_factory=dict)  # fan-assist active
     zone_last_cool: dict[str, float] = field(default_factory=dict)  # coil-wet lockout
     window_suggest_since: dict[str, float] = field(default_factory=dict)
+    zone_track_delta: dict[str, float] = field(default_factory=dict)  # tracking-control depth (K)
+    zone_parked_since: dict[str, float] = field(default_factory=dict)  # parked-state entry time
+    zone_last_park_probe: dict[str, float] = field(default_factory=dict)  # probe rate limiting
+    zone_park_margin: dict[str, float] = field(
+        default_factory=dict
+    )  # adaptive margin above internal (K)
+    zone_park_ref: dict[str, float] = field(
+        default_factory=dict
+    )  # room temp at last margin decision
+    # Working copy of learned park depth; synced to ParkEstimator after each tick.
+    zone_park_preferred: dict[str, float] = field(default_factory=dict)
     shed: dict[str, float] = field(default_factory=dict)  # zone_id -> shed ts
     last_shed_action: float = 0.0
 
@@ -207,6 +248,11 @@ class ControllerState:
             "mode_since": self.mode_since,
             "zone_on": dict(self.zone_on),
             "zone_since": dict(self.zone_since),
+            "zone_track_delta": dict(self.zone_track_delta),
+            "zone_parked_since": dict(self.zone_parked_since),
+            "zone_last_park_probe": dict(self.zone_last_park_probe),
+            "zone_park_margin": dict(self.zone_park_margin),
+            "zone_park_preferred": dict(self.zone_park_preferred),
         }
 
     @classmethod
@@ -216,6 +262,21 @@ class ControllerState:
         st.mode_since = data.get("mode_since", 0.0)
         st.zone_on = dict(data.get("zone_on", {}))
         st.zone_since = dict(data.get("zone_since", {}))
+        st.zone_track_delta = {
+            str(k): float(v) for k, v in data.get("zone_track_delta", {}).items()
+        }
+        st.zone_parked_since = {
+            str(k): float(v) for k, v in data.get("zone_parked_since", {}).items()
+        }
+        st.zone_last_park_probe = {
+            str(k): float(v) for k, v in data.get("zone_last_park_probe", {}).items()
+        }
+        st.zone_park_margin = {
+            str(k): float(v) for k, v in data.get("zone_park_margin", {}).items()
+        }
+        st.zone_park_preferred = {
+            str(k): float(v) for k, v in data.get("zone_park_preferred", {}).items()
+        }
         return st
 
 

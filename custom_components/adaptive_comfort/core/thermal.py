@@ -265,6 +265,12 @@ class ThermalModel:
     def fit_samples(self, door_open: bool = False) -> int:
         return self._fit(door_open).samples
 
+    def fit_is_fallback(self, door_open: bool = False) -> bool:
+        """True when this regime has no samples of its own and reports the
+        other regime's fit (diagnostics would otherwise show two identical
+        regimes and imply both were learned independently)."""
+        return self.fits[door_open].samples == 0 and self.fits[not door_open].samples > 0
+
     def fit_stage(self, door_open: bool = False) -> str:
         """How much the k values rely on learned data: prior | blending | fitted."""
         samples = self.fit_samples(door_open)
@@ -298,10 +304,7 @@ class ThermalModel:
             mix_w = AIR_HEAT_WH_M3K * k_mix * self.volume_m3 * (t_house_other - t_in)
         ua_out = AIR_HEAT_WH_M3K * k_out * self.volume_m3
         return (
-            c * dtdt_per_h
-            - ua_out * (t_out - t_in)
-            - mix_w
-            - self.q_hat(local_hour, door_open) * c
+            c * dtdt_per_h - ua_out * (t_out - t_in) - mix_w - self.q_hat(local_hour, door_open) * c
         )
 
     def update_cop(
@@ -313,10 +316,13 @@ class ThermalModel:
         door_open: bool = False,
         t_house_other: float | None = None,
         alpha: float = 0.05,
+        dtdt_per_h: float = 0.0,
     ) -> None:
         if p_ac_w < 50.0:
             return
-        q_hvac = abs(self.sensible_power_w(t_in, t_out, 0.0, local_hour, door_open, t_house_other))
+        q_hvac = abs(
+            self.sensible_power_w(t_in, t_out, dtdt_per_h, local_hour, door_open, t_house_other)
+        )
         cop = q_hvac / p_ac_w
         if not (COP_MIN <= cop <= COP_MAX):
             return

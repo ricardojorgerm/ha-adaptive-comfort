@@ -218,6 +218,8 @@
       "presence_adaptation": { "name": "Adaptação à presença" },
       "shedding_enabled": { "name": "Limitação de potência" },
       "fan_assist": { "name": "Ventilação auxiliar (zonas com pedido oposto)" },
+      "tracking": { "name": "Setpoint dinâmico (tracking)" },
+      "park_learning": { "name": "Aprendizagem de comportamento em park" },
       "window_suggest": { "name": "Aguardar ventilação manual" },
       "zone_enabled": { "name": "Zona ativa" }
     }

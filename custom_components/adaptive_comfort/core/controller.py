@@ -8,6 +8,7 @@ device setpoints via the per-head drift offsets.
 from __future__ import annotations
 
 from . import comfort, power
+from .park import MARGIN_SETTLE_ALPHA
 from .types import (
     MODE_AUTO,
     MODE_COOL,
@@ -30,6 +31,32 @@ SHED_ACTION_SPACING_S = 30.0
 SHED_URGENT_SPACING_S = 3.0
 COMMAND_SPACING_S = 180.0
 SETPOINT_EPSILON_K = 0.25
+# Tracking setpoint control: the commanded device setpoint follows the head's
+# internal sensor at a small depth below it (cooling), keeping the inverter's
+# perceived error small and constant. The depth adapts to room-frame progress.
+TRACK_DELTA_MIN_K = 0.3
+TRACK_DELTA_MAX_K = 2.5
+TRACK_DELTA_STEP_K = 0.5
+TRACK_DELTA_DEFAULT_K = 0.7
+# Parked-head characterization/exploitation: setpoint margin above the
+# internal reading, minimum dwell in/out of the parked state, probe length
+# and per-zone probe spacing while behavior is still unclassified.
+PARK_MARGIN_K = 1.0
+PARK_MARGIN_MAX_K = 3.0
+PARK_MARGIN_STEP_K = 0.5
+# Enter each park one step below the learned preferred depth (still >=
+# PARK_MARGIN_K so the setpoint stays on the park side of the internal
+# reading). Re-proves the hold without overshooting from a stale high-water.
+PARK_ENTRY_UNDERSHOOT_K = PARK_MARGIN_STEP_K
+# Room movement in the conditioning direction that counts as "the head is
+# not keeping temperature by itself" while parked (per margin decision).
+PARK_ADAPT_EPS_K = 0.1
+PARK_MIN_DWELL_S = 600.0
+PARK_PROBE_S = 900.0
+PARK_PROBE_SPACING_S = 6.0 * 3600.0
+# Trickle output must plausibly carry the zone's standing load to justify
+# exploitation-parking instead of a plain off.
+PARK_LOAD_COVER_FRACTION = 0.6
 COP_TABLE_ADVANTAGE = 1.05
 # Fan assist: a multi-split head cannot run opposite to the shared mode, but
 # fan-only mixing can nudge an out-of-band room using house air. Running the
@@ -105,6 +132,56 @@ def _record_transition(state: ControllerState, zone_id: str, now: float, on: boo
     changes = state.zone_mode_changes.setdefault(zone_id, [])
     changes.append(now)
     del changes[:-10]
+
+
+def _park_exploit_ok(zone: ZoneSnapshot, mode: str) -> bool:
+    """Known trickler whose parked output plausibly carries the standing load."""
+    if zone.park_trickles is not True:
+        return False
+    if zone.park_extraction_w is None:
+        return False
+    if zone.standing_load_w is None:
+        # No load estimate: trickling while satisfied is still calmer than
+        # off/on cycling, accept.
+        return True
+    return zone.park_extraction_w >= PARK_LOAD_COVER_FRACTION * zone.standing_load_w
+
+
+def _park_preferred(zone: ZoneSnapshot, state: ControllerState) -> float:
+    """Learned park depth for this zone, falling back to the base margin."""
+    zid = zone.zone_id
+    if zid in state.zone_park_preferred:
+        return state.zone_park_preferred[zid]
+    if zone.park_preferred_margin_k is not None:
+        return zone.park_preferred_margin_k
+    return PARK_MARGIN_K
+
+
+def _park_entry_margin(zone: ZoneSnapshot, state: ControllerState) -> float:
+    """Start slightly below preferred so the session can re-converge upward."""
+    preferred = _park_preferred(zone, state)
+    return max(preferred - PARK_ENTRY_UNDERSHOOT_K, PARK_MARGIN_K)
+
+
+def _raise_park_preferred(state: ControllerState, zid: str, margin: float) -> None:
+    """High-water: remember at least this depth for the next park entry."""
+    prev = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
+    state.zone_park_preferred[zid] = max(prev, min(max(margin, PARK_MARGIN_K), PARK_MARGIN_MAX_K))
+
+
+def _settle_park_preferred(state: ControllerState, zid: str, margin: float) -> None:
+    """Blend preferred toward a margin that held without overcorrection."""
+    prev = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
+    m = min(max(margin, PARK_MARGIN_K), PARK_MARGIN_MAX_K)
+    state.zone_park_preferred[zid] = min(
+        max(prev + MARGIN_SETTLE_ALPHA * (m - prev), PARK_MARGIN_K), PARK_MARGIN_MAX_K
+    )
+
+
+def _clear_park_session(state: ControllerState, zid: str) -> None:
+    state.zone_parked_since.pop(zid, None)
+    state.zone_park_ref.pop(zid, None)
+    state.zone_park_margin.pop(zid, None)
 
 
 def _opposite_deviation(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> float:
@@ -327,6 +404,133 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         currently_on = state.zone_on.get(zid, zone.is_on)
 
         transitioned = False
+        # ---- Parked-state management (multi-split, heat and cool) -----------
+        # A zone leaving demand/helpers would normally turn off. If park
+        # learning is enabled, the compressor stays alive for siblings, and
+        # either (a) behavior is unclassified and a probe is due, or (b) the
+        # head is a known trickler whose output can carry the standing load,
+        # we park instead: setpoint offset from the internal reading, mode
+        # kept. Session margin starts at the learned preferred depth and
+        # escalates while the room keeps moving in the conditioning direction.
+        if zid not in state.zone_park_preferred:
+            state.zone_park_preferred[zid] = _park_preferred(zone, state)
+        parked_since = state.zone_parked_since.get(zid)
+        if parked_since is not None:
+            dwell_ok = now - parked_since >= PARK_MIN_DWELL_S
+            probing = zone.park_trickles is None
+            probe_done = probing and now - parked_since >= PARK_PROBE_S
+            lo_b, hi_b = bands[zid]
+            out_of_band = zone.temp is not None and (
+                zone.temp > hi_b if mode == MODE_COOL else zone.temp < lo_b
+            )
+            # Far-edge breach: the parked head is out-conditioning the load
+            # and pushed the room through the opposite comfort edge. Releases
+            # immediately (no dwell): comfort beats characterization.
+            overcorrected = zone.temp is not None and (
+                zone.temp <= lo_b if mode == MODE_COOL else zone.temp >= hi_b
+            )
+
+            # Margin escalation: if the room keeps moving in the conditioning
+            # direction while parked, the head is not holding temperature at
+            # this depth - raise the setpoint further away from the internal
+            # reading before giving up. Only when the margin is maxed and the
+            # room still falls (cool) / rises (heat) do we idle the head.
+            preferred = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
+            margin = state.zone_park_margin.get(zid, preferred)
+            margin_exhausted = False
+            margin_changed = False
+            if zone.temp is not None:
+                ref = state.zone_park_ref.get(zid)
+                if ref is None:
+                    state.zone_park_ref[zid] = zone.temp
+                else:
+                    moved = ref - zone.temp if mode == MODE_COOL else zone.temp - ref
+                    if moved >= PARK_ADAPT_EPS_K:
+                        if margin < PARK_MARGIN_MAX_K:
+                            margin = min(margin + PARK_MARGIN_STEP_K, PARK_MARGIN_MAX_K)
+                            state.zone_park_margin[zid] = margin
+                            state.zone_park_ref[zid] = zone.temp
+                            _raise_park_preferred(state, zid, margin)
+                            margin_changed = True
+                        else:
+                            margin_exhausted = True
+                    elif moved <= -PARK_ADAPT_EPS_K:
+                        # Drifting back toward the load side: the head eased
+                        # off (or idles); relax toward the base margin. A clean
+                        # exit then settles preferred toward this lower depth.
+                        new_margin = max(margin - PARK_MARGIN_STEP_K, PARK_MARGIN_K)
+                        if new_margin != margin:
+                            margin = new_margin
+                            state.zone_park_margin[zid] = margin
+                            margin_changed = True
+                        state.zone_park_ref[zid] = zone.temp
+
+            if overcorrected or margin_exhausted:
+                # Head cannot hold temperature at any depth: idle it.
+                # Keep preferred high-water so the next park starts deeper.
+                _clear_park_session(state, zid)
+                diag.setdefault("park_overcorrected", []).append(zid)
+                desired_on = False
+            elif out_of_band and dwell_ok:
+                # Load beat the parked output: fall through to normal
+                # demand handling below (zone re-enters as wanting on).
+                _settle_park_preferred(state, zid, margin)
+                _clear_park_session(state, zid)
+            elif zid in state.shed or (
+                dwell_ok
+                and (
+                    probe_done
+                    or zone.park_trickles is False
+                    or not _park_exploit_ok(zone, mode)
+                    or mode not in (MODE_HEAT, MODE_COOL)
+                )
+            ):
+                # Probe finished, head classified as idler, or exploitation
+                # no longer justified: release to normal off handling.
+                if zid not in state.shed and mode in (MODE_HEAT, MODE_COOL):
+                    _settle_park_preferred(state, zid, margin)
+                _clear_park_session(state, zid)
+                desired_on = False
+            else:
+                # Stay parked: refresh when spacing elapses *or* margin moved
+                # so the head sees the new depth immediately.
+                last_cmd = state.zone_last_cmd.get(zid, 0.0)
+                if margin_changed or now - last_cmd >= COMMAND_SPACING_S:
+                    commands.append(Command(zid, mode, None, "park", park=True, park_margin=margin))
+                    state.zone_last_cmd[zid] = now
+                continue
+        elif (
+            not desired_on
+            and currently_on
+            and s.park_learning
+            and s.multisplit
+            and zid not in state.shed
+            and mode in (MODE_HEAT, MODE_COOL)
+            and any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones)
+            and _transition_allowed(state, zid, now, False, s)
+        ):
+            probe_due = (
+                zone.park_trickles is None
+                and now - state.zone_last_park_probe.get(zid, 0.0) >= PARK_PROBE_SPACING_S
+            )
+            exploit = zone.park_trickles is True and _park_exploit_ok(zone, mode)
+            if probe_due or exploit:
+                preferred = _park_preferred(zone, state)
+                entry = _park_entry_margin(zone, state)
+                state.zone_park_preferred[zid] = preferred
+                state.zone_parked_since[zid] = now
+                state.zone_park_margin[zid] = entry
+                if zone.temp is not None:
+                    state.zone_park_ref[zid] = zone.temp
+                if probe_due:
+                    state.zone_last_park_probe[zid] = now
+                commands.append(
+                    Command(zid, mode, None, "park", park=True, park_margin=entry)
+                )
+                state.zone_last_cmd[zid] = now
+                diag.setdefault("parked", []).append(zid)
+                continue
+
         if desired_on != currently_on:
             # Only a user-forced OFF or shedding bypasses min-runtime; the
             # dominant mode dropping to idle still respects cycling guards.
@@ -344,7 +548,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
         if desired_on:
             center = centers[zid]
-            hi = bands[zid][1]
+            lo, hi = bands[zid]
             if zid in demand_ids:
                 setpoint = center
                 reason = "demand"
@@ -354,12 +558,34 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 setpoint = center + offset if mode == MODE_COOL else center - offset
                 reason = "helper"
             setpoint = quantize_setpoint(setpoint)
+
+            # Tracking depth adaptation (room frame): deepen while the room is
+            # not converging toward its target edge, relax once it is inside.
+            track_delta = None
+            if s.tracking and mode in (MODE_HEAT, MODE_COOL):
+                delta = state.zone_track_delta.get(zid, TRACK_DELTA_DEFAULT_K)
+                if zone.temp is not None:
+                    past_target = (
+                        zone.temp <= setpoint if mode == MODE_COOL else zone.temp >= setpoint
+                    )
+                    out_of_band = zone.temp > hi if mode == MODE_COOL else zone.temp < lo
+                    if out_of_band:
+                        delta += TRACK_DELTA_STEP_K
+                    elif past_target:
+                        delta -= TRACK_DELTA_STEP_K
+                delta = min(max(delta, TRACK_DELTA_MIN_K), TRACK_DELTA_MAX_K)
+                state.zone_track_delta[zid] = delta
+                track_delta = delta
+
             last_cmd = state.zone_last_cmd.get(zid, 0.0)
             last_sp = state.zone_last_setpoint.get(zid)
             setpoint_changed = last_sp is None or abs(setpoint - last_sp) >= SETPOINT_EPSILON_K
             spacing_ok = now - last_cmd >= COMMAND_SPACING_S
-            if transitioned or not zone.is_on or (setpoint_changed and spacing_ok):
-                commands.append(Command(zid, mode, setpoint, reason))
+            # Tracking control re-anchors to the moving internal reading, so
+            # refresh commands on every spacing interval while the zone runs.
+            refresh = track_delta is not None and zone.is_on and spacing_ok
+            if transitioned or not zone.is_on or (setpoint_changed and spacing_ok) or refresh:
+                commands.append(Command(zid, mode, setpoint, reason, track_delta=track_delta))
                 state.zone_last_cmd[zid] = now
                 state.zone_last_setpoint[zid] = setpoint
             state.zone_fan[zid] = False
@@ -384,6 +610,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             commands.append(Command(zid, MODE_OFF, None, reason))
             state.zone_last_cmd[zid] = now
             state.zone_last_setpoint.pop(zid, None)
+            state.zone_track_delta.pop(zid, None)
+            _clear_park_session(state, zid)
 
     diag["shedding_active"] = shed_active
     return Decision(commands, state, diag, window_suggestions)

@@ -136,3 +136,28 @@ def test_thermal_roundtrip_persistence():
     restored = ThermalModel.from_dict(model.to_dict(), 25.0)
     assert restored.fits[False].theta[0] == 0.6
     assert restored.cop == 3.3
+
+
+def _cool_capable_model() -> ThermalModel:
+    model = ThermalModel(volume_m3=30.0)
+    model.fits[False].theta[0] = 0.4
+    model.fits[False].samples = 1000
+    return model
+
+
+def test_update_cop_accepts_transient_samples():
+    """Small rooms on short cycles are never quasi-steady while conditioning;
+    the storage term C*dT/dt makes the transient sample valid (fixes zones
+    that reported cop=None forever)."""
+    model = _cool_capable_model()
+    assert model.cop is None
+    # Pulling down at 3 K/h while drawing 100 W: |q| = C*3 + UA*dT is
+    # dominated by the storage term and lands inside the plausible COP band.
+    model.update_cop(100.0, 24.0, 30.0, 12.0, dtdt_per_h=-3.0)
+    assert model.cop is not None and model.cop > 0.0
+
+
+def test_fit_is_fallback_marks_unlearned_regime():
+    model = _cool_capable_model()  # only the door_closed regime is fitted
+    assert model.fit_is_fallback(True) is True
+    assert model.fit_is_fallback(False) is False

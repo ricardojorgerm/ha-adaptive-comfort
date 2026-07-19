@@ -1,0 +1,436 @@
+"""Park behavior: estimator classification and controller park decisions."""
+
+from custom_components.adaptive_comfort.core import controller
+from custom_components.adaptive_comfort.core.park import (
+    CLASSIFY_MIN_SAMPLES,
+    MARGIN_SETTLE_ALPHA,
+    ParkEstimator,
+)
+from custom_components.adaptive_comfort.core.types import (
+    MODE_COOL,
+    ControllerState,
+    HouseSnapshot,
+    Settings,
+    ZoneSnapshot,
+)
+
+NOW = 1_000_000.0
+
+
+def make_zone(zone_id, temp, is_on=False, **kw):
+    return ZoneSnapshot(
+        zone_id=zone_id,
+        name=zone_id,
+        n_rooms=1,
+        temp=temp,
+        is_on=is_on,
+        free_float=tuple([temp] * 24),
+        confidence=0.9,
+        **kw,
+    )
+
+
+def make_snapshot(zones, settings=None, now=NOW):
+    return HouseSnapshot(
+        now_ts=now,
+        local_hour=12.0,
+        settings=settings or Settings(hvac_mode=MODE_COOL, target=23.0),
+        zones=zones,
+        t_out=30.0,
+    )
+
+
+def warmed_state(zones, now=NOW):
+    state = ControllerState()
+    for zone in zones:
+        state.zone_since[zone.zone_id] = now - 7200.0
+        state.zone_on[zone.zone_id] = zone.is_on
+    state.mode_since = now - 24 * 3600.0
+    return state
+
+
+def tick(zones, state, now=NOW, settings=None):
+    return controller.tick(make_snapshot(zones, settings=settings, now=now), state)
+
+
+def find_cmd(decision, zid):
+    return next((c for c in decision.commands if c.zone_id == zid), None)
+
+
+# --- estimator -----------------------------------------------------------------
+
+
+def test_estimator_classifies_trickler():
+    est = ParkEstimator()
+    for _ in range(CLASSIFY_MIN_SAMPLES):
+        est.update(150.0, True)
+    assert est.trickles is True
+    assert est.classification == "trickle"
+
+
+def test_estimator_classifies_idler():
+    est = ParkEstimator()
+    for _ in range(CLASSIFY_MIN_SAMPLES):
+        est.update(0.0, False)
+    assert est.trickles is False
+
+
+def test_estimator_unknown_until_enough_samples():
+    est = ParkEstimator()
+    est.update(150.0, True)
+    assert est.trickles is None
+
+
+def test_estimator_round_trips():
+    est = ParkEstimator()
+    for _ in range(CLASSIFY_MIN_SAMPLES):
+        est.update(90.0, True)
+    est.raise_preferred(2.0)
+    restored = ParkEstimator.from_dict(est.to_dict())
+    assert restored.trickles is est.trickles
+    assert restored.samples == est.samples
+    assert restored.preferred_margin_k == 2.0
+
+
+def test_estimator_settle_preferred_blends_down():
+    est = ParkEstimator()
+    est.preferred_margin_k = 2.0
+    est.settle_preferred(1.0)
+    expected = 2.0 + MARGIN_SETTLE_ALPHA * (1.0 - 2.0)
+    assert abs(est.preferred_margin_k - expected) < 1e-9
+
+
+def test_park_preferred_state_round_trips():
+    state = ControllerState()
+    state.zone_park_preferred["z1"] = 2.0
+    restored = ControllerState.from_dict(state.to_dict())
+    assert restored.zone_park_preferred == {"z1": 2.0}
+
+
+def test_park_exit_clears_session_margin():
+    satisfied, hot, state = _two_zone_setup(park_trickles=False)
+    # Known idler: enters briefly? Actually idler doesn't park — force a park
+    # then release via probe window with unknown→use unclassified probe path.
+    satisfied, hot, state = _two_zone_setup()
+    tick([satisfied, hot], state)
+    assert "sat" in state.zone_park_margin
+    later = NOW + controller.PARK_PROBE_S + 60.0
+    state.zone_last_cmd["sat"] = later - 3600.0
+    tick([satisfied, hot], state, now=later)
+    assert "sat" not in state.zone_park_margin
+    assert "sat" not in state.zone_parked_since
+    assert "sat" not in state.zone_park_ref
+
+
+# --- controller: probe entry ---------------------------------------------------
+
+
+def _two_zone_setup(satisfied_temp=23.0, park_trickles=None, **satisfied_kw):
+    """Satisfied zone (was on, leaves demand) + hot sibling keeping compressor."""
+    satisfied = make_zone(
+        "sat", satisfied_temp, is_on=True, park_trickles=park_trickles, **satisfied_kw
+    )
+    hot = make_zone("hot", 27.0, is_on=True)
+    state = warmed_state([satisfied, hot])
+    return satisfied, hot, state
+
+
+def test_unclassified_satisfied_zone_gets_probe_parked():
+    satisfied, hot, state = _two_zone_setup()
+    decision = tick([satisfied, hot], state)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is True
+    assert "sat" in state.zone_parked_since
+    assert state.zone_last_park_probe["sat"] == NOW
+
+
+def test_probe_rate_limited():
+    satisfied, hot, state = _two_zone_setup()
+    state.zone_last_park_probe["sat"] = NOW - 60.0  # probed a minute ago
+    decision = tick([satisfied, hot], state)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is None or cmd.park is False  # plain off path, no new probe
+
+
+def test_known_idler_turns_off_not_parked():
+    satisfied, hot, state = _two_zone_setup(park_trickles=False)
+    decision = tick([satisfied, hot], state)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is None or cmd.park is False
+    assert "sat" not in state.zone_parked_since
+
+
+def test_known_trickler_exploit_parks_when_load_covered():
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True, park_extraction_w=150.0, standing_load_w=180.0
+    )
+    decision = tick([satisfied, hot], state)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is True
+
+
+def test_known_trickler_not_parked_when_load_too_big():
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True, park_extraction_w=50.0, standing_load_w=400.0
+    )
+    decision = tick([satisfied, hot], state)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is None or cmd.park is False
+
+
+def test_no_park_without_running_sibling():
+    # Compressor would stop anyway: parking has no basis, plain off.
+    satisfied = make_zone("sat", 23.0, is_on=True)
+    state = warmed_state([satisfied])
+    tick([satisfied], state)
+    assert "sat" not in state.zone_parked_since
+
+
+def test_shed_zone_never_parks():
+    satisfied, hot, state = _two_zone_setup()
+    state.shed["sat"] = NOW
+    tick([satisfied, hot], state)
+    assert "sat" not in state.zone_parked_since
+
+
+def test_park_learning_disabled_falls_back_to_off():
+    settings = Settings(hvac_mode=MODE_COOL, target=23.0, park_learning=False)
+    satisfied, hot, state = _two_zone_setup()
+    tick([satisfied, hot], state, settings=settings)
+    assert "sat" not in state.zone_parked_since
+
+
+# --- controller: parked-state lifecycle ---------------------------------------
+
+
+def test_parked_zone_released_after_probe_window():
+    satisfied, hot, state = _two_zone_setup()
+    tick([satisfied, hot], state)  # enters probe park at NOW
+    later = NOW + controller.PARK_PROBE_S + 60.0
+    state.zone_last_cmd["sat"] = later - 3600.0
+    tick([satisfied, hot], state, now=later)
+    assert "sat" not in state.zone_parked_since  # probe over, released to off
+
+
+def test_parked_zone_reenters_demand_when_out_of_band():
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True, park_extraction_w=200.0, standing_load_w=100.0
+    )
+    tick([satisfied, hot], state)  # exploitation park
+    assert "sat" in state.zone_parked_since
+    later = NOW + controller.PARK_MIN_DWELL_S + 60.0
+    warm = make_zone("sat", 26.0, is_on=True, park_trickles=True, park_extraction_w=200.0)
+    state.zone_last_cmd["sat"] = later - 3600.0
+    decision = tick([warm, hot], state, now=later)
+    assert "sat" not in state.zone_parked_since
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is False and cmd.track_delta is not None
+
+
+def test_parked_zone_refreshes_park_command_on_spacing():
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True, park_extraction_w=200.0, standing_load_w=100.0
+    )
+    tick([satisfied, hot], state)
+    later = NOW + controller.COMMAND_SPACING_S + 10.0
+    decision = tick([satisfied, hot], state, now=later)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is True  # setpoint re-rides internal
+
+
+# --- overcorrection, margin escalation, heating symmetry -----------------------
+
+
+def test_parked_zone_released_when_pushed_through_far_edge():
+    """Non-idling head out-cools the load: comfort floor breach releases
+    immediately, even before the dwell elapses."""
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True, park_extraction_w=400.0, standing_load_w=100.0
+    )
+    tick([satisfied, hot], state)
+    assert "sat" in state.zone_parked_since
+    soon = NOW + 120.0  # well inside PARK_MIN_DWELL_S
+    frozen = make_zone("sat", 21.0, is_on=True, park_trickles=True)  # below band lo
+    state.zone_last_cmd["sat"] = soon - 3600.0
+    decision = tick([frozen, hot], state, now=soon)
+    assert "sat" not in state.zone_parked_since
+    cmd = find_cmd(decision, "sat")
+    assert cmd is None or cmd.park is False
+
+
+def test_margin_escalates_while_room_keeps_cooling():
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True, park_extraction_w=200.0, standing_load_w=100.0
+    )
+    tick([satisfied, hot], state)
+    assert state.zone_park_margin["sat"] == controller.PARK_MARGIN_K
+    # Room fell 0.2 K but is still inside the band: deepen, stay parked.
+    cooler = make_zone(
+        "sat",
+        23.0 - 0.2,
+        is_on=True,
+        park_trickles=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+    )
+    later = NOW + controller.COMMAND_SPACING_S + 10.0
+    decision = tick([cooler, hot], state, now=later)
+    assert state.zone_park_margin["sat"] == controller.PARK_MARGIN_K + controller.PARK_MARGIN_STEP_K
+    assert state.zone_park_preferred["sat"] == state.zone_park_margin["sat"]
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is True
+    assert cmd.park_margin == state.zone_park_margin["sat"]
+
+
+def test_next_park_starts_slightly_below_preferred():
+    """Entry undershoots preferred by one step (still >= PARK_MARGIN_K)."""
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+        park_preferred_margin_k=2.0,
+    )
+    decision = tick([satisfied, hot], state)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is True
+    expected = 2.0 - controller.PARK_ENTRY_UNDERSHOOT_K
+    assert cmd.park_margin == expected
+    assert state.zone_park_margin["sat"] == expected
+    assert state.zone_park_preferred["sat"] == 2.0  # memory unchanged at entry
+
+
+def test_entry_undershoot_floors_at_park_minimum():
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+        park_preferred_margin_k=controller.PARK_MARGIN_K,  # already at floor
+    )
+    decision = tick([satisfied, hot], state)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park_margin == controller.PARK_MARGIN_K
+
+
+def test_margin_change_refreshes_immediately():
+    """Escalation must not wait for COMMAND_SPACING_S to re-command the head."""
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True, park_extraction_w=200.0, standing_load_w=100.0
+    )
+    tick([satisfied, hot], state)
+    state.zone_last_cmd["sat"] = NOW  # spacing not yet elapsed
+    cooler = make_zone(
+        "sat",
+        23.0 - 0.2,
+        is_on=True,
+        park_trickles=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+    )
+    decision = tick([cooler, hot], state, now=NOW + 60.0)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is True
+    assert cmd.park_margin == controller.PARK_MARGIN_K + controller.PARK_MARGIN_STEP_K
+
+
+def test_margin_exhaustion_idles_head():
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True, park_extraction_w=200.0, standing_load_w=100.0
+    )
+    tick([satisfied, hot], state)
+    state.zone_park_margin["sat"] = controller.PARK_MARGIN_MAX_K  # already maxed
+    state.zone_park_ref["sat"] = 23.0
+    cooler = make_zone(
+        "sat",
+        23.0 - 0.2,
+        is_on=True,
+        park_trickles=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+    )
+    tick([cooler, hot], state, now=NOW + 60.0)
+    assert "sat" not in state.zone_parked_since  # idled due to overcorrection
+
+
+def test_margin_relaxes_when_room_drifts_back():
+    satisfied, hot, state = _two_zone_setup(
+        park_trickles=True, park_extraction_w=200.0, standing_load_w=100.0
+    )
+    tick([satisfied, hot], state)
+    state.zone_park_margin["sat"] = 2.0
+    state.zone_park_ref["sat"] = 23.0
+    warmer = make_zone(
+        "sat",
+        23.0 + 0.2,
+        is_on=True,
+        park_trickles=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+    )
+    tick([warmer, hot], state, now=NOW + 60.0)
+    assert state.zone_park_margin["sat"] == 1.5
+
+
+def test_heating_park_entry_and_far_edge_release():
+    """Heat: satisfied zone parks while a cold sibling runs; pushing past
+    band hi releases immediately (symmetric to cool far-edge)."""
+    from custom_components.adaptive_comfort.core.types import MODE_HEAT
+
+    settings = Settings(hvac_mode=MODE_HEAT, target=23.0)
+    # Above center → not a heat helper; in-band → not demand → park candidate.
+    satisfied = make_zone(
+        "sat",
+        23.6,
+        is_on=True,
+        park_trickles=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+    )
+    cold = make_zone("cold", 19.0, is_on=True)  # sibling keeps compressor on
+    state = warmed_state([satisfied, cold])
+    decision = tick([satisfied, cold], state, settings=settings)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is True
+    assert "sat" in state.zone_parked_since
+
+    # Overheat past band hi (center 23 ± 0.7 → hi 23.7): release immediately.
+    soon = NOW + 120.0
+    hot_room = make_zone(
+        "sat", 27.0, is_on=True, park_trickles=True, park_extraction_w=200.0
+    )
+    state.zone_last_cmd["sat"] = soon - 3600.0
+    decision = tick([hot_room, cold], state, settings=settings, now=soon)
+    assert "sat" not in state.zone_parked_since
+    cmd = find_cmd(decision, "sat")
+    assert cmd is None or cmd.park is False
+
+
+def test_heating_margin_escalates_while_room_keeps_warming():
+    from custom_components.adaptive_comfort.core.types import MODE_HEAT
+
+    settings = Settings(hvac_mode=MODE_HEAT, target=23.0)
+    # Stay inside band (hi = 23.7) while still rising enough to escalate.
+    satisfied = make_zone(
+        "sat",
+        23.3,
+        is_on=True,
+        park_trickles=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+    )
+    cold = make_zone("cold", 19.0, is_on=True)
+    state = warmed_state([satisfied, cold])
+    tick([satisfied, cold], state, settings=settings)
+    entry = state.zone_park_margin["sat"]
+    warmer = make_zone(
+        "sat",
+        23.3 + 0.2,
+        is_on=True,
+        park_trickles=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+    )
+    decision = tick([warmer, cold], state, settings=settings, now=NOW + 60.0)
+    assert state.zone_park_margin["sat"] == entry + controller.PARK_MARGIN_STEP_K
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is True
+    assert cmd.park_margin == state.zone_park_margin["sat"]

@@ -1,0 +1,120 @@
+# AGENTS.md — working on ha-adaptive-comfort
+
+Guide for AI agents (and humans in a hurry) contributing to this codebase.
+
+## What this is
+
+A Home Assistant custom integration (`custom_components/adaptive_comfort/`) that acts as a
+self-learning whole-home thermostat for multi-split AC systems. It learns each room's thermal
+dynamics (1R1C model with outdoor + house-mixing coupling), disaggregates AC power from a
+whole-house meter, and coordinates AC heads for comfort and efficiency.
+
+## Architecture — the one invariant that matters
+
+**`core/` is pure Python. Everything else is the HA adapter layer.**
+
+- `core/` imports nothing from Home Assistant and must stay that way. All physics, estimation,
+  and decision logic lives here so it can be unit-tested without an HA harness.
+- `coordinator.py` (the runtime) is the only substantial HA-side module: it polls sensors,
+  builds a `HouseSnapshot` every 60 s, calls `controller.tick(snapshot, state)`, and executes
+  the returned `Command`s against real `climate` entities.
+- Entity platforms (`sensor.py`, `switch.py`, `number.py`, `climate.py`, `binary_sensor.py`)
+  are thin views over the runtime's state; they contain no logic.
+
+If you find yourself importing `homeassistant.*` inside `core/`, you are in the wrong layer.
+
+## Map
+
+| Path | What lives there |
+|---|---|
+| `core/controller.py` | Pure decision engine: one tick from `HouseSnapshot` → `Decision` (mode arbitration, demand/helper selection, min-on/off guards, tracking-delta adaptation, shedding, fan assist, window suggestions). All tunable constants at the top. |
+| `core/thermal.py` | Per-zone 1R1C `ThermalModel`: RLS fits of k_out / k_mix per door regime, effective capacitance, diurnal disturbance, sensible power, COP estimation. Outdoor anchoring via the air-exchange hypothesis (moisture k → absolute UA). |
+| `core/power.py` | Load composition (grid + battery − known loads), time-of-day `BaselineModel`, step-delta AC estimation, per-zone power allocation, shedding math, `outdoor_band()` for COP bookkeeping. |
+| `core/park.py` | Learned above-setpoint ("parked") head behavior: EWMA of extraction while parked + idle/trickle classification. Fed by the runtime from the thermal model's sensible power while the controller holds a zone parked. |
+| `core/drift.py` | Per-head, per-operating-state internal-sensor offset learning (internal vs external reference). Used to correct readings and as *fallback* setpoint translation. |
+| `core/comfort.py` | Adaptive comfort band (running-mean outdoor → band center/edges). |
+| `core/types.py` | All dataclasses: `Settings`, `ZoneSnapshot`, `HouseSnapshot`, `Command`, `ControllerState` (+ its persistence round-trip). |
+| `core/rls.py`, `core/series.py`, `core/psychro.py`, `core/simulator.py` | Recursive least squares, time-series ring buffer, psychrometrics, and a small sim house used by tests. |
+| `coordinator.py` | Runtime: sensor ingestion, estimator updates (`_update_estimators`, `_update_zone_estimators`), COP tables, persistence (`_persist`/restore), command execution (incl. tracking translation), diagnostics dump. |
+| `tests/` | Pytest suite. Core tests run without HA (see `conftest.py` stubbing); config-flow tests need `pytest-homeassistant-custom-component`. |
+
+## Key semantics and unit conventions (violating these breaks physics silently)
+
+- **Temperatures are °C; deltas are K. Power is W; energy is Wh (capacitance `c_eff_wh_per_k`).**
+- **Two coordinate frames for setpoints.** The controller thinks in *room frame* (external
+  sensor). Heads regulate on their *internal* sensor, which reads ~3 K low while cooling
+  (supply-air contamination). Translation between frames happens **only** in
+  `coordinator.py` command execution — either dynamically (tracking control: command
+  `internal − delta`, re-anchored every `COMMAND_SPACING_S`) or statically via
+  `DriftEstimator.offset(state)` as fallback. Never translate anywhere else.
+- **`sensible_power_w` is signed**: negative while cooling. It includes the storage term
+  `C·dT/dt`, which is why transient COP samples are valid.
+- **Multi-split constraint**: all heads share one compressor mode. Opposite-demand zones can
+  only get `fan_only` (fan assist), and only after `COIL_DRY_S` — running a fan over a wet
+  coil re-evaporates condensate and undoes latent work already paid for.
+- **Door regimes**: `ThermalModel.fits[door_open]` holds separate RLS fits. A regime with no
+  samples *reports the other regime's fit* (`_fit` fallback); `fit_is_fallback()` tells you
+  whether you're looking at learned or borrowed numbers. Diagnostics expose this flag —
+  keep it honest.
+- **COP tables**: `cop_table` is keyed by active head count; `cop_table_banded` by
+  `"{heads}|{band}"` with bands from `power.outdoor_band()` (mild/warm/hot). Head count and
+  weather are confounded in the field (3 heads ↔ hot afternoons), so never draw head-count
+  conclusions from the unbanded table alone.
+- **Persistence**: everything that must survive a restart goes through `coordinator._persist()`
+  / restore and the `to_dict`/`from_dict` pairs. If you add controller state or a setting,
+  wire all four places: dataclass, `to_dict`, `from_dict`, and the `_persist` settings dict
+  (+ restore key list) — and the switch/number entity if user-facing.
+
+- **Parking is measured, never assumed.** A zone leaving demand on a multi-split (siblings
+  keeping the compressor alive) may be *parked* — setpoint `internal ± preferred_margin`
+  (cool/heat), mode kept — instead of turned off: bounded probes (`PARK_PROBE_S`, spaced
+  `PARK_PROBE_SPACING_S`) while behavior is unclassified, exploitation once a head is a
+  known trickler whose learned output covers the zone's `standing_load_w`. Session margin
+  starts one step below `preferred_margin_k` (floored at `PARK_MARGIN_K` so the setpoint
+  stays on the park side of the internal reading), escalates while the room keeps moving
+  in the conditioning direction (up to `PARK_MARGIN_MAX_K`), and settles the preferred
+  depth on a clean exit. Devices differ (thermo-off vs keep-temperature trickle) and the
+  estimator learns which; nothing hardcodes either answer. Shed zones never park. Helper
+  selection outranks parking.
+
+## Control-loop cheatsheet (what happens each 60 s tick)
+
+1. Runtime ingests sensors → corrected zone temps (drift-aware), power composition, AC
+   estimate (baseline + step deltas), zone estimator updates (free-float fits when off;
+   COP/c_eff when conditioning).
+2. `controller.tick`: pick dominant mode (model-driven free-float prediction), select demand
+   + helper zones, apply min-on/min-off and mode-change rate guards, adapt per-zone tracking
+   delta, apply shedding/window/fan-assist policy, emit `Command`s.
+3. Runtime executes: translates each command to per-head device setpoints (tracking or drift
+   frame), fans out to mirrored heads, records transitions.
+
+## Testing & tooling
+
+```bash
+pip install pytest ruff
+pytest tests -q                          # core logic; config-flow tests need the HA harness
+pip install -r requirements_test.txt     # adds pytest-homeassistant-custom-component
+pytest tests -q
+ruff check . && ruff format .
+```
+
+- Core tests build zones with the `make_zone`/`make_snapshot`/`warmed_state` helpers
+  (see `tests/test_controller.py`); reuse them rather than hand-rolling snapshots.
+- `warmed_state` matters: fresh `ControllerState` timers block transitions via min-off guards
+  and produce confusing "nothing happened" tests.
+- Physics tests use `core/simulator.py` (`SimHouse`/`SimRoom`) to generate consistent
+  trajectories; prefer it over synthetic constants when testing estimators.
+- CI: ruff, hassfest, HACS validation, pytest on Python 3.13.
+
+## Gotchas learned the hard way
+
+- Commands are fire-and-forget (`blocking=False`); heads may unilaterally stop conditioning
+  when their internal sensor crosses the device setpoint. Tracking control exists precisely
+  because a static drift translation over-demands at run start and under-demands at run end
+  (visible as sub-`min_on` hvac_action bursts in field data).
+- `p_ac` near cycle edges divides small numbers: gate COP publication on
+  `HOUSE_COP_MIN_POWER_W` and smooth with `HOUSE_COP_EMA_ALPHA`.
+- The house may have zones with multiple mirrored heads and a single sensor
+  (`n_rooms > 1`): per-head power is `allocated_w / n_rooms`, and thermal totals multiply
+  back by `n_rooms`. Keep the two consistent.
+- Timezone: runtime uses `local_hour` for diurnal models; timestamps are epoch seconds.
