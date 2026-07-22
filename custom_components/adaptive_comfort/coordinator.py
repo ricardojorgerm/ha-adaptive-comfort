@@ -341,7 +341,12 @@ class AdaptiveComfortRuntime:
                 any(z.config.zone_id not in parked_ids for z in active),
                 any(z.config.zone_id in parked_ids for z in active),
             )
-            self.starts.update(now_ts, self.p_ac, self._last_state_key)
+            self.starts.update(
+                now_ts,
+                self.p_ac,
+                self._last_state_key,
+                floor_w=self._compression_floor_w(active, parked_ids),
+            )
         self._finalize_demand(now_ts)
         if self.settings.shedding_enabled:
             await self._async_control(now_ts, local_hour)
@@ -414,6 +419,7 @@ class AdaptiveComfortRuntime:
             "shed_start_pct",
             "shed_restore_pct",
             "adaptive_blend",
+            "fan_floor_per_head_w",
         ):
             if key in settings:
                 setattr(self.settings, key, float(settings[key]))
@@ -496,6 +502,7 @@ class AdaptiveComfortRuntime:
                 "park_learning": s.park_learning,
                 "auto_regime": s.auto_regime,
                 "night_ventilate": s.night_ventilate,
+                "fan_floor_per_head_w": s.fan_floor_per_head_w,
                 "window_suggest": s.window_suggest,
                 "hvac_mode": s.hvac_mode,
                 "preset": s.preset,
@@ -803,6 +810,18 @@ class AdaptiveComfortRuntime:
             (ts, zid) for ts, zid in self._all_events if now_ts - ts < 2 * EVENT_SETTLE_S
         ]
 
+    def _compression_floor_w(self, active: list, parked_ids: set[str]) -> float:
+        """Same electrical floor as park gating, scaled by open head count."""
+        n_open = sum(
+            z.config.n_rooms
+            for z in self.zones.values()
+            if z.is_on or z.config.zone_id in parked_ids
+        )
+        return park.fan_floor_w(
+            max(1, n_open),
+            per_head_w=self.settings.fan_floor_per_head_w,
+        )
+
     def _update_estimators(self, now_ts: float, local_hour: float) -> None:
         # Continuous AC power estimate and per-zone allocation.
         active = [z for z in self.zones.values() if z.is_on]
@@ -819,7 +838,12 @@ class AdaptiveComfortRuntime:
             any(z.config.zone_id not in parked_ids for z in active),
             any(z.config.zone_id in parked_ids for z in active),
         )
-        self.starts.update(now_ts, self.p_ac, self._last_state_key)
+        self.starts.update(
+            now_ts,
+            self.p_ac,
+            self._last_state_key,
+            floor_w=self._compression_floor_w(active, parked_ids),
+        )
         allocations: dict[str, float] = {}
         if self.p_ac and active:
             mode = MODE_HEAT if any(z.head_state == STATE_HEATING for z in active) else MODE_COOL
@@ -1015,7 +1039,11 @@ class AdaptiveComfortRuntime:
             )
             if solo and self.p_ac is not None:
                 settled = zone.park_power.settle(
-                    now_ts, self.p_ac, floor_w=park.fan_floor_w(n_heads)
+                    now_ts,
+                    self.p_ac,
+                    floor_w=park.fan_floor_w(
+                        n_heads, per_head_w=self.settings.fan_floor_per_head_w
+                    ),
                 )
                 if settled is None:
                     continue
@@ -1024,7 +1052,11 @@ class AdaptiveComfortRuntime:
             else:
                 zone.park_power.reset()
                 extraction, active = park.gate_observation(
-                    self.p_ac, solo, raw_extraction, n_heads=n_heads
+                    self.p_ac,
+                    solo,
+                    raw_extraction,
+                    n_heads=n_heads,
+                    per_head_w=self.settings.fan_floor_per_head_w,
                 )
             margin = self.controller_state.zone_park_margin.get(zid)
             zone.park.update(extraction, active, margin_k=margin)

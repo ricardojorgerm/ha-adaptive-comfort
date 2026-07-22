@@ -572,10 +572,11 @@ def test_runout_falls_back_to_min_delta_when_park_learning_off():
 
 
 def test_gate_observation_solo_fan_floor():
-    from custom_components.adaptive_comfort.core.park import gate_observation
+    from custom_components.adaptive_comfort.core.park import fan_floor_w, gate_observation
 
+    floor_1 = fan_floor_w(1)  # 20 + 55 = 75
     # Solo park drawing fan-only power: extraction is phantom, forced to 0.
-    ext, active = gate_observation(35.0, True, 250.0)
+    ext, active = gate_observation(floor_1 - 20.0, True, 250.0)
     assert ext == 0.0 and active is False
     # Solo park with real compression: extraction stands, active True.
     ext, active = gate_observation(320.0, True, 250.0)
@@ -591,15 +592,18 @@ def test_gate_observation_solo_fan_floor():
 
 
 def test_gate_observation_scales_fan_floor_with_heads():
-    from custom_components.adaptive_comfort.core.park import FAN_FLOOR_W, gate_observation
+    from custom_components.adaptive_comfort.core.park import fan_floor_w, gate_observation
 
-    # Two mirrored heads coasting ~120 W would look like compression with a
-    # single-head floor (90 W); scaled floor must treat it as fan-only.
-    coast = FAN_FLOOR_W * 2 - 20.0
-    ext, active = gate_observation(coast, True, 250.0, n_heads=2)
+    # Two-head coast ~100-130 W must stay below the gate (20+55*2=130).
+    floor_2 = fan_floor_w(2)
+    assert floor_2 == 130.0
+    ext, active = gate_observation(floor_2 - 10.0, True, 250.0, n_heads=2)
     assert ext == 0.0 and active is False
-    ext, active = gate_observation(FAN_FLOOR_W * 2 + 50.0, True, 250.0, n_heads=2)
+    ext, active = gate_observation(floor_2 + 50.0, True, 250.0, n_heads=2)
     assert ext == 250.0 and active is True
+    # Tunable per-head: 20 + 70*2 = 160; 140 W coast stays fan-only.
+    ext, active = gate_observation(140.0, True, 250.0, n_heads=2, per_head_w=70.0)
+    assert ext == 0.0 and active is False
 
 
 def test_multi_room_park_exploit_uses_per_room_load():

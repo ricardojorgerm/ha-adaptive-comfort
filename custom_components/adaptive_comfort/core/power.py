@@ -34,7 +34,7 @@ def outdoor_band(t_out: float | None) -> str | None:
     return "hot"
 
 
-COMPRESSION_FLOOR_W = 90.0  # below this the AC draw is fans/electronics only
+COMPRESSION_FLOOR_W = 75.0  # default = fan_floor_w(1); callers pass live floor
 START_DEBOUNCE_S = 180.0  # power must stay below the floor this long to arm
 START_WINDOW_S = 24.0 * 3600.0
 
@@ -42,11 +42,12 @@ START_WINDOW_S = 24.0 * 3600.0
 class StartCounter:
     """Counts compressor starts from the electrical record.
 
-    A start is a rising edge of (ac_power > COMPRESSION_FLOOR_W) after the
-    draw has been below the floor for at least START_DEBOUNCE_S — brief dips
-    from modulation do not re-arm. Events carry the control-state key so
-    inner-loop (park hysteresis) restarts are separable from outer-loop
-    (controller cycling) restarts.
+    A start is a rising edge of (ac_power > floor) after the draw has been
+    below the floor for at least START_DEBOUNCE_S — brief dips from modulation
+    do not re-arm. Pass the same fan_floor_w(open_heads) used for park gating
+    so multi-head coasts are not counted as compression restarts. Events carry
+    the control-state key so inner-loop (park hysteresis) restarts are
+    separable from outer-loop (controller cycling) restarts.
     """
 
     def __init__(self) -> None:
@@ -54,11 +55,18 @@ class StartCounter:
         self._above = False
         self._below_since: float | None = None
 
-    def update(self, now: float, ac_w: float | None, state_key: str | None) -> bool:
+    def update(
+        self,
+        now: float,
+        ac_w: float | None,
+        state_key: str | None,
+        floor_w: float | None = None,
+    ) -> bool:
         if ac_w is None:
             return False
+        floor = COMPRESSION_FLOOR_W if floor_w is None else floor_w
         started = False
-        if ac_w > COMPRESSION_FLOOR_W:
+        if ac_w > floor:
             armed = self._below_since is not None and now - self._below_since >= START_DEBOUNCE_S
             if not self._above and (armed or not self.events):
                 self.events.append((now, state_key or "unknown"))

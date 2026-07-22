@@ -242,7 +242,8 @@
       "shed_start": { "name": "Limite para iniciar limitação" },
       "shed_restore": { "name": "Limite para repor conforto" },
       "adaptive_blend": { "name": "Peso da adaptação sazonal" },
-      "comfort_offset": { "name": "Desvio de conforto" }
+      "comfort_offset": { "name": "Desvio de conforto" },
+      "fan_floor_per_head": { "name": "Piso de ventilador por cabeça aberta" }
     },
     "switch": {
       "coordination": { "name": "Coordenação multi-split" },

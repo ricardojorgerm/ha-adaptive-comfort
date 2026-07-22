@@ -12,11 +12,11 @@ from custom_components.adaptive_comfort.core.types import (
 NOW = 1_000_000.0
 
 
-def make_zone(zone_id, temp, **kw):
+def make_zone(zone_id, temp, n_rooms=1, **kw):
     return ZoneSnapshot(
         zone_id=zone_id,
         name=zone_id,
-        n_rooms=1,
+        n_rooms=n_rooms,
         temp=temp,
         free_float=tuple([temp] * 24),
         confidence=0.9,
@@ -50,10 +50,20 @@ def test_regime_ventilate_on_cold_outdoors():
     assert d.diag["regime"] == "ventilate"
 
 
-def test_regime_continuous_on_big_load():
-    zones = [make_zone("z1", 26.0, standing_load_w=600.0)]
-    st = warmed(zones)
-    d = controller.tick(snap(zones, t_out=30.0), st)
+def test_regime_continuous_scales_with_head_count():
+    # One-head zone: threshold ≈ 0.6 * 265 ≈ 159 W.
+    one = [make_zone("east", 26.0, standing_load_w=170.0, n_rooms=1)]
+    st = warmed(one)
+    d = controller.tick(snap(one, t_out=30.0), st)
+    assert d.diag["regime"] == "continuous"
+    # Two-head zone: threshold ≈ 318 W; 300 W night-West sits just below.
+    west_low = [make_zone("west", 26.0, standing_load_w=300.0, n_rooms=2)]
+    st = warmed(west_low)
+    d = controller.tick(snap(west_low, t_out=30.0), st)
+    assert d.diag["regime"] == "cycling"
+    west_high = [make_zone("west", 26.0, standing_load_w=330.0, n_rooms=2)]
+    st = warmed(west_high)
+    d = controller.tick(snap(west_high, t_out=30.0), st)
     assert d.diag["regime"] == "continuous"
 
 

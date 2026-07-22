@@ -55,8 +55,10 @@ PARK_PROBE_RETRY_S = 1800.0
 # avoids controller-imposed off/restart losses; when outdoor air beats the
 # compressor, neither should run.
 REGIME_VENT_MARGIN_K = 1.0  # outdoor must be this far below the coolest target
-REGIME_FLOOR_THERMAL_W = 750.0  # ~300 W electric floor x park-COP ~2.5
-REGIME_CONT_LOAD_FRACTION = 0.6
+# Compressor thermal floor per open head (~295 W electric solo-park median x
+# park COP ~2.5-3 ≈ 800 W thermal across the open circuits; 265 x 3 ≈ 800).
+REGIME_FLOOR_PER_HEAD_THERMAL_W = 265.0
+REGIME_CONT_LOAD_FRACTION = 0.6  # → ~160 W standing load per head
 REGIME_DWELL_S = 900.0  # hysteresis on regime switching
 # Night outdoor gating (opt-in): widen ventilate and suppress continuous
 # park-holds overnight when outdoor air is near the coolest target.
@@ -93,7 +95,10 @@ def _select_regime(snap: HouseSnapshot, mode: str, centers: dict[str, float]) ->
         ):
             return "cycling"
     total_load = sum(z.standing_load_w or 0.0 for z in snap.zones if z.enabled)
-    if total_load >= REGIME_CONT_LOAD_FRACTION * REGIME_FLOOR_THERMAL_W:
+    total_heads = sum(z.n_rooms for z in snap.zones if z.enabled)
+    if total_heads > 0 and total_load >= (
+        REGIME_CONT_LOAD_FRACTION * REGIME_FLOOR_PER_HEAD_THERMAL_W * total_heads
+    ):
         return "continuous"
     return "cycling"
 

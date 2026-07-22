@@ -31,12 +31,12 @@ from __future__ import annotations
 TRICKLE_MIN_W = 60.0
 IDLE_MAX_W = 25.0
 CLASSIFY_MIN_SAMPLES = 6
-# Electrical truth: below this AC draw there is no compression — just fans
-# and electronics — regardless of what hvac_action claims. Field data shows
-# parked heads cycling between real compression (~300-460 W) and effectively
-# fan-only (<60 W) via their internal hysteresis; hvac_action reports
-# 'cooling' throughout, so power is the only honest activity signal.
-FAN_FLOOR_W = 90.0
+# Electrical truth: below this AC draw there is no compression - just fans
+# and electronics - regardless of what hvac_action claims. Field data: one
+# indoor fan + electronics sits ~60-75 W; two-head coasts run ~100-130 W.
+# Floor = base + per_head * open_heads (per_head is HA-tunable).
+FAN_FLOOR_BASE_W = 20.0
+FAN_FLOOR_PER_HEAD_W = 55.0
 # Park duty samples on the 60 s control tick (not the 5 min thermal fit, and
 # not sub-minute meter edges). Power must sit on one side of the (per-zone)
 # fan floor for this long before a sample counts - brief modulation dips do
@@ -51,14 +51,20 @@ MARGIN_MAX_K = 3.0
 MARGIN_SETTLE_ALPHA = 0.3
 
 
-def fan_floor_w(n_heads: int = 1) -> float:
+def fan_floor_w(
+    n_heads: int = 1,
+    per_head_w: float | None = None,
+    base_w: float | None = None,
+) -> float:
     """Electrical floor below which a solo park has no compression.
 
-    Mirrored heads in one zone all fan together, so the house draw scales
-    with head count; a fixed 90 W floor would mis-read a 2-3 head coast as
-    compression.
+    Mirrored heads fan together, so the house draw scales with head count.
+    Default 20 + 55*N puts East (~75 W) and West (~130 W) coasts below the
+    gate while real compression (~300 W+) stays above.
     """
-    return FAN_FLOOR_W * max(1, int(n_heads))
+    base = FAN_FLOOR_BASE_W if base_w is None else base_w
+    per = FAN_FLOOR_PER_HEAD_W if per_head_w is None else per_head_w
+    return base + per * max(1, int(n_heads))
 
 
 def margin_bin(margin_k: float | None) -> str | None:
@@ -73,18 +79,20 @@ def gate_observation(
     solo: bool,
     extraction_w: float,
     n_heads: int = 1,
+    per_head_w: float | None = None,
+    base_w: float | None = None,
 ) -> tuple[float, bool]:
     """Power-gate a parked observation.
 
     solo (no sibling conditioning): the house AC draw belongs to this park
-    alone, so below fan_floor_w(n_heads) the heads are coasting fan-only -
+    alone, so below fan_floor_w(...) the heads are coasting fan-only -
     the thermal model's extraction estimate is phantom and is forced to zero.
     extraction_w is sensed-room / per-head frame (same as ParkEstimator).
     Non-solo: electrical attribution is ambiguous; fall back to judging
     activity from the extraction magnitude itself.
     """
     if solo and p_ac_w is not None:
-        if p_ac_w < fan_floor_w(n_heads):
+        if p_ac_w < fan_floor_w(n_heads, per_head_w=per_head_w, base_w=base_w):
             return 0.0, False
         return max(0.0, extraction_w), True
     return max(0.0, extraction_w), extraction_w > IDLE_MAX_W
@@ -108,7 +116,7 @@ class PowerDebounce:
     def settle(self, now: float, p_ac_w: float | None, floor_w: float | None = None) -> bool | None:
         if p_ac_w is None:
             return None
-        floor = FAN_FLOOR_W if floor_w is None else floor_w
+        floor = fan_floor_w(1) if floor_w is None else floor_w
         above = p_ac_w >= floor
         if self.above is None or self.above != above:
             self.above = above

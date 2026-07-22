@@ -136,6 +136,8 @@ class Settings:
     # ventilate / cycling path instead of continuous park-holds (opt-in;
     # field data showed ~280 W overnight compression against cool outdoor air).
     night_ventilate: bool = False
+    # Per-open-head electrical fan floor (W). Gate = 20 + this × heads.
+    fan_floor_per_head_w: float = 55.0
     # Hold mechanical conditioning briefly while the user is expected to ventilate manually.
     window_suggest: bool = False
     hvac_mode: str = MODE_AUTO

@@ -7,6 +7,7 @@ from dataclasses import dataclass
 
 from homeassistant.components.number import NumberEntity, NumberEntityDescription, NumberMode
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import UnitOfPower
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.entity import EntityCategory
 from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
@@ -107,6 +108,18 @@ HOUSE_NUMBERS: tuple[SettingNumberDescription, ...] = (
         entity_category=EntityCategory.CONFIG,
         get_fn=lambda s: s.adaptive_blend * 100.0,
         set_fn=lambda s, v: setattr(s, "adaptive_blend", v / 100.0),
+    ),
+    SettingNumberDescription(
+        key="fan_floor_per_head",
+        translation_key="fan_floor_per_head",
+        native_min_value=20,
+        native_max_value=120,
+        native_step=5,
+        native_unit_of_measurement=UnitOfPower.WATT,
+        mode=NumberMode.BOX,
+        entity_category=EntityCategory.CONFIG,
+        get_fn=lambda s: s.fan_floor_per_head_w,
+        set_fn=lambda s, v: setattr(s, "fan_floor_per_head_w", v),
     ),
 )
 

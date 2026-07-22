@@ -242,7 +242,8 @@
       "shed_start": { "name": "Shed start threshold" },
       "shed_restore": { "name": "Shed restore threshold" },
       "adaptive_blend": { "name": "Seasonal adaptation weight" },
-      "comfort_offset": { "name": "Comfort offset" }
+      "comfort_offset": { "name": "Comfort offset" },
+      "fan_floor_per_head": { "name": "Fan floor per open head" }
     },
     "switch": {
       "coordination": { "name": "Multi-split coordination" },
