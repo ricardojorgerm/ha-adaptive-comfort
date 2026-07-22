@@ -61,6 +61,20 @@ HOUSE_SWITCHES: tuple[SettingSwitchDescription, ...] = (
         set_fn=lambda s, v: setattr(s, "park_learning", v),
     ),
     SettingSwitchDescription(
+        key="auto_regime",
+        translation_key="auto_regime",
+        entity_category=EntityCategory.CONFIG,
+        get_fn=lambda s: s.auto_regime,
+        set_fn=lambda s, v: setattr(s, "auto_regime", v),
+    ),
+    SettingSwitchDescription(
+        key="night_ventilate",
+        translation_key="night_ventilate",
+        entity_category=EntityCategory.CONFIG,
+        get_fn=lambda s: s.night_ventilate,
+        set_fn=lambda s, v: setattr(s, "night_ventilate", v),
+    ),
+    SettingSwitchDescription(
         key="fan_assist",
         translation_key="fan_assist",
         entity_category=EntityCategory.CONFIG,

@@ -127,6 +127,15 @@ class Settings:
     # trickle, then parking replaces hard-off when trickle output can
     # carry a satisfied zone's standing load (multi-split, siblings on).
     park_learning: bool = True
+    # Regime policy: per-tick choice among 'ventilate' (outdoor beats the
+    # compressor: gate cooling demand), 'continuous' (load can feed the
+    # compressor floor: hold zones parked instead of cycling them off), and
+    # 'cycling' (default behavior with true offs and drained coils).
+    auto_regime: bool = True
+    # Overnight: when outdoor air is at/near the coolest target, force the
+    # ventilate / cycling path instead of continuous park-holds (opt-in;
+    # field data showed ~280 W overnight compression against cool outdoor air).
+    night_ventilate: bool = False
     # Hold mechanical conditioning briefly while the user is expected to ventilate manually.
     window_suggest: bool = False
     hvac_mode: str = MODE_AUTO
@@ -168,11 +177,14 @@ class ZoneSnapshot:
     # controller keep tracking a zone that is running out its minimum
     # runtime after the house has gone idle.
     head_mode: str | None = None
-    park_extraction_w: float | None = None
+    park_extraction_w: float | None = None  # sensed-room / per-head parked output (W)
     # Learned park depth (K) to start from on the next park entry.
     park_preferred_margin_k: float | None = None
-    # Estimated standing heat load of the zone at current conditions (W, >=0);
-    # lets the controller judge whether trickle output can carry the zone.
+    # Cheapest margin bin whose compression duty is low (from ParkEstimator).
+    park_coast_margin_k: float | None = None
+    # Estimated standing heat load of the *zone* at current conditions
+    # (W, >=0, sensed-room inflow x n_rooms). Park extraction is per-head;
+    # exploit compares extraction to standing_load_w / n_rooms.
     standing_load_w: float | None = None
 
 
@@ -245,6 +257,8 @@ class ControllerState:
     zone_park_probe_entry: dict[str, int] = field(
         default_factory=dict
     )  # park_samples at probe entry
+    regime: str = "cycling"  # 'ventilate' | 'continuous' | 'cycling'
+    regime_since: float = 0.0
     zone_park_margin: dict[str, float] = field(
         default_factory=dict
     )  # adaptive margin above internal (K)
@@ -268,6 +282,8 @@ class ControllerState:
             "zone_park_probe_entry": dict(self.zone_park_probe_entry),
             "zone_park_margin": dict(self.zone_park_margin),
             "zone_last_park_abort": dict(self.zone_last_park_abort),
+            "regime": self.regime,
+            "regime_since": self.regime_since,
             "zone_park_preferred": dict(self.zone_park_preferred),
         }
 
@@ -296,6 +312,8 @@ class ControllerState:
         st.zone_last_park_abort = {
             str(k): float(v) for k, v in data.get("zone_last_park_abort", {}).items()
         }
+        st.regime = str(data.get("regime", "cycling"))
+        st.regime_since = float(data.get("regime_since", 0.0))
         st.zone_park_preferred = {
             str(k): float(v) for k, v in data.get("zone_park_preferred", {}).items()
         }

@@ -111,10 +111,23 @@ def test_window_suggested_and_cooling_delayed_when_option_on():
     assert not any(c.hvac_mode == MODE_COOL for c in decision.commands)
 
 
-def test_window_suggested_but_cooling_proceeds_when_option_off():
-    # The advisory is always reported; the option only controls the delay.
+def test_window_suggested_ventilate_regime_forces_grace():
+    # Cold outdoors selects the 'ventilate' regime, which forces the
+    # grace-gated flow even with the window_suggest option off: open within
+    # the grace period, or the compressor proceeds anyway.
     zone = make_zone("bed", 25.5, occupied=True)
     snap = make_snapshot([zone], Settings(hvac_mode=MODE_AUTO), t_out=18.0)
+    decision = controller.tick(snap, warmed_state([zone]))
+    assert decision.window_suggestions == ["bed"]
+    assert not any(c.hvac_mode == MODE_COOL for c in decision.commands)
+
+
+def test_window_suggested_cooling_proceeds_with_auto_regime_off():
+    # With the regime policy disabled, the old semantics hold: the advisory
+    # is reported, the option alone controls the delay, cooling proceeds.
+    zone = make_zone("bed", 25.5, occupied=True)
+    settings = Settings(hvac_mode=MODE_AUTO, auto_regime=False)
+    snap = make_snapshot([zone], settings, t_out=18.0)
     decision = controller.tick(snap, warmed_state([zone]))
     assert decision.window_suggestions == ["bed"]
     assert any(c.hvac_mode == MODE_COOL for c in decision.commands)

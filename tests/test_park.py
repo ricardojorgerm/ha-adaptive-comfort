@@ -17,11 +17,11 @@ from custom_components.adaptive_comfort.core.types import (
 NOW = 1_000_000.0
 
 
-def make_zone(zone_id, temp, is_on=False, **kw):
+def make_zone(zone_id, temp, is_on=False, n_rooms=1, **kw):
     return ZoneSnapshot(
         zone_id=zone_id,
         name=zone_id,
-        n_rooms=1,
+        n_rooms=n_rooms,
         temp=temp,
         is_on=is_on,
         free_float=tuple([temp] * 24),
@@ -257,9 +257,7 @@ def test_parked_zone_released_when_pushed_through_far_edge():
     assert "sat" in state.zone_parked_since
     soon = NOW + 120.0  # well inside PARK_MIN_DWELL_S
     # Band lo = target - band_k = 22.3; at the floor the session must live.
-    at_floor = make_zone(
-        "sat", 22.3, is_on=True, park_trickles=True, park_extraction_w=400.0
-    )
+    at_floor = make_zone("sat", 22.3, is_on=True, park_trickles=True, park_extraction_w=400.0)
     state.zone_last_cmd["sat"] = soon - 3600.0
     tick([at_floor, hot], state, now=soon)
     assert "sat" in state.zone_parked_since
@@ -568,3 +566,152 @@ def test_runout_falls_back_to_min_delta_when_park_learning_off():
         assert cmd.track_delta == controller.TRACK_DELTA_MIN_K
     else:
         assert cmd is None or cmd.park is False
+
+
+# --- power-gated observation and hysteresis learning ---------------------------
+
+
+def test_gate_observation_solo_fan_floor():
+    from custom_components.adaptive_comfort.core.park import gate_observation
+
+    # Solo park drawing fan-only power: extraction is phantom, forced to 0.
+    ext, active = gate_observation(35.0, True, 250.0)
+    assert ext == 0.0 and active is False
+    # Solo park with real compression: extraction stands, active True.
+    ext, active = gate_observation(320.0, True, 250.0)
+    assert ext == 250.0 and active is True
+    # Sibling conditioning (ambiguous power): judge by extraction magnitude.
+    ext, active = gate_observation(600.0, False, 10.0)
+    assert active is False
+    ext, active = gate_observation(600.0, False, 200.0)
+    assert active is True
+    # No power reading at all: same magnitude fallback.
+    ext, active = gate_observation(None, True, 200.0)
+    assert active is True
+
+
+def test_gate_observation_scales_fan_floor_with_heads():
+    from custom_components.adaptive_comfort.core.park import FAN_FLOOR_W, gate_observation
+
+    # Two mirrored heads coasting ~120 W would look like compression with a
+    # single-head floor (90 W); scaled floor must treat it as fan-only.
+    coast = FAN_FLOOR_W * 2 - 20.0
+    ext, active = gate_observation(coast, True, 250.0, n_heads=2)
+    assert ext == 0.0 and active is False
+    ext, active = gate_observation(FAN_FLOOR_W * 2 + 50.0, True, 250.0, n_heads=2)
+    assert ext == 250.0 and active is True
+
+
+def test_multi_room_park_exploit_uses_per_room_load():
+    """Zone-total standing load must not block exploit when per-head covers it."""
+    from custom_components.adaptive_comfort.core.controller import _park_exploit_ok
+
+    # Two rooms: zone load 200 W, sensed-room extraction 120 W covers 100 W/room.
+    zone = make_zone(
+        "duo",
+        23.0,
+        n_rooms=2,
+        park_trickles=True,
+        park_extraction_w=120.0,
+        standing_load_w=200.0,
+    )
+    assert _park_exploit_ok(zone, MODE_COOL) is True
+    # Same numbers without n_rooms scaling would have failed (120 < 0.7*200).
+    under = make_zone(
+        "duo",
+        23.0,
+        n_rooms=2,
+        park_trickles=True,
+        park_extraction_w=50.0,
+        standing_load_w=200.0,
+    )
+    assert _park_exploit_ok(under, MODE_COOL) is False
+
+
+def test_multi_room_zone_parks_and_exploits_with_sibling():
+    """Mirrored zone with adequate per-head trickle parks when a sibling runs."""
+    sat = make_zone(
+        "sat",
+        23.0,
+        is_on=True,
+        n_rooms=2,
+        park_trickles=True,
+        park_extraction_w=150.0,
+        standing_load_w=200.0,  # 100 W/room; 150 covers it
+    )
+    hot = make_zone("hot", 26.0, is_on=True, standing_load_w=200.0)
+    state = warmed_state([sat, hot])
+    decision = tick([sat, hot], state)
+    assert "sat" in state.zone_parked_since
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is True
+
+
+def test_margin_bins_learn_hysteresis_map():
+    from custom_components.adaptive_comfort.core.park import (
+        CLASSIFY_MIN_SAMPLES,
+        ParkEstimator,
+    )
+
+    est = ParkEstimator()
+    # Shallow margin: hysteresis keeps re-engaging compression.
+    for _ in range(CLASSIFY_MIN_SAMPLES):
+        est.update(300.0, True, margin_k=1.0)
+    # Deep margin: head coasts fan-only.
+    for _ in range(CLASSIFY_MIN_SAMPLES):
+        est.update(0.0, False, margin_k=2.5)
+    assert est.margin_bins["1.0"][1] > 0.7  # compression duty high
+    assert est.margin_bins["2.5"][1] < 0.3  # coast region
+    assert est.coast_margin_k() == 2.5
+    assert est.fan_only_ratio is not None and 0.3 < est.fan_only_ratio < 0.7
+
+
+def test_margin_bins_round_trip():
+    from custom_components.adaptive_comfort.core.park import ParkEstimator
+
+    est = ParkEstimator()
+    for _ in range(8):
+        est.update(150.0, True, margin_k=1.4)  # bins to "1.5"
+    restored = ParkEstimator.from_dict(est.to_dict())
+    assert "1.5" in restored.margin_bins
+    assert restored.margin_bins["1.5"][2] == 8
+
+
+def test_margin_bin_edges():
+    from custom_components.adaptive_comfort.core.park import margin_bin
+
+    assert margin_bin(None) is None
+    assert margin_bin(1.0) == "1.0"
+    assert margin_bin(1.24) == "1.0"
+    assert margin_bin(1.26) == "1.5"
+    assert margin_bin(3.0) == "3.0"
+
+
+def test_control_state_key():
+    from custom_components.adaptive_comfort.core.power import control_state_key
+
+    assert control_state_key(True, False) == "conditioning"
+    assert control_state_key(False, True) == "park"
+    assert control_state_key(True, True) == "mixed"
+    assert control_state_key(False, False) is None
+
+
+def test_power_debounce_ignores_brief_crossings():
+    from custom_components.adaptive_comfort.core.park import (
+        PARK_DUTY_DEBOUNCE_S,
+        PowerDebounce,
+    )
+
+    d = PowerDebounce()
+    t = NOW
+    assert d.settle(t, 320.0) is None  # first sighting arms, no sample yet
+    assert d.settle(t + PARK_DUTY_DEBOUNCE_S - 1.0, 320.0) is None  # still settling
+    assert d.settle(t + PARK_DUTY_DEBOUNCE_S, 320.0) is True
+    # Brief dip below the floor: re-arm, no false inactive sample.
+    assert d.settle(t + PARK_DUTY_DEBOUNCE_S + 60.0, 40.0) is None
+    assert d.settle(t + PARK_DUTY_DEBOUNCE_S + 90.0, 320.0) is None  # flipped back
+    # Sustained coast then settles inactive.
+    assert d.settle(t + 500.0, 40.0) is None
+    assert d.settle(t + 500.0 + PARK_DUTY_DEBOUNCE_S, 40.0) is False
+    d.reset()
+    assert d.above is None and d.since is None

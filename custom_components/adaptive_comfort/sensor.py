@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import time
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
@@ -168,6 +169,30 @@ HOUSE_SENSORS: tuple[HouseSensorDescription, ...] = (
             )
         },
     ),
+    HouseSensorDescription(
+        key="operating_regime",
+        translation_key="operating_regime",
+        device_class=SensorDeviceClass.ENUM,
+        options=["ventilate", "continuous", "cycling"],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda r: r.controller_state.regime,
+        attr_fn=lambda r: {
+            "since": r.controller_state.regime_since,
+            "auto_regime": r.settings.auto_regime,
+            "night_ventilate": r.settings.night_ventilate,
+        },
+    ),
+    HouseSensorDescription(
+        key="compressor_starts_per_hour",
+        translation_key="compressor_starts_per_hour",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda r: round(r.starts.per_hour(time.time()), 2),
+        attr_fn=lambda r: {
+            "by_state_24h": r.starts.by_state(time.time()),
+            "events_24h": sum(r.starts.by_state(time.time()).values()),
+        },
+    ),
 )
 
 
@@ -331,6 +356,20 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         value_fn=lambda z, r: _round(z.allocated_w, 0),
     ),
     ZoneSensorDescription(
+        key="head_internal_temp",
+        translation_key="head_internal_temp",
+        native_unit_of_measurement=UnitOfTemperature.CELSIUS,
+        device_class=SensorDeviceClass.TEMPERATURE,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: _round(z.head_internal_temp, 2),
+        attr_fn=lambda z, r: {
+            "device_setpoint": None if z.device_setpoint is None else round(z.device_setpoint, 2),
+            "room_temp": None if z.temp is None else round(z.temp, 2),
+            "track_delta_k": r.controller_state.zone_track_delta.get(z.config.zone_id),
+        },
+    ),
+    ZoneSensorDescription(
         key="control_state",
         translation_key="control_state",
         device_class=SensorDeviceClass.ENUM,
@@ -346,7 +385,7 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         ],
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z, r: r.zone_control_state(z),
-        attr_fn=lambda z, r: {"last_reason": z.last_control_reason},
+        attr_fn=lambda z, r: r.zone_control_attrs(z),
     ),
     ZoneSensorDescription(
         key="track_delta",
@@ -354,9 +393,7 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         native_unit_of_measurement="K",
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda z, r: _round(
-            r.controller_state.zone_track_delta.get(z.config.zone_id), 2
-        ),
+        value_fn=lambda z, r: _round(r.controller_state.zone_track_delta.get(z.config.zone_id), 2),
     ),
     ZoneSensorDescription(
         key="park_classification",
@@ -367,23 +404,16 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         value_fn=lambda z, r: z.park.classification,
         attr_fn=lambda z, r: {
             "samples": z.park.samples,
-            "active_ratio": None
-            if z.park.active_ratio is None
-            else round(z.park.active_ratio, 3),
-        },
-    ),
-    ZoneSensorDescription(
-        key="park_preferred_margin",
-        translation_key="park_preferred_margin",
-        native_unit_of_measurement="K",
-        state_class=SensorStateClass.MEASUREMENT,
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda z, r: _round(
-            r.controller_state.zone_park_preferred.get(
+            "preferred_margin_k": r.controller_state.zone_park_preferred.get(
                 z.config.zone_id, z.park.preferred_margin_k
             ),
-            2,
-        ),
+            "active_ratio": None if z.park.active_ratio is None else round(z.park.active_ratio, 3),
+            "fan_only_ratio": None
+            if z.park.fan_only_ratio is None
+            else round(z.park.fan_only_ratio, 3),
+            "coast_margin_k": z.park.coast_margin_k(),
+            "margin_bins": z.park.margin_bins,
+        },
     ),
     ZoneSensorDescription(
         key="park_margin",
@@ -391,9 +421,7 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         native_unit_of_measurement="K",
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda z, r: _round(
-            r.controller_state.zone_park_margin.get(z.config.zone_id), 2
-        ),
+        value_fn=lambda z, r: _round(r.controller_state.zone_park_margin.get(z.config.zone_id), 2),
     ),
     ZoneSensorDescription(
         key="park_extraction",
@@ -403,24 +431,6 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z, r: _round(z.park.extraction_w, 0),
-    ),
-    ZoneSensorDescription(
-        key="command_reason",
-        translation_key="command_reason",
-        device_class=SensorDeviceClass.ENUM,
-        options=[
-            "none",
-            "demand",
-            "helper",
-            "park",
-            "runout",
-            "off",
-            "shed",
-            "fan_assist",
-            "fan_off",
-        ],
-        entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda z, r: z.last_control_reason or "none",
     ),
 )
 

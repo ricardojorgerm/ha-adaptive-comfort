@@ -181,6 +181,15 @@
       "house_cop": { "name": "COP da casa" },
       "model_confidence": { "name": "Confiança do modelo" },
       "parked_zones": { "name": "Zonas em park" },
+      "operating_regime": {
+        "name": "Regime de operação",
+        "state": {
+          "ventilate": "Ventilar",
+          "continuous": "Contínuo",
+          "cycling": "Ciclos"
+        }
+      },
+      "compressor_starts_per_hour": { "name": "Arranques do compressor por hora" },
       "zone_temperature": { "name": "Temperatura (corrigida)" },
       "predicted_60m": { "name": "Temperatura prevista +60 min" },
       "k_exchange": { "name": "Constante de troca exterior k" },
@@ -196,6 +205,7 @@
       "drift_offset": { "name": "Desvio do sensor" },
       "zone_confidence": { "name": "Confiança do ajuste" },
       "allocated_power": { "name": "Potência AC atribuída" },
+      "head_internal_temp": { "name": "Temperatura interna da cabeça" },
       "control_state": {
         "name": "Estado de controlo",
         "state": {
@@ -214,28 +224,12 @@
         "name": "Classificação de park",
         "state": { "unknown": "Desconhecido", "idle": "Idle", "trickle": "Trickle" }
       },
-      "park_preferred_margin": { "name": "Margem de park preferida" },
       "park_margin": { "name": "Margem de park" },
-      "park_extraction": { "name": "Extração em park" },
-      "command_reason": {
-        "name": "Motivo do último comando",
-        "state": {
-          "none": "Nenhum",
-          "demand": "Procura",
-          "helper": "Auxiliar",
-          "park": "Park",
-          "runout": "A terminar ciclo",
-          "off": "Desligado",
-          "shed": "Limitação",
-          "fan_assist": "Ventilação auxiliar",
-          "fan_off": "Ventilação desligada"
-        }
-      }
+      "park_extraction": { "name": "Extração em park" }
     },
     "binary_sensor": {
       "shedding_active": { "name": "Limitação de potência ativa" },
       "conditioning_active": { "name": "Climatização" },
-      "zone_parked": { "name": "Em park" },
       "zone_shed": { "name": "Limitada" },
       "window_suggestion": { "name": "Abrir janelas sugerido" },
       "zone_window_suggestion": { "name": "Abrir janela sugerido" }
@@ -257,6 +251,8 @@
       "fan_assist": { "name": "Ventilação auxiliar (zonas com pedido oposto)" },
       "tracking": { "name": "Setpoint dinâmico (tracking)" },
       "park_learning": { "name": "Aprendizagem de comportamento em park" },
+      "auto_regime": { "name": "Regime automático (ventilar / contínuo / ciclos)" },
+      "night_ventilate": { "name": "Prioridade à ventilação noturna (ar exterior fresco)" },
       "window_suggest": { "name": "Aguardar ventilação manual" },
       "zone_enabled": { "name": "Zona ativa" }
     }

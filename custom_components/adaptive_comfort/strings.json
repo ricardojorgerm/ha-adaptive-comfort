@@ -181,6 +181,15 @@
       "house_cop": { "name": "House COP" },
       "model_confidence": { "name": "Model confidence" },
       "parked_zones": { "name": "Parked zones" },
+      "operating_regime": {
+        "name": "Operating regime",
+        "state": {
+          "ventilate": "Ventilate",
+          "continuous": "Continuous",
+          "cycling": "Cycling"
+        }
+      },
+      "compressor_starts_per_hour": { "name": "Compressor starts per hour" },
       "zone_temperature": { "name": "Temperature (corrected)" },
       "predicted_60m": { "name": "Predicted temperature +60 min" },
       "k_exchange": { "name": "Outdoor exchange constant k" },
@@ -196,6 +205,7 @@
       "drift_offset": { "name": "Sensor drift offset" },
       "zone_confidence": { "name": "Fit confidence" },
       "allocated_power": { "name": "Allocated AC power" },
+      "head_internal_temp": { "name": "Head internal temperature" },
       "control_state": {
         "name": "Control state",
         "state": {
@@ -214,28 +224,12 @@
         "name": "Park classification",
         "state": { "unknown": "Unknown", "idle": "Idle", "trickle": "Trickle" }
       },
-      "park_preferred_margin": { "name": "Preferred park margin" },
       "park_margin": { "name": "Park margin" },
-      "park_extraction": { "name": "Park extraction" },
-      "command_reason": {
-        "name": "Last command reason",
-        "state": {
-          "none": "None",
-          "demand": "Demand",
-          "helper": "Helper",
-          "park": "Park",
-          "runout": "Run-out",
-          "off": "Off",
-          "shed": "Shed",
-          "fan_assist": "Fan assist",
-          "fan_off": "Fan off"
-        }
-      }
+      "park_extraction": { "name": "Park extraction" }
     },
     "binary_sensor": {
       "shedding_active": { "name": "Shedding active" },
       "conditioning_active": { "name": "Conditioning" },
-      "zone_parked": { "name": "Parked" },
       "zone_shed": { "name": "Shed" },
       "window_suggestion": { "name": "Open windows suggested" },
       "zone_window_suggestion": { "name": "Open window suggested" }
@@ -257,6 +251,8 @@
       "fan_assist": { "name": "Fan assist (opposite-demand zones)" },
       "tracking": { "name": "Tracking setpoint control" },
       "park_learning": { "name": "Park-behavior learning" },
+      "auto_regime": { "name": "Automatic regime (ventilate / continuous / cycling)" },
+      "night_ventilate": { "name": "Night outdoor gating (prefer free cooling overnight)" },
       "window_suggest": { "name": "Wait for manual ventilation" },
       "zone_enabled": { "name": "Zone enabled" }
     }

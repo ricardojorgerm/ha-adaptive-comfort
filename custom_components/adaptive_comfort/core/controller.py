@@ -49,6 +49,64 @@ PARK_MARGIN_K = 1.0
 PARK_OVERCOOL_BUFFER_K = 0.4
 # A probe that never produced an observation should be cheap to retry.
 PARK_PROBE_RETRY_S = 1800.0
+# Regime policy thresholds. The compressor cannot run below its floor; the
+# only question is who duty-cycles it. When the aggregate standing load can
+# feed a meaningful fraction of the floor, continuous (park-held) operation
+# avoids controller-imposed off/restart losses; when outdoor air beats the
+# compressor, neither should run.
+REGIME_VENT_MARGIN_K = 1.0  # outdoor must be this far below the coolest target
+REGIME_FLOOR_THERMAL_W = 750.0  # ~300 W electric floor x park-COP ~2.5
+REGIME_CONT_LOAD_FRACTION = 0.6
+REGIME_DWELL_S = 900.0  # hysteresis on regime switching
+# Night outdoor gating (opt-in): widen ventilate and suppress continuous
+# park-holds overnight when outdoor air is near the coolest target.
+NIGHT_START_H = 22.0
+NIGHT_END_H = 8.0
+NIGHT_VENT_MARGIN_K = 0.0  # at night, outdoor at/below coolest target is enough
+NIGHT_SKIP_CONT_K = 2.0  # outdoor within this of coolest → prefer cycling over continuous
+
+
+def _is_night(local_hour: float) -> bool:
+    return local_hour >= NIGHT_START_H or local_hour < NIGHT_END_H
+
+
+def _select_regime(snap: HouseSnapshot, mode: str, centers: dict[str, float]) -> str:
+    s = snap.settings
+    if not s.auto_regime or mode not in (MODE_COOL, MODE_HEAT):
+        return "cycling"
+    # Free cooling: outdoor beats the coolest zone target. Heat has no
+    # symmetric "ventilate" (opening windows when outdoor is warm is rare
+    # and already covered by the window-suggestion path).
+    if mode == MODE_COOL and snap.t_out is not None and centers:
+        coolest = min(centers.values())
+        vent_margin = REGIME_VENT_MARGIN_K
+        if s.night_ventilate and _is_night(snap.local_hour):
+            vent_margin = NIGHT_VENT_MARGIN_K
+        if snap.t_out <= coolest - vent_margin:
+            return "ventilate"
+        # Overnight with outdoor near-cool: don't keep continuous park-holds
+        # chewing the compressor floor when free cooling is almost as good.
+        if (
+            s.night_ventilate
+            and _is_night(snap.local_hour)
+            and snap.t_out <= coolest + NIGHT_SKIP_CONT_K
+        ):
+            return "cycling"
+    total_load = sum(z.standing_load_w or 0.0 for z in snap.zones if z.enabled)
+    if total_load >= REGIME_CONT_LOAD_FRACTION * REGIME_FLOOR_THERMAL_W:
+        return "continuous"
+    return "cycling"
+
+
+def _apply_regime_dwell(state: ControllerState, proposed: str, now: float) -> str:
+    if state.regime_since == 0.0 or (
+        proposed != state.regime and now - state.regime_since >= REGIME_DWELL_S
+    ):
+        state.regime = proposed
+        state.regime_since = now
+    return state.regime
+
+
 PARK_MARGIN_MAX_K = 3.0
 PARK_MARGIN_STEP_K = 0.5
 # Enter each park one step below the learned preferred depth (still >=
@@ -142,7 +200,12 @@ def _record_transition(state: ControllerState, zone_id: str, now: float, on: boo
 
 
 def _park_exploit_ok(zone: ZoneSnapshot, mode: str) -> bool:
-    """Known trickler whose parked output plausibly carries the standing load."""
+    """Known trickler whose parked output plausibly carries the standing load.
+
+    park_extraction_w is sensed-room / per-head; standing_load_w is zone-total
+    (x n_rooms). Compare in the per-room frame so mirrored zones are not
+    falsely judged unable to cover their load.
+    """
     if zone.park_trickles is not True:
         return False
     if zone.park_extraction_w is None:
@@ -151,21 +214,31 @@ def _park_exploit_ok(zone: ZoneSnapshot, mode: str) -> bool:
         # No load estimate: trickling while satisfied is still calmer than
         # off/on cycling, accept.
         return True
-    return zone.park_extraction_w >= PARK_LOAD_COVER_FRACTION * zone.standing_load_w
+    per_room_load = zone.standing_load_w / max(1, zone.n_rooms)
+    return zone.park_extraction_w >= PARK_LOAD_COVER_FRACTION * per_room_load
 
 
 def _park_preferred(zone: ZoneSnapshot, state: ControllerState) -> float:
-    """Learned park depth for this zone, falling back to the base margin."""
+    """Learned park depth for this zone, falling back to the base margin.
+
+    Once the hysteresis map has found a coasting depth, prefer that over the
+    static default — it is the cheapest hold inside the head's dead-band.
+    """
     zid = zone.zone_id
     if zid in state.zone_park_preferred:
         return state.zone_park_preferred[zid]
+    if zone.park_coast_margin_k is not None:
+        return min(max(zone.park_coast_margin_k, PARK_MARGIN_K), PARK_MARGIN_MAX_K)
     if zone.park_preferred_margin_k is not None:
         return zone.park_preferred_margin_k
     return PARK_MARGIN_K
 
 
 def _park_entry_margin(zone: ZoneSnapshot, state: ControllerState) -> float:
-    """Start slightly below preferred so the session can re-converge upward."""
+    """Park entry depth: coast band when mapped, else preferred - undershoot."""
+    if zone.park_coast_margin_k is not None:
+        # Land inside the coast region; undershooting would re-engage compression.
+        return min(max(zone.park_coast_margin_k, PARK_MARGIN_K), PARK_MARGIN_MAX_K)
     preferred = _park_preferred(zone, state)
     return max(preferred - PARK_ENTRY_UNDERSHOOT_K, PARK_MARGIN_K)
 
@@ -325,6 +398,15 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
     want_on = {z.zone_id: (z in demand or z in helpers) for z in zones}
 
+    # ---- Regime policy -------------------------------------------------
+    regime = _apply_regime_dwell(state, _select_regime(snap, mode, centers), now)
+    diag["regime"] = regime
+    # 'ventilate' does not hard-gate: it widens the window-suggestion pool to
+    # every warm zone and forces the grace-gated flow (below) regardless of
+    # the window_suggest option — open within the grace period, or the
+    # compressor proceeds anyway (at its best COP, given the cold outdoors).
+    # A hot room is never stranded because nobody was around to open up.
+
     # Remember when each zone last ran its compressor in cooling: the coil
     # stays wet for a while and fan-only would re-evaporate condensate.
     for zone in zones:
@@ -337,14 +419,20 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     # The window_suggest option additionally *delays* mechanical conditioning
     # for a grace period so the user can open a window first; with the option
     # off the suggestion is still reported but conditioning starts immediately.
+    # In 'ventilate' regime the grace gate is forced regardless of the option.
     window_suggestions: list[str] = []
     if mode in (MODE_HEAT, MODE_COOL):
-        for zone in demand:
+        suggest_pool = (
+            [z for z in zones if z.temp is not None and z.temp > centers[z.zone_id]]
+            if regime == "ventilate" and mode == MODE_COOL
+            else demand
+        )
+        for zone in suggest_pool:
             zid = zone.zone_id
             if _window_would_help(zone, snap.t_out, mode, snap.house_occupied):
                 since = state.window_suggest_since.setdefault(zid, now)
                 window_suggestions.append(zid)
-                if s.window_suggest and now - since < WINDOW_GRACE_S:
+                if (s.window_suggest or regime == "ventilate") and now - since < WINDOW_GRACE_S:
                     want_on[zid] = False  # give the user a chance first
             else:
                 state.window_suggest_since.pop(zid, None)
@@ -530,14 +618,19 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 and (
                     probe_done
                     or zone.park_trickles is False
-                    or not _park_exploit_ok(zone, pmode)
-                    or not sibling_alive
+                    or (
+                        regime != "continuous"
+                        and (not _park_exploit_ok(zone, pmode) or not sibling_alive)
+                    )
                     or pmode is None
                 )
             ):
                 # Probe finished, head classified as idler, or exploitation
                 # no longer justified: release to normal off handling.
                 # Settle even when the house mode is already idle (run-out parks).
+                # In 'continuous' regime, sibling requirement and exploit check
+                # are waived — the load feeds the compressor floor, so holding
+                # parked is cheaper than controller-imposed off/restart cycles.
                 if zid not in state.shed:
                     _settle_park_preferred(state, zid, margin)
                 _clear_park_session(state, zid, zone, now)
@@ -559,7 +652,10 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             and s.multisplit
             and zid not in state.shed
             and mode in (MODE_HEAT, MODE_COOL)
-            and any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones)
+            and (
+                regime == "continuous"
+                or any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones)
+            )
             and _transition_allowed(state, zid, now, False, s)
         ):
             probe_due = (

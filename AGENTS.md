@@ -88,14 +88,38 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   idle; overcorrected-but-unstoppable zones hold at `PARK_MARGIN_MAX_K` rather than being
   released into a forbidden off. Tracked `runout` commands are the `park_learning`-off
   fallback only.
+- **Power is the only honest activity signal.** These heads report `hvac_action: cooling`
+  through entire parks while the electrical record is bimodal (fan-only <60 W vs real
+  compression >300 W) — the device cycles via an internal hysteresis around its own sensor.
+  Parked observations are therefore power-gated (`park.gate_observation`): solo-park draw
+  below `FAN_FLOOR_W` forces extraction to zero. Never infer compression from `hvac_action`.
+  Duty samples run on the 60 s control tick (not the 5 min thermal fit), with
+  `PowerDebounce` / `PARK_DUTY_DEBOUNCE_S` so brief meter blips do not flip
+  `active_ratio`. The per-margin `margin_bins` map (extraction, compression duty, n)
+  charts the hysteresis; `coast_margin_k()` gives the cheapest coasting depth;
+  `cop_table_state` buckets house COP by control state to audit park-hold economics.
+- **Regime policy owns the macro decision.** `_select_regime` picks per tick (15 min dwell):
+  `ventilate` when outdoor beats the coolest target by `REGIME_VENT_MARGIN_K` (forces the
+  grace-gated window flow — never hard-strands a hot room), `continuous` when aggregate
+  `standing_load_w` can feed `REGIME_CONT_LOAD_FRACTION` of the compressor's thermal floor
+  (zones park instead of turning off; sibling requirement waived; the head's measured
+  hysteresis does fine modulation), else `cycling` (true offs, drained coils). `auto_regime`
+  off restores pre-regime semantics exactly. Heat shares the `continuous` path when load can
+  feed the floor; `ventilate` remains cool-only. Opt-in `night_ventilate` (22:00–08:00) widens
+  the ventilate margin to 0 K and suppresses continuous when outdoor is within
+  `NIGHT_SKIP_CONT_K` of the coolest target. Tune thresholds from `cop_table_state` and
+  the `StartCounter` diagnostics, not from intuition. Park entry prefers
+  `coast_margin_k()` once the hysteresis map has found a coasting depth.
 - **Zone COP counts latent.** `update_cop` heat flow is sensible + latent; sensible-only
   samples in humid rooms undercount delivered cooling by 30–50% and can fall below
   `COP_MIN`, producing absurd or silently-rejected readings.
-- **Control/park history is entity-backed.** Zone sensors expose `control_state`,
-  `track_delta`, `park_classification`, `park_preferred_margin`, `park_margin`,
-  `park_extraction`, and `command_reason` (plus `binary_sensor` `zone_parked` and
-  house `parked_zones`) so HA history can chart behaviors that only lived in
-  controller memory before.
+- **Control/park history is entity-backed.** Zone `control_state` is the single role
+  timeline (`off`/`demand`/`helper`/`park`/`runout`/…); its attributes carry
+  `last_reason`, park margins/classification, and track depth — so separate
+  `command_reason` / `zone_parked` / `park_preferred_margin` entities are not needed.
+  Chart the continuous internals with `head_internal_temp`, `track_delta`,
+  `park_margin`, `park_extraction`, and `park_classification` (plus house
+  `parked_zones`, `operating_regime`, `compressor_starts_per_hour`).
 
 ## Control-loop cheatsheet (what happens each 60 s tick)
 
@@ -136,5 +160,8 @@ ruff check . && ruff format .
   `HOUSE_COP_MIN_POWER_W` and smooth with `HOUSE_COP_EMA_ALPHA`.
 - The house may have zones with multiple mirrored heads and a single sensor
   (`n_rooms > 1`): per-head power is `allocated_w / n_rooms`, and thermal totals multiply
-  back by `n_rooms`. Keep the two consistent.
+  back by `n_rooms`. Keep the two consistent. Park learning stays in the per-head
+  frame (`park_extraction_w`, trickle thresholds); `standing_load_w` is zone-total, so
+  exploit compares extraction to `standing_load_w / n_rooms`. Solo-park electrical
+  gating uses `fan_floor_w(n_rooms)` so multi-head fan draw is not mistaken for compression.
 - Timezone: runtime uses `local_hour` for diurnal models; timestamps are epoch seconds.

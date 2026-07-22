@@ -151,6 +151,7 @@ class ZoneRuntime:
         self.sensible_w = 0.0  # sensed room, signed
         self.latent_w = 0.0  # sensed room
         self.park = park.ParkEstimator()
+        self.park_power = park.PowerDebounce()
         self.moisture_sources_kg_h = 0.0
         self.temp: float | None = None
         self.rh: float | None = None
@@ -161,6 +162,9 @@ class ZoneRuntime:
         self.free_float: tuple[float, ...] = ()
         self.pred_60m: float | None = None
         self.allocated_w = 0.0
+        # Live head-frame readings (for tracking/park diagnostics).
+        self.head_internal_temp: float | None = None
+        self.device_setpoint: float | None = None
         # Last controller command reason for this zone (demand/helper/park/…).
         self.last_control_reason: str | None = None
 
@@ -231,6 +235,10 @@ class AdaptiveComfortRuntime:
         self.cop_table: dict[int, tuple[float, int]] = {}  # heads -> (ewma cop, samples)
         # (heads, outdoor band) -> (ewma cop, samples); diagnostics/analysis only for now.
         self.cop_table_banded: dict[str, tuple[float, int]] = {}
+        # control state ('conditioning'|'park'|'mixed') -> (ewma cop, samples)
+        self.cop_table_state: dict[str, tuple[float, int]] = {}
+        self.starts = power.StartCounter()
+        self._last_state_key: str | None = None
         self.house_cop: float | None = None
         self.free_float_bias: float | None = None
         self.warm_excess_kh: float | None = None
@@ -268,6 +276,17 @@ class AdaptiveComfortRuntime:
             areas = list(data.get(CONF_AREAS, []))
             if not heads or not areas:
                 continue
+            if len(areas) != len(heads):
+                _LOGGER.warning(
+                    "Zone %s: %d heads but %d areas; aligning to head count",
+                    subentry.title,
+                    len(heads),
+                    len(areas),
+                )
+                if len(areas) < len(heads):
+                    areas = areas + [areas[-1]] * (len(heads) - len(areas))
+                else:
+                    areas = areas[: len(heads)]
             height = data.get(CONF_HEIGHT, DEFAULT_CEILING_HEIGHT_M)
             rooms = tuple(RoomConfig(area_m2=float(a), height_m=height) for a in areas)
             config = ZoneConfig(
@@ -317,10 +336,18 @@ class AdaptiveComfortRuntime:
                 self.p_ac = power.estimate_ac_power(self.p_load, self.baseline.value(local_hour))
             else:
                 self.p_ac = 0.0
+            parked_ids = set(self.controller_state.zone_parked_since)
+            self._last_state_key = power.control_state_key(
+                any(z.config.zone_id not in parked_ids for z in active),
+                any(z.config.zone_id in parked_ids for z in active),
+            )
+            self.starts.update(now_ts, self.p_ac, self._last_state_key)
         self._finalize_demand(now_ts)
         if self.settings.shedding_enabled:
             await self._async_control(now_ts, local_hour)
-            self.notify()
+        # Always publish: ac_power_estimate / starts sensors should track the
+        # meter at event rate, not wait for the 60 s control tick.
+        self.notify()
 
     def _power_watch_entities(self) -> list[str]:
         data = self.entry.data
@@ -397,6 +424,8 @@ class AdaptiveComfortRuntime:
             "fan_assist",
             "tracking",
             "park_learning",
+            "auto_regime",
+            "night_ventilate",
             "window_suggest",
         ):
             if key in settings:
@@ -438,6 +467,13 @@ class AdaptiveComfortRuntime:
                 self.cop_table_banded[str(key)] = (float(value[0]), int(value[1]))
             except (TypeError, ValueError, IndexError):
                 continue
+        for key, value in data.get("cop_table_state", {}).items():
+            try:
+                self.cop_table_state[str(key)] = (float(value[0]), int(value[1]))
+            except (TypeError, ValueError, IndexError):
+                continue
+        if "starts" in data:
+            self.starts = power.StartCounter.from_dict(data["starts"])
 
     def _persist(self) -> dict:
         s = self.settings
@@ -458,6 +494,8 @@ class AdaptiveComfortRuntime:
                 "fan_assist": s.fan_assist,
                 "tracking": s.tracking,
                 "park_learning": s.park_learning,
+                "auto_regime": s.auto_regime,
+                "night_ventilate": s.night_ventilate,
                 "window_suggest": s.window_suggest,
                 "hvac_mode": s.hvac_mode,
                 "preset": s.preset,
@@ -472,6 +510,8 @@ class AdaptiveComfortRuntime:
             "zones": {zid: zone.to_dict() for zid, zone in self.zones.items()},
             "cop_table": {str(k): [v[0], v[1]] for k, v in self.cop_table.items()},
             "cop_table_banded": {k: [v[0], v[1]] for k, v in self.cop_table_banded.items()},
+            "cop_table_state": {k: [v[0], v[1]] for k, v in self.cop_table_state.items()},
+            "starts": self.starts.to_dict(),
         }
 
     async def _async_save(self, _now=None) -> None:
@@ -701,6 +741,21 @@ class AdaptiveComfortRuntime:
             zone.outdoor_exhaust_on = fan_entities_on(self.hass, cfg.outdoor_exhaust_fan_entities)
             zone.occupied = presence_state(self.hass, cfg.presence_sensor)
 
+            internals: list[float] = []
+            setpoints: list[float] = []
+            for head in cfg.heads:
+                state = self.hass.states.get(head)
+                if state is None:
+                    continue
+                internal = state.attributes.get("current_temperature")
+                if isinstance(internal, (int, float)):
+                    internals.append(float(internal))
+                target = state.attributes.get("temperature")
+                if isinstance(target, (int, float)):
+                    setpoints.append(float(target))
+            zone.head_internal_temp = sum(internals) / len(internals) if internals else None
+            zone.device_setpoint = sum(setpoints) / len(setpoints) if setpoints else None
+
             # Drift learning: stable state >= 10 min with an external reference.
             external = _float_state(self.hass, cfg.temp_sensor)
             if external is not None and now_ts - zone.head_state_since >= STABLE_STATE_S:
@@ -757,6 +812,14 @@ class AdaptiveComfortRuntime:
                 self.p_ac = power.estimate_ac_power(self.p_load, self.baseline.value(local_hour))
             else:
                 self.p_ac = 0.0
+        # Always count starts from the electrical record when we have a reading.
+        # (A prior draft only updated in the idle branch — starts never fired.)
+        parked_ids = set(self.controller_state.zone_parked_since)
+        self._last_state_key = power.control_state_key(
+            any(z.config.zone_id not in parked_ids for z in active),
+            any(z.config.zone_id in parked_ids for z in active),
+        )
+        self.starts.update(now_ts, self.p_ac, self._last_state_key)
         allocations: dict[str, float] = {}
         if self.p_ac and active:
             mode = MODE_HEAT if any(z.head_state == STATE_HEATING for z in active) else MODE_COOL
@@ -782,6 +845,10 @@ class AdaptiveComfortRuntime:
                 total_sensible += abs(zone.sensible_w) * zone.config.n_rooms
                 total_latent += zone.latent_w * zone.config.n_rooms
 
+        # Park duty/extraction on the 60 s tick (debounced electrically), not
+        # gated behind the 5 min thermal fit.
+        self._update_park_learners(now_ts)
+
         # Empirical COP table by active head count (and by outdoor band, to
         # separate head-count physics from weather: three-head samples cluster
         # in hot afternoons and single-head samples in mild nights, so the
@@ -805,6 +872,15 @@ class AdaptiveComfortRuntime:
                     self.cop_table_banded[key] = (
                         prev_b + 0.05 * (house_cop - prev_b),
                         count_b + 1,
+                    )
+                # Per-control-state COP: are park-holds the cheapest or the
+                # most wasteful kWh in the system? Sampled house-wide.
+                skey = self._last_state_key
+                if skey is not None:
+                    prev_s, count_s = self.cop_table_state.get(skey, (house_cop, 0))
+                    self.cop_table_state[skey] = (
+                        prev_s + 0.05 * (house_cop - prev_s),
+                        count_s + 1,
                     )
 
     def _update_zone_estimators(self, zone: ZoneRuntime, now_ts: float, local_hour: float) -> None:
@@ -906,20 +982,52 @@ class AdaptiveComfortRuntime:
             outdoor_exhaust_on=zone.outdoor_exhaust_on,
         )
         zone.latent_w = self._latent_power(zone, dt_h)
-        # Parked characterization: while the controller holds this zone in
-        # the parked state, |sensible_w| in the conditioning direction is the
-        # head's above-setpoint output (the model separates AC action from
-        # free-float drift). Feed the learner instead of assuming.
-        parked_since = self.controller_state.zone_parked_since.get(zone.config.zone_id)
-        if parked_since is not None and now_ts - parked_since >= PARK_OBS_DELAY_S:
-            # Conditioning direction matters: cooling removes heat
-            # (sensible_w < 0), heating adds it (sensible_w > 0).
+
+    def _update_park_learners(self, now_ts: float) -> None:
+        """Feed parked-zone learners once per control tick.
+
+        Activity (compression vs coast) is judged electrically with a
+        PARK_DUTY_DEBOUNCE_S settle so brief meter blips do not flip duty.
+        Extraction magnitude reuses the latest thermal sensible_w (updated on
+        the 5 min fit); when coasting it is forced to zero.
+        """
+        parked_ids = set(self.controller_state.zone_parked_since)
+        for zone in self.zones.values():
+            zid = zone.config.zone_id
+            parked_since = self.controller_state.zone_parked_since.get(zid)
+            if parked_since is None:
+                zone.park_power.reset()
+                continue
+            if now_ts - parked_since < PARK_OBS_DELAY_S:
+                continue
             if zone.head_state == STATE_HEATING or self.controller_state.mode == MODE_HEAT:
-                extraction = max(0.0, zone.sensible_w)
+                raw_extraction = max(0.0, zone.sensible_w)
             else:
-                extraction = max(0.0, -zone.sensible_w)
-            active = zone.head_state in (STATE_COOLING, STATE_HEATING)
-            zone.park.update(extraction, active)
+                raw_extraction = max(0.0, -zone.sensible_w)
+            # Sensed-room extraction; ParkEstimator / trickle thresholds are
+            # per-head. Electrical floor scales with mirrored head count.
+            n_heads = zone.config.n_rooms
+            solo = not any(
+                other.is_on
+                and other.config.zone_id != zid
+                and other.config.zone_id not in parked_ids
+                for other in self.zones.values()
+            )
+            if solo and self.p_ac is not None:
+                settled = zone.park_power.settle(
+                    now_ts, self.p_ac, floor_w=park.fan_floor_w(n_heads)
+                )
+                if settled is None:
+                    continue
+                extraction = 0.0 if not settled else max(0.0, raw_extraction)
+                active = settled
+            else:
+                zone.park_power.reset()
+                extraction, active = park.gate_observation(
+                    self.p_ac, solo, raw_extraction, n_heads=n_heads
+                )
+            margin = self.controller_state.zone_park_margin.get(zid)
+            zone.park.update(extraction, active, margin_k=margin)
 
     def _update_moisture_baseline(self, zone: ZoneRuntime, dt_h: float) -> None:
         """Learn indoor moisture generation while the AC is off."""
@@ -1011,6 +1119,7 @@ class AdaptiveComfortRuntime:
                     park_trickles=zone.park.trickles,
                     park_extraction_w=zone.park.extraction_w,
                     park_preferred_margin_k=zone.park.preferred_margin_k,
+                    park_coast_margin_k=zone.park.coast_margin_k(),
                     park_samples=zone.park.samples,
                     head_mode=(
                         MODE_HEAT
@@ -1094,6 +1203,31 @@ class AdaptiveComfortRuntime:
         if st.zone_on.get(zid) or zone.is_on:
             return "conditioning"
         return "off"
+
+    def zone_control_attrs(self, zone: ZoneRuntime) -> dict:
+        """Detail for the control_state sensor — replaces separate reason/parked entities."""
+        zid = zone.config.zone_id
+        st = self.controller_state
+        parked = zid in st.zone_parked_since
+        attrs: dict = {
+            "last_reason": zone.last_control_reason or "none",
+            "parked": parked,
+            "track_delta_k": st.zone_track_delta.get(zid),
+        }
+        if parked:
+            attrs["park_margin_k"] = st.zone_park_margin.get(zid)
+            attrs["park_preferred_margin_k"] = st.zone_park_preferred.get(
+                zid, zone.park.preferred_margin_k
+            )
+            attrs["park_classification"] = zone.park.classification
+            attrs["park_extraction_w"] = (
+                None if zone.park.extraction_w is None else round(zone.park.extraction_w, 0)
+            )
+            attrs["park_active_ratio"] = (
+                None if zone.park.active_ratio is None else round(zone.park.active_ratio, 3)
+            )
+            attrs["park_coast_margin_k"] = zone.park.coast_margin_k()
+        return attrs
 
     def _update_free_float_bias(self, snapshot: HouseSnapshot) -> None:
         center = comfort.band_center(self.settings, self.t_rm)
@@ -1228,6 +1362,9 @@ class AdaptiveComfortRuntime:
             "forecast": self.forecast,
             "cop_table": {str(k): v for k, v in self.cop_table.items()},
             "cop_table_banded": dict(self.cop_table_banded),
+            "cop_table_state": dict(self.cop_table_state),
+            "compressor_starts_per_hour_24h": round(self.starts.per_hour(time.time()), 2),
+            "compressor_starts_by_state_24h": self.starts.by_state(time.time()),
             "controller_diag": self.last_diag,
             "zones": {
                 zid: {

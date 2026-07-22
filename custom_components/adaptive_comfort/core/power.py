@@ -34,6 +34,96 @@ def outdoor_band(t_out: float | None) -> str | None:
     return "hot"
 
 
+COMPRESSION_FLOOR_W = 90.0  # below this the AC draw is fans/electronics only
+START_DEBOUNCE_S = 180.0  # power must stay below the floor this long to arm
+START_WINDOW_S = 24.0 * 3600.0
+
+
+class StartCounter:
+    """Counts compressor starts from the electrical record.
+
+    A start is a rising edge of (ac_power > COMPRESSION_FLOOR_W) after the
+    draw has been below the floor for at least START_DEBOUNCE_S — brief dips
+    from modulation do not re-arm. Events carry the control-state key so
+    inner-loop (park hysteresis) restarts are separable from outer-loop
+    (controller cycling) restarts.
+    """
+
+    def __init__(self) -> None:
+        self.events: list[tuple[float, str]] = []  # (ts, state_key)
+        self._above = False
+        self._below_since: float | None = None
+
+    def update(self, now: float, ac_w: float | None, state_key: str | None) -> bool:
+        if ac_w is None:
+            return False
+        started = False
+        if ac_w > COMPRESSION_FLOOR_W:
+            armed = self._below_since is not None and now - self._below_since >= START_DEBOUNCE_S
+            if not self._above and (armed or not self.events):
+                self.events.append((now, state_key or "unknown"))
+                started = True
+            self._above = True
+            self._below_since = None
+        else:
+            if self._above or self._below_since is None:
+                self._below_since = now
+            self._above = False
+        cutoff = now - 2 * START_WINDOW_S
+        while self.events and self.events[0][0] < cutoff:
+            self.events.pop(0)
+        return started
+
+    def per_hour(self, now: float, window_s: float = START_WINDOW_S) -> float:
+        n = sum(1 for ts, _ in self.events if ts >= now - window_s)
+        return n / (window_s / 3600.0)
+
+    def by_state(self, now: float, window_s: float = START_WINDOW_S) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for ts, key in self.events:
+            if ts >= now - window_s:
+                out[key] = out.get(key, 0) + 1
+        return out
+
+    def to_dict(self) -> dict:
+        return {
+            "events": [[ts, key] for ts, key in self.events[-500:]],
+            "above": self._above,
+            "below_since": self._below_since,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> StartCounter:
+        c = cls()
+        for item in data.get("events", []):
+            try:
+                c.events.append((float(item[0]), str(item[1])))
+            except (TypeError, ValueError, IndexError):
+                continue
+        # Restore edge state so a restart mid-run does not recount the same start.
+        if "above" in data:
+            c._above = bool(data["above"])
+        elif c.events:
+            c._above = True
+        if data.get("below_since") is not None:
+            try:
+                c._below_since = float(data["below_since"])
+            except (TypeError, ValueError):
+                c._below_since = None
+        return c
+
+
+def control_state_key(any_conditioning: bool, any_parked: bool) -> str | None:
+    """House-wide control-state label for COP bookkeeping."""
+    if any_conditioning and any_parked:
+        return "mixed"
+    if any_conditioning:
+        return "conditioning"
+    if any_parked:
+        return "park"
+    return None
+
+
 def compose_load(
     p_grid: float,
     p_battery: float | None = None,
