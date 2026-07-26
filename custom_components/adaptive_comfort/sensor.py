@@ -96,6 +96,19 @@ HOUSE_SENSORS: tuple[HouseSensorDescription, ...] = (
         attr_fn=lambda r: {"source": r.mode_source},
     ),
     HouseSensorDescription(
+        key="effective_preset",
+        translation_key="effective_preset",
+        device_class=SensorDeviceClass.ENUM,
+        options=["none", "eco", "away", "boost", "manual"],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda r: r.effective_preset,
+        attr_fn=lambda r: {
+            "preset": r.settings.preset,
+            "manual_control": r.manual_control,
+            "house_occupied": r.house_occupied,
+        },
+    ),
+    HouseSensorDescription(
         key="free_float_bias",
         translation_key="free_float_bias",
         native_unit_of_measurement="K",
@@ -370,6 +383,14 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         },
     ),
     ZoneSensorDescription(
+        key="want",
+        translation_key="zone_want",
+        device_class=SensorDeviceClass.ENUM,
+        options=["off", "demand", "helper"],
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: r.zone_want(z),
+    ),
+    ZoneSensorDescription(
         key="control_state",
         translation_key="control_state",
         device_class=SensorDeviceClass.ENUM,
@@ -382,6 +403,7 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
             "fan_assist",
             "shed",
             "conditioning",
+            "manual",
         ],
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z, r: r.zone_control_state(z),

@@ -163,6 +163,21 @@
     }
   },
   "entity": {
+    "climate": {
+      "house_climate": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "none": "Nenhum",
+              "eco": "Eco",
+              "away": "Ausente",
+              "boost": "Boost",
+              "manual": "Manual"
+            }
+          }
+        }
+      }
+    },
     "sensor": {
       "house_load": { "name": "Carga da casa" },
       "ac_power_estimate": { "name": "Potência estimada do AC" },
@@ -172,6 +187,16 @@
       "dominant_mode": {
         "name": "Modo dominante",
         "state": { "off": "Desligado", "heat": "Aquecer", "cool": "Arrefecer" }
+      },
+      "effective_preset": {
+        "name": "Preset efetivo",
+        "state": {
+          "none": "Nenhum",
+          "eco": "Eco",
+          "away": "Ausente",
+          "boost": "Boost",
+          "manual": "Manual"
+        }
       },
       "free_float_bias": { "name": "Desvio em flutuação livre" },
       "warm_excess": { "name": "Excesso térmico previsto" },
@@ -206,8 +231,12 @@
       "zone_confidence": { "name": "Confiança do ajuste" },
       "allocated_power": { "name": "Potência AC atribuída" },
       "head_internal_temp": { "name": "Temperatura interna da cabeça" },
+      "zone_want": {
+        "name": "Desejo",
+        "state": { "off": "Desligado", "demand": "Procura", "helper": "Auxiliar" }
+      },
       "control_state": {
-        "name": "Estado de controlo",
+        "name": "Ação",
         "state": {
           "off": "Desligado",
           "demand": "Procura",
@@ -216,7 +245,8 @@
           "runout": "A terminar ciclo",
           "fan_assist": "Ventilação auxiliar",
           "shed": "Limitada",
-          "conditioning": "Climatização"
+          "conditioning": "Climatização",
+          "manual": "Manual"
         }
       },
       "track_delta": { "name": "Profundidade de tracking" },
@@ -229,7 +259,9 @@
     },
     "binary_sensor": {
       "shedding_active": { "name": "Limitação de potência ativa" },
+      "house_occupied": { "name": "Casa ocupada" },
       "conditioning_active": { "name": "Climatização" },
+      "zone_occupied": { "name": "Zona ocupada" },
       "zone_shed": { "name": "Limitada" },
       "window_suggestion": { "name": "Abrir janelas sugerido" },
       "zone_window_suggestion": { "name": "Abrir janela sugerido" }
@@ -255,6 +287,7 @@
       "auto_regime": { "name": "Regime automático (ventilar / contínuo / ciclos)" },
       "night_ventilate": { "name": "Prioridade à ventilação noturna (ar exterior fresco)" },
       "window_suggest": { "name": "Aguardar ventilação manual" },
+      "manual_control": { "name": "Controlo manual (pausar adaptativo)" },
       "zone_enabled": { "name": "Zona ativa" }
     }
   }

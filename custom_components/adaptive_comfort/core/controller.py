@@ -15,6 +15,7 @@ from .types import (
     MODE_FAN,
     MODE_HEAT,
     MODE_OFF,
+    PRESET_MANUAL,
     STATE_COOLING,
     STATE_FAN_ONLY,
     Command,
@@ -79,7 +80,8 @@ def _select_regime(snap: HouseSnapshot, mode: str, centers: dict[str, float]) ->
     # Free cooling: outdoor beats the coolest zone target. Heat has no
     # symmetric "ventilate" (opening windows when outdoor is warm is rare
     # and already covered by the window-suggestion path).
-    if mode == MODE_COOL and snap.t_out is not None and centers:
+    # Do not enter ventilate on climatology-after-dropout (t_out_synthetic).
+    if mode == MODE_COOL and snap.t_out is not None and not snap.t_out_synthetic and centers:
         coolest = min(centers.values())
         vent_margin = REGIME_VENT_MARGIN_K
         if s.night_ventilate and _is_night(snap.local_hour):
@@ -140,9 +142,19 @@ WINDOW_DELTA_K = 2.0
 WINDOW_GRACE_S = 15.0 * 60.0
 
 
-def quantize_setpoint(value: float, minimum: float = 16.0, maximum: float = 30.0) -> float:
-    """Round to the 0.5 C steps AC heads accept, clamped to device limits."""
-    return min(max(round(value * 2.0) / 2.0, minimum), maximum)
+def quantize_setpoint(
+    value: float,
+    minimum: float = 16.0,
+    maximum: float = 30.0,
+    step: float = 0.5,
+) -> float:
+    """Round to the device's temperature step, clamped to device limits."""
+    step = 0.5 if step is None or step <= 0.0 else float(step)
+    rounded = round(value / step) * step
+    # Avoid binary float dust (e.g. 22.0000000002) before HA serialises.
+    decimals = max(0, min(4, len(f"{step:.4f}".rstrip("0").split(".")[-1])))
+    rounded = round(rounded, decimals)
+    return min(max(rounded, minimum), maximum)
 
 
 def _comfort_error(zone: ZoneSnapshot, center: float, mode: str) -> float:
@@ -180,6 +192,13 @@ def _reached_far_edge(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> bo
     if mode == MODE_HEAT:
         return zone.temp >= hi
     return True
+
+
+def _park_ok_now(zone: ZoneSnapshot, lo: float, hi: float, pmode: str | None) -> bool:
+    """Park is keep-temperature only: never while the room still needs pull-down."""
+    if zone.temp is None or pmode not in (MODE_HEAT, MODE_COOL):
+        return False
+    return zone.temp <= hi if pmode == MODE_COOL else zone.temp >= lo
 
 
 def _transition_allowed(
@@ -298,6 +317,8 @@ def _window_would_help(
     t_out: float | None,
     mode: str,
     house_occupied: bool | None,
+    *,
+    t_out_synthetic: bool = False,
 ) -> bool:
     """Outdoor air would move the room toward comfort and someone can act on it.
 
@@ -305,9 +326,10 @@ def _window_would_help(
     Heating demand: outdoors clearly warmer (free warming / ventilate).
 
     Without any presence information (zone and house both unknown) we do not
-    assume a person is available to open a window.
+    assume a person is available to open a window. Synthetic outdoor (climatology
+    after a sensor dropout) must not drive suggestions or grace holds.
     """
-    if t_out is None or zone.temp is None:
+    if t_out is None or zone.temp is None or t_out_synthetic:
         return False
     if mode == MODE_COOL and zone.temp - t_out < WINDOW_DELTA_K:
         return False
@@ -331,11 +353,13 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     # 1. Comfort bands.
     centers: dict[str, float] = {}
     bands: dict[str, tuple[float, float]] = {}
+    preset = comfort.effective_preset(s, snap.house_occupied)
     for zone in zones:
         center = comfort.band_center(s, snap.t_rm, s.zone_offsets.get(zone.zone_id, 0.0))
         centers[zone.zone_id] = center
         bands[zone.zone_id] = comfort.zone_band(s, center, zone.occupied, snap.house_occupied)
     diag["bands"] = {z: bands[z] for z in bands}
+    diag["effective_preset"] = preset
 
     # 2. Mode arbitration.
     if s.hvac_mode == MODE_OFF:
@@ -399,9 +423,28 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             helpers = []
             diag["consolidated_by_cop_table"] = True
     diag["demand"] = sorted(demand_ids)
-    diag["helpers"] = sorted(z.zone_id for z in helpers)
+    helper_ids = {z.zone_id for z in helpers}
+    diag["helpers"] = sorted(helper_ids)
 
     want_on = {z.zone_id: (z in demand or z in helpers) for z in zones}
+    diag["want"] = {
+        z.zone_id: (
+            "demand" if z.zone_id in demand_ids else "helper" if z.zone_id in helper_ids else "off"
+        )
+        for z in zones
+    }
+
+    # Manual: full hands-off — no comfort commands, no shedding, no fan assist.
+    # Compute want/mode for diagnostics, clear park sessions (so park learning
+    # cannot attribute user setpoints), and emit nothing — unless the hub HVAC
+    # mode is Off, which still force-stops children.
+    if s.preset == PRESET_MANUAL:
+        diag["manual"] = True
+        for zone in zones:
+            if zone.zone_id in state.zone_parked_since:
+                _clear_park_session(state, zone.zone_id, zone, now)
+        if s.hvac_mode != MODE_OFF:
+            return Decision([], state, diag, [])
 
     # ---- Regime policy -------------------------------------------------
     regime = _apply_regime_dwell(state, _select_regime(snap, mode, centers), now)
@@ -432,20 +475,35 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             if regime == "ventilate" and mode == MODE_COOL
             else demand
         )
+        in_pool: set[str] = set()
         for zone in suggest_pool:
             zid = zone.zone_id
-            if _window_would_help(zone, snap.t_out, mode, snap.house_occupied):
+            if _window_would_help(
+                zone,
+                snap.t_out,
+                mode,
+                snap.house_occupied,
+                t_out_synthetic=snap.t_out_synthetic,
+            ):
+                in_pool.add(zid)
+                state.window_suggest_out_since.pop(zid, None)
                 since = state.window_suggest_since.setdefault(zid, now)
                 window_suggestions.append(zid)
                 if (s.window_suggest or regime == "ventilate") and now - since < WINDOW_GRACE_S:
                     want_on[zid] = False  # give the user a chance first
-            else:
-                state.window_suggest_since.pop(zid, None)
+        # Keep the grace clock across brief disqualification (oscillation
+        # around WINDOW_DELTA_K). Only clear after WINDOW_GRACE_S continuously
+        # out of the pool so the next cool-down episode can re-arm once.
         for zid in list(state.window_suggest_since):
-            if zid not in window_suggestions:
+            if zid in in_pool:
+                continue
+            out_since = state.window_suggest_out_since.setdefault(zid, now)
+            if now - out_since >= WINDOW_GRACE_S:
                 state.window_suggest_since.pop(zid, None)
+                state.window_suggest_out_since.pop(zid, None)
     else:
         state.window_suggest_since.clear()
+        state.window_suggest_out_since.clear()
     diag["window_suggestions"] = window_suggestions
 
     # Fan assist: on a multi-split every compressor head shares one mode, so
@@ -612,7 +670,20 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 _clear_park_session(state, zid, zone, now)
                 diag.setdefault("park_overcorrected", []).append(zid)
                 desired_on = False
-            elif out_of_band and dwell_ok:
+            elif out_of_band and (
+                dwell_ok
+                or (
+                    # Under-conditioned breach: comfort beats characterization
+                    # both ways (symmetric to overcorrection's immediate release).
+                    zone.temp is not None
+                    and pmode is not None
+                    and (
+                        zone.temp >= hi_b + PARK_OVERCOOL_BUFFER_K
+                        if pmode == MODE_COOL
+                        else zone.temp <= lo_b - PARK_OVERCOOL_BUFFER_K
+                    )
+                )
+            ):
                 # Load beat the parked output: fall through to normal
                 # demand handling below (zone re-enters as wanting on).
                 _settle_park_preferred(state, zid, margin)
@@ -657,6 +728,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             and s.multisplit
             and zid not in state.shed
             and mode in (MODE_HEAT, MODE_COOL)
+            and _park_ok_now(zone, *bands[zid], mode)
             and (
                 regime == "continuous"
                 or any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones)
@@ -699,12 +771,12 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     and zid not in state.shed
                     and zid not in state.zone_parked_since
                     and zone.head_mode in (MODE_HEAT, MODE_COOL)
+                    and _park_ok_now(zone, *bands[zid], zone.head_mode)
                 ):
                     # Run-out park: the zone wants off but min-runtime forces
                     # it to keep running - the compressor is alive regardless,
-                    # so parking is free. No sibling requirement and no probe
-                    # budget: observations accrue, and if the head idles above
-                    # setpoint this *saves* energy versus tracked run-out.
+                    # so parking is free. Keep-temp only: never park while
+                    # still out of band (unfinished pull-down).
                     entry = _park_entry_margin(zone, state)
                     state.zone_parked_since[zid] = now
                     state.zone_park_margin[zid] = entry
@@ -741,7 +813,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             center = centers[zid]
             lo, hi = bands[zid]
             if zid in demand_ids:
-                setpoint = center
+                setpoint = comfort.demand_setpoint(mode, center, lo, hi, zone.occupied, preset)
                 reason = "demand"
             else:
                 # Helper zones trim gently toward the band edge.

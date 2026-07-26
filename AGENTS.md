@@ -32,11 +32,11 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
 | `core/power.py` | Load composition (grid + battery − known loads), time-of-day `BaselineModel`, step-delta AC estimation, per-zone power allocation, shedding math, `outdoor_band()` for COP bookkeeping. |
 | `core/park.py` | Learned above-setpoint ("parked") head behavior: EWMA of extraction while parked + idle/trickle classification. Fed by the runtime from the thermal model's sensible power while the controller holds a zone parked. |
 | `core/drift.py` | Per-head, per-operating-state internal-sensor offset learning (internal vs external reference). Used to correct readings and as *fallback* setpoint translation. |
-| `core/comfort.py` | Adaptive comfort band (running-mean outdoor → band center/edges). |
+| `core/comfort.py` | Comfort band, presets (`effective_preset`), demand setpoints (center vs Away/vacant band-hold), and model mode arbitration (`demand_integrals` over an 8 h free-float horizon with asymmetric exit). |
 | `core/types.py` | All dataclasses: `Settings`, `ZoneSnapshot`, `HouseSnapshot`, `Command`, `ControllerState` (+ its persistence round-trip). |
 | `core/rls.py`, `core/series.py`, `core/psychro.py`, `core/simulator.py` | Recursive least squares, time-series ring buffer, psychrometrics, and a small sim house used by tests. |
-| `coordinator.py` | Runtime: sensor ingestion, estimator updates (`_update_estimators`, `_update_zone_estimators`), COP tables, persistence (`_persist`/restore), command execution (incl. tracking translation), diagnostics dump. |
-| `tests/` | Pytest suite. Core tests run without HA (see `conftest.py` stubbing); config-flow tests need `pytest-homeassistant-custom-component`. |
+| `coordinator.py` | Runtime: sensor ingestion, estimator updates (`_update_estimators`, `_update_zone_estimators`), COP tables, persistence (`_persist`/restore), command execution (incl. tracking translation), diagnostics dump. Power-react is a lean path (heads+power+demand; full `controller.tick` only on shed engage/release). |
+| `tests/` | Pytest suite. `conftest.py` loads `pytest-homeassistant-custom-component` for the whole suite (needed by config-flow / any HA tests); most `core/` tests do not exercise HA APIs. |
 
 ## Key semantics and unit conventions (violating these breaks physics silently)
 
@@ -65,40 +65,56 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   wire all four places: dataclass, `to_dict`, `from_dict`, and the `_persist` settings dict
   (+ restore key list) — and the switch/number entity if user-facing.
 
-- **Parking is measured, never assumed.** A zone leaving demand on a multi-split (siblings
-  keeping the compressor alive) may be *parked* — setpoint `internal ± preferred_margin`
-  (cool/heat), mode kept — instead of turned off: bounded probes (`PARK_PROBE_S`, spaced
-  `PARK_PROBE_SPACING_S`) while behavior is unclassified, exploitation once a head is a
-  known trickler whose learned output covers the zone's `standing_load_w`. Session margin
-  starts one step below `preferred_margin_k` (floored at `PARK_MARGIN_K` so the setpoint
-  stays on the park side of the internal reading), escalates while the room keeps moving
-  in the conditioning direction (up to `PARK_MARGIN_MAX_K`), and settles the preferred
-  depth on a clean exit. Devices differ (thermo-off vs keep-temperature trickle) and the
-  estimator learns which; nothing hardcodes either answer. Shed zones never park. Helper
-  selection outranks parking. The overcorrection release sits `PARK_OVERCOOL_BUFFER_K`
+- **Parking is measured, never assumed — and keep-temp only.** A zone leaving demand on a
+  multi-split (siblings keeping the compressor alive) may be *parked* — setpoint
+  `internal ± preferred_margin` (cool/heat), mode kept — instead of turned off: bounded
+  probes (`PARK_PROBE_S`, spaced `PARK_PROBE_SPACING_S`) while behavior is unclassified,
+  exploitation once a head is a known trickler whose learned output covers the zone's
+  `standing_load_w`. Park entry requires the zone already in-band on the conditioning side
+  (`_park_ok_now`: cool `temp ≤ hi`); unfinished pull-down stays on a tracked setpoint.
+  Session margin starts one step below `preferred_margin_k` (floored at `PARK_MARGIN_K` so
+  the setpoint stays on the park side of the internal reading), escalates while the room
+  keeps moving in the conditioning direction (up to `PARK_MARGIN_MAX_K`), and settles the
+  preferred depth on a clean exit. Devices differ (thermo-off vs keep-temperature trickle)
+  and the estimator learns which; nothing hardcodes either answer. Shed zones never park.
+  Helper selection outranks parking. The overcorrection release sits `PARK_OVERCOOL_BUFFER_K`
   *below* the band floor (cool; above the ceiling in heat) — zones exit demand AT the floor,
   so a guard placed on the floor itself kills every park at entry (a real field failure).
   Probe budget is charged at *release* and only when the probe produced observations;
   stillborn probes get the short `PARK_PROBE_RETRY_S` clock instead of the 6 h spacing.
-- **Run-out is the free probe window.** A zone wanting off while `min_on` forces it to run
-  is parked immediately — no sibling requirement, no probe budget — because the compressor
-  is alive regardless: observations are free, and an idling head saves energy versus tracked
-  run-out. Parked releases honor `min_on`; continued exploitation beyond it requires a live
-  sibling (`want_on`); park direction follows `head_mode` when the house's dominant mode goes
-  idle; overcorrected-but-unstoppable zones hold at `PARK_MARGIN_MAX_K` rather than being
-  released into a forbidden off. Tracked `runout` commands are the `park_learning`-off
-  fallback only.
+- **Run-out is the free probe window (when in-band).** A zone wanting off while `min_on`
+  forces it to run is parked immediately if already in-band — no sibling requirement, no
+  probe budget — because the compressor is alive regardless: observations are free, and an
+  idling head saves energy versus tracked run-out. Out-of-band run-out keeps tracking
+  (unfinished pull-down must not park-coast). Parked releases honor `min_on`; continued
+  exploitation beyond it requires a live sibling (`want_on`); park direction follows
+  `head_mode` when the house's dominant mode goes idle; overcorrected-but-unstoppable zones
+  hold at `PARK_MARGIN_MAX_K` rather than being released into a forbidden off. Tracked
+  `runout` commands are the `park_learning`-off fallback only.
+- **Manual vs HVAC Off.** Hub climate preset `manual` (mirrored switch) stops **all**
+  adaptive actuation — comfort commands, parking, fan assist, **and contracted-power
+  shedding** — and leaves heads as-is. Thermal/COP/drift estimators still run; park
+  learning and park sessions are suspended. Hub HVAC **Off** still force-stops children
+  even under Manual (the one exception). Clearing Manual restores the prior preset.
+  Shedding while Manual is intentionally off: the user owns the plant.
 - **Power is the only honest activity signal.** These heads report `hvac_action: cooling`
   through entire parks while the electrical record is bimodal (fan-only <60 W vs real
   compression >300 W) — the device cycles via an internal hysteresis around its own sensor.
-  Parked observations are therefore power-gated (`park.gate_observation`): solo-park draw
-  below `fan_floor_w(n_heads)` (= `20 + fan_floor_per_head_w × heads`, HA-tunable per-head
-  term) forces extraction to zero. Never infer compression from `hvac_action`.
-  Duty samples run on the 60 s control tick (not the 5 min thermal fit), with
-  `PowerDebounce` / `PARK_DUTY_DEBOUNCE_S` so brief meter blips do not flip
-  `active_ratio`. The per-margin `margin_bins` map (extraction, compression duty, n)
-  charts the hysteresis; `coast_margin_k()` gives the cheapest coasting depth;
+  House `p_ac` is the electrical residual (`p_load − baseline`), never forced to 0 because
+  `hvac_action` reports idle. Baseline *learning* stays gated on device quiet
+  (`_all_off_since`, including fan-only as busy). Park gating / StartCounter prefer a
+  *learned* baseline slot (`fallback=False`) so cross-slot medians do not invent phantom AC.
+  Parked observations are power-gated (`park.gate_observation`); extraction uses
+  `sensible_w` only when freshly fitted after park entry (`sensible_ts`). Never infer
+  compression from `hvac_action`. Duty samples run on the 60 s control tick (not the 5 min
+  thermal fit), with `PowerDebounce` / `PARK_DUTY_DEBOUNCE_S`. The per-margin `margin_bins`
+  map charts hysteresis; `coast_margin_k()` gives the cheapest coasting depth;
   `cop_table_state` buckets house COP by control state to audit park-hold economics.
+- **Power-react vs 60 s tick.** Meter/known-load changes run `_async_power_react`: head-state
+  scan + `_sample_power` + demand finalize + `notify`. Full `controller.tick` runs on that
+  path **only when shed engage/release flips** (tracking-delta and park-margin adapt per
+  tick and are not `COMMAND_SPACING_S`-gated). The 60 s tick owns `t_rm`, diurnal, baseline
+  EWMA, drift, thermal fits, moisture, and park learners.
 - **Regime policy owns the macro decision.** `_select_regime` picks per tick (15 min dwell):
   `ventilate` when outdoor beats the coolest target by `REGIME_VENT_MARGIN_K` (forces the
   grace-gated window flow — never hard-strands a hot room), `continuous` when aggregate
@@ -108,17 +124,26 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   when load can feed the floor; `ventilate` remains cool-only. Opt-in `night_ventilate`
   (22:00–08:00) widens the ventilate margin to 0 K and suppresses continuous when outdoor
   is within `NIGHT_SKIP_CONT_K` of the coolest target. Park entry prefers `coast_margin_k()`
-  once the hysteresis map has found a coasting depth.
+  once the hysteresis map has found a coasting depth. `t_out_synthetic` (climatology after a
+  configured outdoor dropout) blocks ventilate entry and window suggestions; virgin installs
+  without an outdoor entity may still use climatology. Window grace clocks survive brief
+  disqualification and re-arm only after `WINDOW_GRACE_S` continuously out of the pool.
+- **Latent moisture uses outdoor ACH only.** `outdoor_airflow_m3h` = `k_out × volume` (door/
+  exhaust scaled); house-mixing must not couple to outdoor humidity ratio.
 - **Zone COP counts latent.** `update_cop` heat flow is sensible + latent; sensible-only
   samples in humid rooms undercount delivered cooling by 30–50% and can fall below
   `COP_MIN`, producing absurd or silently-rejected readings.
-- **Control/park history is entity-backed.** Zone `control_state` is the single role
-  timeline (`off`/`demand`/`helper`/`park`/`runout`/…); its attributes carry
-  `last_reason`, park margins/classification, and track depth — so separate
-  `command_reason` / `zone_parked` / `park_preferred_margin` entities are not needed.
-  Chart the continuous internals with `head_internal_temp`, `track_delta`,
-  `park_margin`, `park_extraction`, and `park_classification` (plus house
-  `parked_zones`, `operating_regime`, `compressor_starts_per_hour`).
+- **Control history is want vs action.** Zone `want` is controller desire
+  (`off`/`demand`/`helper`); `control_state` is action (`off`/`demand`/`helper`/`park`/
+  `runout`/`manual`/…). Action attributes carry `last_reason`, park margins/classification,
+  and track depth. Also chart `zone_occupied`, house `effective_preset` / `house_occupied`,
+  plus `head_internal_temp`, `track_delta`, `park_margin`, `park_extraction`,
+  `park_classification`, `parked_zones`, `operating_regime`, `compressor_starts_per_hour`.
+- **Mode integrals include on zones.** `demand_integrals` uses no-AC free-float (including
+  while conditioning — `predict_free` is the counterfactual) over `MODE_HORIZON_H` (~8 h),
+  with temp persistence when confidence is low. Enter cool/heat above `MODE_DEADBAND_KH`;
+  hold until below `MODE_EXIT_KH`. Boost beats presence-Away and skips vacant band widen;
+  Away/vacant demand setpoints hold near the band edge (not the comfort center).
 
 ## Control-loop cheatsheet (what happens each 60 s tick)
 

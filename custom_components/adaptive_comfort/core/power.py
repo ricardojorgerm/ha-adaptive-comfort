@@ -165,10 +165,19 @@ class BaselineModel:
         cur = self.slots[idx]
         self.slots[idx] = p_load if cur is None else cur + self.alpha * (p_load - cur)
 
-    def value(self, local_hour: float) -> float | None:
+    def value(self, local_hour: float, *, fallback: bool = True) -> float | None:
+        """Return the baseline for this half-hour slot.
+
+        When the current slot has never been learned, the median of other
+        slots is diagnostics-grade only: park gating / StartCounter should
+        pass ``fallback=False`` so a hot-afternoon gap does not invent
+        phantom AC from night medians.
+        """
         idx = self.slot_for(local_hour)
         if self.slots[idx] is not None:
             return self.slots[idx]
+        if not fallback:
+            return None
         known = [s for s in self.slots if s is not None]
         return median(known) if known else None
 

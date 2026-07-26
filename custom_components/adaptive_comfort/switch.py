@@ -14,7 +14,7 @@ from homeassistant.helpers.entity_platform import AddConfigEntryEntitiesCallback
 
 from .const import DOMAIN
 from .coordinator import AdaptiveComfortRuntime
-from .core.types import Settings
+from .core.types import PRESET_MANUAL, Settings
 from .entity import AdaptiveComfortEntity, AdaptiveComfortZoneEntity
 
 
@@ -97,7 +97,12 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     runtime: AdaptiveComfortRuntime = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities(HouseSwitch(runtime, description) for description in HOUSE_SWITCHES)
+    async_add_entities(
+        [
+            *(HouseSwitch(runtime, description) for description in HOUSE_SWITCHES),
+            ManualControlSwitch(runtime),
+        ]
+    )
     for zone in runtime.zones.values():
         async_add_entities(
             [ZoneEnabledSwitch(runtime, zone)], config_subentry_id=zone.config.zone_id
@@ -124,6 +129,30 @@ class HouseSwitch(AdaptiveComfortEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self.entity_description.set_fn(self.runtime.settings, False)
+        self.runtime.request_save()
+        self.runtime.notify()
+
+
+class ManualControlSwitch(AdaptiveComfortEntity, SwitchEntity):
+    """Pause adaptive commanding; leave heads as-is (mirrors climate preset manual)."""
+
+    _attr_translation_key = "manual_control"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, runtime: AdaptiveComfortRuntime) -> None:
+        super().__init__(runtime, "manual_control")
+
+    @property
+    def is_on(self) -> bool:
+        return self.runtime.manual_control
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self.runtime.set_preset(PRESET_MANUAL)
+        self.runtime.request_save()
+        self.runtime.notify()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self.runtime.clear_manual()
         self.runtime.request_save()
         self.runtime.notify()
 

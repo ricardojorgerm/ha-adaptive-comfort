@@ -56,6 +56,41 @@ def test_band_widens_when_unoccupied_and_away():
     assert abs((hi - lo) / 2 - 3.7) < 1e-9  # auto-away
 
 
+def test_boost_overrides_presence_away():
+    from custom_components.adaptive_comfort.core.types import PRESET_BOOST
+
+    s = Settings(band_k=0.7, preset=PRESET_BOOST, presence_adaptation=True)
+    assert comfort.effective_preset(s, house_occupied=False) == PRESET_BOOST
+    lo, hi = comfort.zone_band(s, 22.5, zone_occupied=True, house_occupied=False)
+    assert abs((hi - lo) / 2 - 0.35) < 1e-9  # half * 0.5, no away widen
+
+
+def test_boost_skips_vacant_widen():
+    from custom_components.adaptive_comfort.core.types import PRESET_BOOST, PRESET_NONE
+
+    s = Settings(band_k=0.7, preset=PRESET_BOOST)
+    lo, hi = comfort.zone_band(s, 22.5, zone_occupied=False, house_occupied=True)
+    assert abs((hi - lo) / 2 - 0.35) < 1e-9  # not 0.35+1.5
+    s_none = Settings(band_k=0.7, preset=PRESET_NONE)
+    lo_n, hi_n = comfort.zone_band(s_none, 22.5, zone_occupied=False, house_occupied=True)
+    assert abs((hi_n - lo_n) / 2 - 2.2) < 1e-9
+
+
+def test_demand_setpoint_band_hold_when_away():
+    from custom_components.adaptive_comfort.core.types import PRESET_AWAY, PRESET_BOOST, PRESET_NONE
+
+    assert comfort.demand_setpoint(MODE_COOL, 22.5, 21.8, 23.2, True, PRESET_NONE) == 22.5
+    assert (
+        abs(
+            comfort.demand_setpoint(MODE_COOL, 22.5, 18.8, 26.2, True, PRESET_AWAY)
+            - (26.2 - comfort.BAND_HOLD_MARGIN_K)
+        )
+        < 1e-9
+    )
+    # Boost center-seeks even when vacant.
+    assert comfort.demand_setpoint(MODE_COOL, 22.5, 20.0, 25.0, False, PRESET_BOOST) == 22.5
+
+
 def test_running_mean_seed_and_update():
     t_rm = comfort.update_running_mean(None, 20.0, 1.0)
     assert t_rm == 20.0
@@ -123,12 +158,12 @@ def test_emergency_override_beats_dwell():
 
 
 def test_fallback_no_model_hot_room_in_summer():
-    # Cold start: no fitted model, hot room, Lisbon August running mean.
+    # Cold start: no fitted model — persistence still feeds the model path.
     zone = make_zone(temp=25.5, confidence=0.0, free_float=())
     snap = make_snapshot([zone], t_rm=23.5)
     state = ControllerState()
     decision = comfort.dominant_mode(snap, state, {"z1": (21.8, 23.2)})
-    assert decision.source == "fallback"
+    assert decision.source == "model"
     assert decision.mode == MODE_COOL
 
 
@@ -154,7 +189,7 @@ def test_fallback_uses_aux_bathroom_sensor():
 
 def test_model_mode_does_not_heat_summer_warm_house_on_forecast():
     """Regression: bogus cold-deficit forecast must not heat a 24 °C house in July."""
-    # Standby west zone only; east is actively cooling so its trajectory is ignored.
+    # Both zones contribute counterfactual free-float; seasonal guard blocks heat.
     west = make_zone(
         temp=24.4,
         free_float=[18.0] * 24,
@@ -175,13 +210,72 @@ def test_model_mode_does_not_heat_summer_warm_house_on_forecast():
     assert decision.mode in (MODE_COOL, MODE_OFF)
 
 
-def test_demand_integrals_skips_conditioning_zones():
-    on = make_zone(free_float=[30.0] * 24, is_on=True)
-    off = make_zone(free_float=[22.5] * 24, is_on=False)
-    warm, cold = comfort.demand_integrals([on, off], {"z1": (21.8, 23.2)})
-    assert warm == 0.0
+def test_demand_integrals_include_conditioning_zones():
+    """On zones still contribute counterfactual free-float (no-AC from current temp)."""
+    on = make_zone(zone_id="on", free_float=[30.0] * 24, is_on=True, temp=30.0)
+    off = make_zone(zone_id="off", free_float=[22.5] * 24, is_on=False, temp=22.5)
+    bands = {"on": (21.8, 23.2), "off": (21.8, 23.2)}
+    warm, cold = comfort.demand_integrals([on, off], bands)
+    # 8 h * (30 - 23.2) from the on zone; off zone in-band.
+    assert abs(warm - 8 * (30.0 - 23.2)) < 1e-9
     assert cold == 0.0
 
+
+def test_hot_on_zone_keeps_cool_mode():
+    """Field regression: occupied hot room that is already on must not drop to off."""
+    zone = make_zone(
+        temp=27.0,
+        free_float=[27.0] * 24,
+        is_on=True,
+        occupied=True,
+        confidence=0.9,
+    )
+    snap = make_snapshot([zone])
+    state = ControllerState(mode=MODE_COOL, mode_since=0.0)
+    bands = {"z1": (21.8, 23.2)}
+    d1 = comfort.dominant_mode(snap, state, bands)
+    assert d1.mode == MODE_COOL
+    d2 = comfort.dominant_mode(snap, state, bands)
+    assert d2.mode == MODE_COOL
+
+
+def test_asymmetric_exit_holds_cool_through_deadband():
+    # Entered cool earlier; warm excess between EXIT and DEADBAND.
+    # 8 * 0.2 = 1.6 → > EXIT(1.0) and < DEADBAND(3.0) → hold cool
+    zone2 = make_zone(temp=23.4, free_float=[23.4] * 24)
+    snap2 = make_snapshot([zone2])
+    state = ControllerState(mode=MODE_COOL, mode_since=0.0)
+    bands = {"z1": (21.8, 23.2)}
+    decision = comfort.dominant_mode(snap2, state, bands)
+    assert decision.mode == MODE_COOL
+
+
+def test_asymmetric_exit_releases_when_excess_clears():
+    zone = make_zone(temp=23.25, free_float=[23.25] * 24)  # 8*0.05 = 0.4 < EXIT
+    snap = make_snapshot([zone])
+    state = ControllerState(mode=MODE_COOL, mode_since=0.0)
+    decision = comfort.dominant_mode(snap, state, {"z1": (21.8, 23.2)})
+    assert decision.mode == MODE_OFF
+
+
+def test_seasonal_guard_does_not_silence_hot_room():
+    """House-mean dilution must not force off while one zone is clearly hot."""
+    hot = make_zone(zone_id="hot", temp=27.0, free_float=[27.0] * 24)
+    cool = make_zone(zone_id="ok", temp=21.5, free_float=[21.5] * 24)
+    snap = make_snapshot([hot, cool], t_rm=12.0)  # winter running mean
+    state = ControllerState(mode=MODE_COOL, mode_since=0.0)
+    bands = {"hot": (21.8, 23.2), "ok": (21.8, 23.2)}
+    decision = comfort.dominant_mode(snap, state, bands)
+    assert decision.mode == MODE_COOL
+
+
+def test_low_confidence_uses_temp_persistence():
+    zone = make_zone(temp=27.0, free_float=(), confidence=0.0, is_on=True)
+    warm, _cold = comfort.demand_integrals([zone], {"z1": (21.8, 23.2)})
+    assert abs(warm - 8 * (27.0 - 23.2)) < 1e-9
+
+
+def test_indoor_deviation_aux_weighting():
     zones = [make_zone(temp=23.0)]
     bands = {"z1": (21.8, 23.2)}
     dev = comfort.indoor_deviation(zones, bands, aux_indoor=((26.0, 1.0),))

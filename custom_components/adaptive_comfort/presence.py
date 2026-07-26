@@ -54,9 +54,7 @@ def house_presence(
         if result is not None:
             return result
 
-    zone_values = [
-        presence_state(hass, sensor) for sensor in zone_presence_sensors if sensor
-    ]
+    zone_values = [presence_state(hass, sensor) for sensor in zone_presence_sensors if sensor]
     if not zone_values:
         return None
     if any(value is True for value in zone_values):

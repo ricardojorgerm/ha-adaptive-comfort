@@ -21,6 +21,7 @@ PRESET_NONE = "none"
 PRESET_ECO = "eco"
 PRESET_AWAY = "away"
 PRESET_BOOST = "boost"
+PRESET_MANUAL = "manual"
 
 ROOM_TYPE_REGULAR = "regular"
 ROOM_TYPE_WET = "wet"
@@ -136,7 +137,7 @@ class Settings:
     # ventilate / cycling path instead of continuous park-holds (opt-in;
     # field data showed ~280 W overnight compression against cool outdoor air).
     night_ventilate: bool = False
-    # Per-open-head electrical fan floor (W). Gate = 20 + this × heads.
+    # Per-open-head electrical fan floor (W). Gate = 20 + this * heads.
     fan_floor_per_head_w: float = 55.0
     # Hold mechanical conditioning briefly while the user is expected to ventilate manually.
     window_suggest: bool = False
@@ -199,6 +200,10 @@ class HouseSnapshot:
     settings: Settings
     zones: list[ZoneSnapshot]
     t_out: float | None = None
+    # True when t_out is climatology after a configured outdoor source dropped
+    # out (not a virgin install that never had outdoor). Discretionary
+    # actuation (ventilate, window grace) must not trust this number.
+    t_out_synthetic: bool = False
     t_rm: float | None = None  # 7-day running-mean outdoor temperature
     house_occupied: bool | None = None
     p_grid: float | None = None
@@ -250,6 +255,9 @@ class ControllerState:
     zone_fan: dict[str, bool] = field(default_factory=dict)  # fan-assist active
     zone_last_cool: dict[str, float] = field(default_factory=dict)  # coil-wet lockout
     window_suggest_since: dict[str, float] = field(default_factory=dict)
+    # Last time the zone left the window-suggest pool; grace clock is kept
+    # across brief disqualification until this ages past WINDOW_GRACE_S.
+    window_suggest_out_since: dict[str, float] = field(default_factory=dict)
     zone_track_delta: dict[str, float] = field(default_factory=dict)  # tracking-control depth (K)
     zone_parked_since: dict[str, float] = field(default_factory=dict)  # parked-state entry time
     zone_last_park_probe: dict[str, float] = field(default_factory=dict)  # consumed-probe spacing
@@ -284,9 +292,15 @@ class ControllerState:
             "zone_park_probe_entry": dict(self.zone_park_probe_entry),
             "zone_park_margin": dict(self.zone_park_margin),
             "zone_last_park_abort": dict(self.zone_last_park_abort),
+            "zone_park_ref": dict(self.zone_park_ref),
+            "zone_park_preferred": dict(self.zone_park_preferred),
+            "zone_fan": dict(self.zone_fan),
+            "zone_last_cool": dict(self.zone_last_cool),
+            "zone_mode_changes": {k: list(v) for k, v in self.zone_mode_changes.items()},
+            "window_suggest_since": dict(self.window_suggest_since),
+            "window_suggest_out_since": dict(self.window_suggest_out_since),
             "regime": self.regime,
             "regime_since": self.regime_since,
-            "zone_park_preferred": dict(self.zone_park_preferred),
         }
 
     @classmethod
@@ -314,11 +328,23 @@ class ControllerState:
         st.zone_last_park_abort = {
             str(k): float(v) for k, v in data.get("zone_last_park_abort", {}).items()
         }
-        st.regime = str(data.get("regime", "cycling"))
-        st.regime_since = float(data.get("regime_since", 0.0))
+        st.zone_park_ref = {str(k): float(v) for k, v in data.get("zone_park_ref", {}).items()}
         st.zone_park_preferred = {
             str(k): float(v) for k, v in data.get("zone_park_preferred", {}).items()
         }
+        st.zone_fan = {str(k): bool(v) for k, v in data.get("zone_fan", {}).items()}
+        st.zone_last_cool = {str(k): float(v) for k, v in data.get("zone_last_cool", {}).items()}
+        st.zone_mode_changes = {
+            str(k): [float(t) for t in v] for k, v in data.get("zone_mode_changes", {}).items()
+        }
+        st.window_suggest_since = {
+            str(k): float(v) for k, v in data.get("window_suggest_since", {}).items()
+        }
+        st.window_suggest_out_since = {
+            str(k): float(v) for k, v in data.get("window_suggest_out_since", {}).items()
+        }
+        st.regime = str(data.get("regime", "cycling"))
+        st.regime_since = float(data.get("regime_since", 0.0))
         return st
 
 

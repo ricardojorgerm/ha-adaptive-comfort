@@ -25,6 +25,7 @@ from .core.types import (
     PRESET_AWAY,
     PRESET_BOOST,
     PRESET_ECO,
+    PRESET_MANUAL,
     PRESET_NONE,
 )
 from .entity import AdaptiveComfortEntity
@@ -49,6 +50,7 @@ async def async_setup_entry(
 
 class AdaptiveComfortClimate(AdaptiveComfortEntity, ClimateEntity):
     _attr_name = None  # take the device name
+    _attr_translation_key = "house_climate"
     _attr_temperature_unit = UnitOfTemperature.CELSIUS
     _attr_hvac_modes: ClassVar[list[HVACMode]] = [
         HVACMode.OFF,
@@ -61,6 +63,7 @@ class AdaptiveComfortClimate(AdaptiveComfortEntity, ClimateEntity):
         PRESET_ECO,
         PRESET_AWAY,
         PRESET_BOOST,
+        PRESET_MANUAL,
     ]
     _attr_supported_features = (
         ClimateEntityFeature.TARGET_TEMPERATURE
@@ -83,6 +86,8 @@ class AdaptiveComfortClimate(AdaptiveComfortEntity, ClimateEntity):
     def hvac_action(self) -> HVACAction:
         if self.runtime.settings.hvac_mode == MODE_OFF:
             return HVACAction.OFF
+        if self.runtime.manual_control:
+            return HVACAction.IDLE
         active = self.runtime.controller_state.mode
         any_on = any(z.is_on for z in self.runtime.zones.values())
         if not any_on:
@@ -114,6 +119,9 @@ class AdaptiveComfortClimate(AdaptiveComfortEntity, ClimateEntity):
             "dominant_mode": self.runtime.controller_state.mode,
             "mode_source": self.runtime.mode_source,
             "shedding_active": self.runtime.shedding_active,
+            "effective_preset": self.runtime.effective_preset,
+            "manual_control": self.runtime.manual_control,
+            "house_occupied": self.runtime.house_occupied,
         }
 
     async def async_set_temperature(self, **kwargs: Any) -> None:
@@ -129,7 +137,7 @@ class AdaptiveComfortClimate(AdaptiveComfortEntity, ClimateEntity):
 
     async def async_set_preset_mode(self, preset_mode: str) -> None:
         if preset_mode in self._attr_preset_modes:
-            self.runtime.settings.preset = preset_mode
+            self.runtime.set_preset(preset_mode)
             self.runtime.request_save()
             self.runtime.notify()
 

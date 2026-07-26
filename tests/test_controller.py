@@ -56,6 +56,62 @@ def test_hot_zone_gets_cooled():
     commands = {c.zone_id: c for c in decision.commands}
     assert commands["bed"].hvac_mode == MODE_COOL
     assert commands["bed"].setpoint == 22.5
+    assert decision.diag["want"]["bed"] == "demand"
+
+
+def test_away_demand_holds_near_band_edge():
+    from custom_components.adaptive_comfort.core import comfort
+    from custom_components.adaptive_comfort.core.types import PRESET_AWAY
+
+    settings = Settings(hvac_mode=MODE_COOL, target=22.5, preset=PRESET_AWAY, adaptive_blend=0.0)
+    # Far above away band so still in demand.
+    zone = make_zone("bed", 30.0)
+    snap = make_snapshot([zone], settings, house_occupied=False)
+    state = warmed_state([zone])
+    decision = controller.tick(snap, state)
+    cmd = {c.zone_id: c for c in decision.commands}["bed"]
+    center = comfort.band_center(settings, None)
+    _lo, hi = comfort.zone_band(settings, center, True, False)
+    assert abs(cmd.setpoint - (hi - comfort.BAND_HOLD_MARGIN_K)) < 0.26  # quantized
+
+
+def test_manual_emits_no_commands_but_keeps_want():
+    from custom_components.adaptive_comfort.core.types import PRESET_MANUAL
+
+    settings = Settings(hvac_mode=MODE_AUTO, preset=PRESET_MANUAL)
+    zone = make_zone("bed", 26.0, is_on=True)
+    snap = make_snapshot([zone], settings)
+    state = warmed_state([zone])
+    state.zone_parked_since["bed"] = NOW
+    decision = controller.tick(snap, state)
+    assert decision.commands == []
+    assert decision.diag["want"]["bed"] == "demand"
+    assert "bed" not in state.zone_parked_since  # parks cleared
+
+
+def test_manual_with_hvac_off_still_force_stops():
+    from custom_components.adaptive_comfort.core.types import PRESET_MANUAL
+
+    settings = Settings(hvac_mode=MODE_OFF, preset=PRESET_MANUAL)
+    zone = make_zone("bed", 26.0, is_on=True)
+    snap = make_snapshot([zone], settings)
+    state = warmed_state([zone])
+    decision = controller.tick(snap, state)
+    assert any(c.hvac_mode == MODE_OFF for c in decision.commands)
+
+
+def test_manual_does_not_shed():
+    """Manual is full hands-off — including contracted-power shedding."""
+    from custom_components.adaptive_comfort.core.types import PRESET_MANUAL
+
+    settings = Settings(hvac_mode=MODE_AUTO, preset=PRESET_MANUAL, shedding_enabled=True)
+    zone = make_zone("bed", 26.0, is_on=True, draw_w=1200.0)
+    snap = make_snapshot([zone], settings, p_demand=3400.0, shed_urgent=True)
+    state = warmed_state([zone])
+    state.zone_on["bed"] = True
+    decision = controller.tick(snap, state)
+    assert decision.commands == []
+    assert state.shed == {}
 
 
 def test_coordination_spreads_to_helper_zones():

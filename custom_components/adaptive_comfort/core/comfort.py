@@ -12,6 +12,8 @@ from .types import (
     PRESET_AWAY,
     PRESET_BOOST,
     PRESET_ECO,
+    PRESET_MANUAL,
+    PRESET_NONE,
     ControllerState,
     HouseSnapshot,
     Settings,
@@ -46,13 +48,19 @@ FALLBACK_HEAT_BELOW_C = 14.0
 FALLBACK_COOL_ABOVE_C = 21.0
 FALLBACK_HYSTERESIS_K = 1.0
 
-MODE_DEADBAND_KH = 1.5
+# Enter/exit thresholds for the MODE_HORIZON_H integral (K*h). Sized so a
+# sustained ~0.4 K / ~0.15 K mean excursion enters / holds (8 * 0.375 / 0.125).
+MODE_DEADBAND_KH = 3.0
+MODE_EXIT_KH = 1.0
+MODE_HORIZON_H = 8  # near-term hours for mode arbitration (not full 24 h)
 MODE_DWELL_S = 6.0 * 3600.0
 OVERRIDE_DELTA_K = 2.0
 OVERRIDE_SUSTAIN_S = 30.0 * 60.0
 MIN_MODEL_CONFIDENCE = 0.3
 UNOCCUPIED_WIDEN_K = 1.5
 UNOCCUPIED_WEIGHT = 0.3
+# Away/vacant demand trims to the near band edge, not the comfort center.
+BAND_HOLD_MARGIN_K = 0.3
 
 
 def update_running_mean(t_rm: float | None, t_out: float, dt_h: float) -> float:
@@ -75,6 +83,16 @@ def band_center(settings: Settings, t_rm: float | None, zone_offset: float = 0.0
     return center + zone_offset
 
 
+def effective_preset(settings: Settings, house_occupied: bool | None) -> str:
+    """User preset with presence Away, unless Boost (or Manual) wins."""
+    preset = settings.preset
+    if preset in (PRESET_BOOST, PRESET_MANUAL):
+        return preset
+    if settings.presence_adaptation and house_occupied is False:
+        return PRESET_AWAY
+    return preset if preset else PRESET_NONE
+
+
 def zone_band(
     settings: Settings,
     center: float,
@@ -83,18 +101,42 @@ def zone_band(
 ) -> tuple[float, float]:
     """Comfort band (lower, upper) for a zone this tick."""
     half = settings.band_k
-    preset = settings.preset
-    if settings.presence_adaptation and house_occupied is False:
-        preset = PRESET_AWAY
+    preset = effective_preset(settings, house_occupied)
     if preset == PRESET_ECO:
         half += 1.5
     elif preset == PRESET_AWAY:
         half += 3.0
     elif preset == PRESET_BOOST:
         half = max(0.3, half * 0.5)
-    if zone_occupied is False:
+    # Manual uses the underlying band for diagnostics; it does not command.
+    # Boost overrides vacant widen (same as it overrides presence-Away).
+    if zone_occupied is False and preset != PRESET_BOOST:
         half += UNOCCUPIED_WIDEN_K
     return center - half, center + half
+
+
+def demand_setpoint(
+    mode: str,
+    center: float,
+    lo: float,
+    hi: float,
+    zone_occupied: bool | None,
+    preset: str,
+) -> float:
+    """Room-frame demand target: center-seek, or band-hold when Away/vacant.
+
+    Boost always center-seeks (overrides Away and vacant widen semantics).
+    """
+    if preset == PRESET_BOOST:
+        return center
+    band_hold = preset == PRESET_AWAY or zone_occupied is False
+    if not band_hold:
+        return center
+    if mode == MODE_COOL:
+        return hi - BAND_HOLD_MARGIN_K
+    if mode == MODE_HEAT:
+        return lo + BAND_HOLD_MARGIN_K
+    return center
 
 
 def indoor_deviation(
@@ -184,25 +226,42 @@ class ModeDecision:
     cold_deficit_kh: float = 0.0
 
 
+def _mode_trajectory(zone: ZoneSnapshot, horizon_h: int = MODE_HORIZON_H) -> tuple[float, ...]:
+    """Near-term no-AC temperatures for mode arbitration.
+
+    Confident free-float is the counterfactual (including while the head is on:
+    predict_free never models AC). Low-confidence zones contribute a flat hold
+    at the current temperature so an always-conditioned room is not dropped.
+    """
+    if zone.confidence >= MIN_MODEL_CONFIDENCE and zone.free_float:
+        return tuple(zone.free_float[:horizon_h])
+    if zone.temp is None:
+        return ()
+    return (zone.temp,) * horizon_h
+
+
 def demand_integrals(
     zones: list[ZoneSnapshot],
     bands: dict[str, tuple[float, float]],
+    horizon_h: int = MODE_HORIZON_H,
 ) -> tuple[float, float]:
-    """Occupancy-weighted (warm excess, cold deficit) in K*h over the horizon,
-    integrated from each zone's hourly free-float trajectory.
+    """Occupancy-weighted (warm excess, cold deficit) in K*h over the horizon.
 
-    Zones actively conditioning are skipped: free-float trajectories are not
-    meaningful while the AC is driving the room.
+    Integrates each zone's no-AC counterfactual vs its comfort band. Conditioning
+    zones are included: predict_free is already "if this zone gets no AC."
     """
     warm = 0.0
     cold = 0.0
     for zone in zones:
-        if zone.is_on or not zone.free_float or zone.zone_id not in bands:
+        if zone.zone_id not in bands:
+            continue
+        trajectory = _mode_trajectory(zone, horizon_h)
+        if not trajectory:
             continue
         lo, hi = bands[zone.zone_id]
         weight = UNOCCUPIED_WEIGHT if zone.occupied is False else 1.0
         weight *= zone.n_rooms  # a mirrored zone is N rooms' worth of demand
-        for temp in zone.free_float:
+        for temp in trajectory:
             warm += weight * max(0.0, temp - hi)  # 1 h per sample
             cold += weight * max(0.0, lo - temp)
     return warm, cold
@@ -250,6 +309,24 @@ def _emergency_override(
     return state.override_mode
 
 
+def _max_present_excess(
+    zones: list[ZoneSnapshot],
+    bands: dict[str, tuple[float, float]],
+    *,
+    cool: bool,
+) -> float | None:
+    """Largest current out-of-band excursion (K) on the cool or heat side."""
+    best: float | None = None
+    for zone in zones:
+        if zone.temp is None or zone.zone_id not in bands:
+            continue
+        lo, hi = bands[zone.zone_id]
+        excess = zone.temp - hi if cool else lo - zone.temp
+        if best is None or excess > best:
+            best = excess
+    return best
+
+
 def dominant_mode(
     snap: HouseSnapshot,
     state: ControllerState,
@@ -271,8 +348,12 @@ def dominant_mode(
             state.mode_since = now
         return ModeDecision(override, "override")
 
-    confident = [z for z in zones if z.free_float and z.confidence >= MIN_MODEL_CONFIDENCE]
-    if not confident:
+    # Prefer model integrals whenever any zone can contribute (free-float or
+    # temperature persistence). Only fall back when nothing is measurable.
+    has_signal = any(
+        (z.confidence >= MIN_MODEL_CONFIDENCE and z.free_float) or z.temp is not None for z in zones
+    )
+    if not has_signal:
         dev = indoor_deviation(zones, bands, snap.aux_indoor)
         mode = fallback_mode(snap.t_rm, state.mode, dev, snap.settings.band_k)
         if mode != state.mode:
@@ -280,26 +361,39 @@ def dominant_mode(
             state.mode_since = now
         return ModeDecision(mode, "fallback")
 
-    warm, cold = demand_integrals(confident, bands)
-    indoor_dev = indoor_deviation(zones, bands, snap.aux_indoor)
+    warm, cold = demand_integrals(zones, bands)
     season_heat = snap.t_rm is not None and snap.t_rm < FALLBACK_HEAT_BELOW_C
     season_cool = snap.t_rm is not None and snap.t_rm > FALLBACK_COOL_ABOVE_C
+    # Per-zone present excursion (not house-mean): a single hot room must not
+    # be silenced by cooler siblings in the seasonal guard.
+    max_hot_k = _max_present_excess(zones, bands, cool=True)
+    max_cold_k = _max_present_excess(zones, bands, cool=False)
 
     if warm - cold > MODE_DEADBAND_KH:
         desired = MODE_COOL
-        if season_heat and (indoor_dev is None or indoor_dev < 2.0):
+        # Winter: ignore forecast-only cool when no zone is above the band now.
+        if season_heat and (max_hot_k is None or max_hot_k <= 0.0):
             desired = MODE_OFF
     elif cold - warm > MODE_DEADBAND_KH:
         desired = MODE_HEAT
-        # Do not heat on forecast alone in summer when the house is not cold now.
-        if season_cool and (indoor_dev is None or indoor_dev > -2.0):
+        # Summer: ignore forecast-only heat when no zone is below the band now.
+        if season_cool and (max_cold_k is None or max_cold_k <= 0.0):
             desired = MODE_OFF
     else:
         desired = MODE_OFF
 
+    # Asymmetric exit: hold cool/heat until excess falls below MODE_EXIT_KH
+    # (applies after seasonal demotion so a latched cool with real warm excess
+    # cannot be forced off by a diluted house-mean guard).
+    if desired == MODE_OFF:
+        if state.mode == MODE_COOL and warm - cold > MODE_EXIT_KH:
+            desired = MODE_COOL
+        elif state.mode == MODE_HEAT and cold - warm > MODE_EXIT_KH:
+            desired = MODE_HEAT
+
     if desired != state.mode:
         # Switching between heat and cool (or leaving off) honours the dwell;
-        # dropping to off is always allowed.
+        # dropping to off is allowed when exit hysteresis agrees.
         if desired != MODE_OFF and now - state.mode_since < MODE_DWELL_S and state.mode != MODE_OFF:
             return ModeDecision(state.mode, "dwell", warm, cold)
         state.mode = desired

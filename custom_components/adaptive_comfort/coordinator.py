@@ -6,6 +6,7 @@ services to the pure snapshot/command interface.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 from datetime import timedelta
@@ -59,12 +60,15 @@ from .core.types import (
     MODE_FAN,
     MODE_HEAT,
     MODE_OFF,
+    PRESET_MANUAL,
+    PRESET_NONE,
     ROOM_TYPE_REGULAR,
     ROOM_TYPE_WET,
     STATE_COOLING,
     STATE_FAN_ONLY,
     STATE_HEATING,
     STATE_STANDBY,
+    Command,
     ControllerState,
     HouseSnapshot,
     RoomConfig,
@@ -97,6 +101,12 @@ COP_TABLE_MIN_SAMPLES = 20
 HOUSE_COP_MIN_POWER_W = 250.0
 HOUSE_COP_EMA_ALPHA = 0.2
 FORECAST_HOURS = 24
+# Hold last measured outdoor this long after a sensor/weather dropout before
+# falling back to climatology (which then marks t_out_synthetic).
+OUTDOOR_LKG_S = 2.0 * 3600.0
+# Moisture baselines learned against (k_out+k_mix) are invalid after the
+# outdoor-only airflow fix; wipe on restore from older schema.
+MOISTURE_SCHEMA = 2
 
 
 def _float_state(hass: HomeAssistant, entity_id: str | None) -> float | None:
@@ -149,6 +159,7 @@ class ZoneRuntime:
         self.last_fit_ts: float | None = None
         self.last_fit_temp: float | None = None
         self.sensible_w = 0.0  # sensed room, signed
+        self.sensible_ts: float | None = None  # when sensible_w was last fitted
         self.latent_w = 0.0  # sensed room
         self.park = park.ParkEstimator()
         self.park_power = park.PowerDebounce()
@@ -178,6 +189,7 @@ class ZoneRuntime:
             "thermal": self.model.to_dict(),
             "drift": {h: d.to_dict() for h, d in self.drift.items()},
             "moisture_sources_kg_h": self.moisture_sources_kg_h,
+            "moisture_schema": MOISTURE_SCHEMA,
         }
 
     def restore(self, data: dict) -> None:
@@ -188,7 +200,11 @@ class ZoneRuntime:
         for head, drift_data in data.get("drift", {}).items():
             if head in self.drift:
                 self.drift[head] = DriftEstimator.from_dict(drift_data)
-        self.moisture_sources_kg_h = float(data.get("moisture_sources_kg_h", 0.0))
+        # Inflated (k_out+k_mix) moisture EWMAs are not reusable.
+        if int(data.get("moisture_schema", 0)) >= MOISTURE_SCHEMA:
+            self.moisture_sources_kg_h = float(data.get("moisture_sources_kg_h", 0.0))
+        else:
+            self.moisture_sources_kg_h = 0.0
 
 
 class AdaptiveComfortRuntime:
@@ -218,6 +234,8 @@ class AdaptiveComfortRuntime:
         self.t_rm: float | None = None
         self.t_out: float | None = None
         self.house_occupied: bool | None = None
+        self._prev_house_occupied: bool | None = None
+        self._preset_before_manual: str = PRESET_NONE
         self.p_grid: float | None = None
         self.p_load: float | None = None
         self.p_ac: float | None = None
@@ -232,6 +250,15 @@ class AdaptiveComfortRuntime:
         self.grid_over_since: float | None = None
         self.forecast: list[float] = []
         self._forecast_ts = 0.0
+        self._forecast_fetched_ts: float = 0.0
+        self._t_out_lkg: float | None = None
+        self._t_out_lkg_ts: float = 0.0
+        self._t_out_synthetic: bool = False
+        self._event_seq: int = 0
+        self._control_lock = asyncio.Lock()
+        self._prev_zone_enabled: dict[str, bool] = {}
+        # True only when at least one *conditioning* zone refreshed sensible this tick.
+        self._conditioning_fit_refreshed: bool = False
         self.cop_table: dict[int, tuple[float, int]] = {}  # heads -> (ewma cop, samples)
         # (heads, outdoor band) -> (ewma cop, samples); diagnostics/analysis only for now.
         self.cop_table_banded: dict[str, tuple[float, int]] = {}
@@ -247,7 +274,8 @@ class AdaptiveComfortRuntime:
         self.mode_source: str = "off"
         self.last_diag: dict = {}
         self._pending_events: list[dict] = []
-        self._all_events: list[tuple[float, str]] = []
+        # (ts, zone_id, event_id) — isolation compares by id, not equal timestamps.
+        self._all_events: list[tuple[float, str, int]] = []
         self._all_off_since: float | None = 0.0
         self._last_sample_ts: float | None = None
         self._unsub: list = []
@@ -322,37 +350,85 @@ class AdaptiveComfortRuntime:
         self.hass.async_create_task(self._async_power_react())
 
     async def _async_power_react(self) -> None:
+        """Fast meter path: fresh heads+power, shed only on engage/release.
+
+        Must not run estimator EWMAs or full controller.tick on every meter
+        update — tracking-delta / park-margin adapt per tick and would saturate.
+        """
         now_ts = time.time()
         if now_ts - self._last_power_react < POWER_REACT_DEBOUNCE_S:
             return
         self._last_power_react = now_ts
         local_hour = self._local_hour()
-        dt_h = (now_ts - self._last_sample_ts) / 3600.0 if self._last_sample_ts else 1.0 / 60.0
-        self._sample_house(now_ts, local_hour, dt_h)
-        self._sample_zones(now_ts, local_hour)
-        if self.p_load is not None:
-            active = [z for z in self.zones.values() if z.is_on]
-            if active:
-                self.p_ac = power.estimate_ac_power(self.p_load, self.baseline.value(local_hour))
-            else:
-                self.p_ac = 0.0
-            parked_ids = set(self.controller_state.zone_parked_since)
-            self._last_state_key = power.control_state_key(
-                any(z.config.zone_id not in parked_ids for z in active),
-                any(z.config.zone_id in parked_ids for z in active),
-            )
-            self.starts.update(
-                now_ts,
-                self.p_ac,
-                self._last_state_key,
-                floor_w=self._compression_floor_w(active, parked_ids),
-            )
+        self._sample_head_states(now_ts)
+        self._sample_power(now_ts, local_hour)
         self._finalize_demand(now_ts)
         if self.settings.shedding_enabled:
-            await self._async_control(now_ts, local_hour)
+            await self._async_control_if_shed_transition(now_ts, local_hour, skip_if_busy=True)
         # Always publish: ac_power_estimate / starts sensors should track the
         # meter at event rate, not wait for the 60 s control tick.
         self.notify()
+
+    def _shed_needed_now(self) -> bool:
+        over_s = time.time() - self.grid_over_since if self.grid_over_since is not None else None
+        return power.shed_needed(
+            self.p_demand,
+            self.settings.limit_w,
+            self.settings.shed_start_pct,
+            over_s,
+            urgent=self.shed_urgent,
+        )
+
+    def _shed_has_open_candidates(self) -> bool:
+        """True when an on zone is not yet in the shed set (another victim possible)."""
+        shed = self.controller_state.shed
+        return any(z.is_on and z.config.zone_id not in shed for z in self.zones.values())
+
+    def _shed_any_restore_possible(self) -> bool:
+        """True when at least one shed zone would pass restore_allowed at current demand."""
+        p_demand = self.p_demand
+        if p_demand is None:
+            return False
+        s = self.settings
+        for zid in self.controller_state.shed:
+            zone = self.zones.get(zid)
+            mode = MODE_HEAT if zone is not None and zone.head_state == STATE_HEATING else MODE_COOL
+            draw = self.draws.draw_w(zid, mode)
+            if power.restore_allowed(p_demand, s.limit_w, s.shed_restore_pct, draw):
+                return True
+        return False
+
+    def _react_should_run_control(self) -> bool:
+        """Whether power-react should enter controller.tick for shedding.
+
+        Must not compare shed_needed to bool(state.shed): start (0.88) and restore
+        (0.75) differ, so the hysteresis band would re-enter tick every meter event
+        with no state change and saturate zone_track_delta.
+        """
+        needed = self._shed_needed_now()
+        shedding = bool(self.controller_state.shed)
+        now_ts = time.time()
+        if needed:
+            if not shedding:
+                return True
+            spacing = (
+                controller.SHED_URGENT_SPACING_S
+                if self.shed_urgent
+                else controller.SHED_ACTION_SPACING_S
+            )
+            if now_ts - self.controller_state.last_shed_action < spacing:
+                return False
+            return self._shed_has_open_candidates()
+        # Below start threshold: only run when a restore can actually proceed.
+        return shedding and self._shed_any_restore_possible()
+
+    async def _async_control_if_shed_transition(
+        self, now_ts: float, local_hour: float, *, skip_if_busy: bool = False
+    ) -> None:
+        """Run control only when shed engage, add-victim, or actionable restore."""
+        if not self._react_should_run_control():
+            return
+        await self._async_control(now_ts, local_hour, skip_if_busy=skip_if_busy)
 
     def _power_watch_entities(self) -> list[str]:
         data = self.entry.data
@@ -376,13 +452,16 @@ class AdaptiveComfortRuntime:
         active = [z for z in self.zones.values() if z.is_on]
         mode = MODE_HEAT if any(z.head_state == STATE_HEATING for z in active) else MODE_COOL
         draws = [self.draws.draw_w(z.config.zone_id, mode) for z in active]
-        ac_w = power.estimated_active_ac_draw_w(draws, self.p_ac)
+        # Empty active + house residual must not count as "active AC draw".
+        ac_w = power.estimated_active_ac_draw_w(draws, self.p_ac if active else None)
         peak = self.p_grid_series.max_window(now_ts - power.SHED_PEAK_WINDOW_S, now_ts)
         self.p_demand = power.contracted_demand_w(self.p_grid, known, ac_w, peak)
 
-        if self._prev_known_total is not None:
-            if self.known_load_total - self._prev_known_total >= power.KNOWN_LOAD_SPIKE_W:
-                self._demand_spike_until = now_ts + 90.0
+        if (
+            self._prev_known_total is not None
+            and self.known_load_total - self._prev_known_total >= power.KNOWN_LOAD_SPIKE_W
+        ):
+            self._demand_spike_until = now_ts + 90.0
         self._prev_known_total = self.known_load_total
 
         threshold = self.settings.shed_start_pct * self.settings.limit_w
@@ -442,6 +521,15 @@ class AdaptiveComfortRuntime:
             self.settings.preset = settings["preset"]
         self.settings.zone_offsets = dict(settings.get("zone_offsets", {}))
         self.settings.zone_enabled = dict(settings.get("zone_enabled", {}))
+        # Seed so the first tick does not Off-spam zones already disabled.
+        self._prev_zone_enabled = {
+            zid: bool(self.settings.zone_enabled.get(zid, True)) for zid in self.zones
+        }
+        if "preset_before_manual" in data:
+            self._preset_before_manual = str(data["preset_before_manual"] or PRESET_NONE)
+        if "prev_house_occupied" in data:
+            prev = data["prev_house_occupied"]
+            self._prev_house_occupied = None if prev is None else bool(prev)
         if "t_rm" in data and data["t_rm"] is not None:
             self.t_rm = float(data["t_rm"])
         if "baseline" in data:
@@ -509,6 +597,8 @@ class AdaptiveComfortRuntime:
                 "zone_offsets": s.zone_offsets,
                 "zone_enabled": s.zone_enabled,
             },
+            "preset_before_manual": self._preset_before_manual,
+            "prev_house_occupied": self._prev_house_occupied,
             "t_rm": self.t_rm,
             "baseline": self.baseline.to_dict(),
             "draws": self.draws.to_dict(),
@@ -536,10 +626,18 @@ class AdaptiveComfortRuntime:
         now = dt_util.now()
         return now.hour + now.minute / 60.0 + now.second / 3600.0
 
+    def _outdoor_configured(self) -> bool:
+        data = self.entry.data
+        return bool(data.get(CONF_OUTDOOR_TEMP) or data.get(CONF_WEATHER))
+
     def _read_outdoor(self) -> tuple[float | None, str]:
-        """Outdoor temperature and its source: sensor > weather > climatology."""
+        """Outdoor temperature and its source: sensor > weather > LKG > climatology."""
+        now_ts = time.time()
         value = _float_state(self.hass, self.entry.data.get(CONF_OUTDOOR_TEMP))
         if value is not None:
+            self._t_out_lkg = value
+            self._t_out_lkg_ts = now_ts
+            self._t_out_synthetic = False
             return value, "sensor"
         weather = self.entry.data.get(CONF_WEATHER)
         if weather:
@@ -547,10 +645,22 @@ class AdaptiveComfortRuntime:
             if state is not None:
                 temp = state.attributes.get("temperature")
                 if isinstance(temp, (int, float)):
+                    self._t_out_lkg = float(temp)
+                    self._t_out_lkg_ts = now_ts
+                    self._t_out_synthetic = False
                     return float(temp), "weather"
-        # Fresh install with no outdoor data at all: use climatological
-        # normals (Lisbon defaults) so seasonal logic stays sane.
+        # Configured outdoor dropped out: prefer last-known-good briefly.
+        if (
+            self._outdoor_configured()
+            and self._t_out_lkg is not None
+            and now_ts - self._t_out_lkg_ts <= OUTDOOR_LKG_S
+        ):
+            self._t_out_synthetic = False
+            return self._t_out_lkg, "stale"
+        # Climatology: OK for virgin installs (no outdoor entity). After a
+        # configured source dropout it is synthetic for discretionary actuation.
         now = dt_util.now()
+        self._t_out_synthetic = self._outdoor_configured()
         return comfort.climatology_temp(now.month, self._local_hour()), "climatology"
 
     def _read_outdoor_rh(self) -> float | None:
@@ -665,6 +775,26 @@ class AdaptiveComfortRuntime:
         if temps and self.t_out is not None:
             temps[0] = self.t_out  # anchor the horizon on the live reading
         self.forecast = temps
+        self._forecast_fetched_ts = now_ts
+
+    def _effective_forecast(self, now_ts: float) -> list[float]:
+        """Re-index stored forecast so index 0 is 'now', anchored on live t_out."""
+        if not self.forecast:
+            return [self.t_out] * FORECAST_HOURS if self.t_out is not None else []
+        elapsed_h = 0.0
+        if self._forecast_fetched_ts > 0.0:
+            elapsed_h = max(0.0, (now_ts - self._forecast_fetched_ts) / 3600.0)
+        n = len(self.forecast)
+        shifted: list[float] = []
+        for h in range(FORECAST_HOURS):
+            pos = elapsed_h + h
+            idx = min(int(pos), n - 1)
+            frac = min(pos - idx, 1.0)
+            nxt = min(idx + 1, n - 1)
+            shifted.append(self.forecast[idx] * (1.0 - frac) + self.forecast[nxt] * frac)
+        if self.t_out is not None and shifted:
+            shifted[0] = self.t_out
+        return shifted
 
     # -- main loop --------------------------------------------------------------
 
@@ -676,14 +806,18 @@ class AdaptiveComfortRuntime:
 
         self._sample_house(now_ts, local_hour, dt_h)
         await self._async_refresh_forecast(now_ts)
-        self._sample_zones(now_ts, local_hour)
+        self._sample_head_states(now_ts)
+        self._sample_zone_environment(now_ts, local_hour)
+        self._sample_power(now_ts, local_hour)
         self._process_power_events(now_ts)
         self._update_estimators(now_ts, local_hour)
         self._finalize_demand(now_ts)
+        await self._async_apply_zone_disable_edges()
         await self._async_control(now_ts, local_hour)
         self.notify()
 
-    def _sample_house(self, now_ts: float, local_hour: float, dt_h: float) -> None:
+    def _sample_power(self, now_ts: float, local_hour: float) -> None:
+        """Grid/load series + electrical p_ac + starts. Safe on the react path."""
         data = self.entry.data
         self.p_grid = _float_state(self.hass, data.get(CONF_GRID_POWER))
         battery = _float_state(self.hass, data.get(CONF_BATTERY_POWER))
@@ -697,7 +831,53 @@ class AdaptiveComfortRuntime:
                 known,
             )
             self.p_load_series.append(now_ts, self.p_load)
+        self._estimate_p_ac(now_ts, local_hour)
 
+    def _estimate_p_ac(self, now_ts: float, local_hour: float) -> None:
+        """Electrical AC residual — never zeroed from hvac_action.
+
+        Baseline learning stays gated on device quiet (_all_off_since). Trade-offs:
+        unmodeled non-AC load above the fan floor can latch StartCounter (missed
+        starts) or, with a learned slot and heads off, count phantom starts —
+        preferred to manufacturing starts from hvac_action idle flicker.
+        """
+        active = [z for z in self.zones.values() if z.is_on]
+        self.p_ac = None
+        if self.p_load is not None:
+            # Median fallback OK for demand/shedding; park path uses learned slot.
+            self.p_ac = power.estimate_ac_power(self.p_load, self.baseline.value(local_hour))
+        parked_ids = set(self.controller_state.zone_parked_since)
+        self._last_state_key = power.control_state_key(
+            any(z.config.zone_id not in parked_ids for z in active),
+            any(z.config.zone_id in parked_ids for z in active),
+        )
+        # Prefer a learned baseline slot for start counting when available.
+        starts_pac = self.p_ac
+        learned = self.baseline.value(local_hour, fallback=False)
+        if self.p_load is not None and learned is not None:
+            starts_pac = power.estimate_ac_power(self.p_load, learned)
+        elif learned is None and self.baseline.value(local_hour) is not None:
+            # Slot unknown: do not invent compression for StartCounter.
+            starts_pac = 0.0 if not active else self.p_ac
+        self.starts.update(
+            now_ts,
+            starts_pac,
+            self._last_state_key,
+            floor_w=self._compression_floor_w(active, parked_ids),
+        )
+
+    def _park_p_ac(self, local_hour: float) -> float | None:
+        """p_ac for park gating — only from a learned baseline slot."""
+        if self.p_load is None:
+            return None
+        learned = self.baseline.value(local_hour, fallback=False)
+        if learned is None:
+            return None
+        return power.estimate_ac_power(self.p_load, learned)
+
+    def _sample_house(self, now_ts: float, local_hour: float, dt_h: float) -> None:
+        """Tick-only: outdoor, t_rm, diurnal, presence. No power series."""
+        data = self.entry.data
         self.t_out, self.outdoor_source = self._read_outdoor()
         if self.t_rm is None:
             # Seed the running mean from climatology rather than a single
@@ -706,27 +886,39 @@ class AdaptiveComfortRuntime:
         if self.t_out is not None and self.outdoor_source != "climatology":
             self.t_rm = comfort.update_running_mean(self.t_rm, self.t_out, dt_h)
             self.outdoor_diurnal.update(local_hour, self.t_out)
-        self.house_occupied = house_presence(
+        occupied = house_presence(
             self.hass,
             data.get(CONF_PRESENCE),
             [zone.config.presence_sensor for zone in self.zones.values()],
         )
+        if (
+            self.settings.presence_adaptation
+            and self._prev_house_occupied is False
+            and occupied is True
+        ):
+            self.reset_track_deltas()
+        self._prev_house_occupied = occupied
+        self.house_occupied = occupied
 
-    def _sample_zones(self, now_ts: float, local_hour: float) -> None:
-        any_on = False
+    def _sample_head_states(self, now_ts: float) -> None:
+        """Cheap head-state scan + draw-event stamps. Both react and tick."""
+        any_busy = False
         for zone in self.zones.values():
             cfg = zone.config
-            # Head operating state (mirrored heads: most active wins).
             states = [_head_state(self.hass, head) for head in cfg.heads]
             priority = [STATE_COOLING, STATE_HEATING, STATE_FAN_ONLY, STATE_STANDBY]
             new_state = next((p for p in priority if p in states), STATE_STANDBY)
             if new_state != zone.head_state:
                 if (new_state in (STATE_COOLING, STATE_HEATING)) != zone.is_on:
                     mode = MODE_HEAT if new_state == STATE_HEATING else MODE_COOL
-                    if zone.is_on:  # turning off: attribute mode from previous state
+                    if zone.is_on:
                         mode = MODE_HEAT if zone.head_state == STATE_HEATING else MODE_COOL
-                    self._pending_events.append({"ts": now_ts, "zone": cfg.zone_id, "mode": mode})
-                    self._all_events.append((now_ts, cfg.zone_id))
+                    self._event_seq += 1
+                    eid = self._event_seq
+                    self._pending_events.append(
+                        {"ts": now_ts, "zone": cfg.zone_id, "mode": mode, "event_id": eid}
+                    )
+                    self._all_events.append((now_ts, cfg.zone_id, eid))
                 zone.head_state = new_state
                 zone.head_state_since = now_ts
             if zone.head_state == STATE_STANDBY:
@@ -734,8 +926,17 @@ class AdaptiveComfortRuntime:
                     zone.all_off_since = now_ts
             else:
                 zone.all_off_since = None
-                any_on = zone.is_on or any_on
+                # Fan-only draws power — must block house baseline learning.
+                any_busy = True
+        if any_busy:
+            self._all_off_since = None
+        elif self._all_off_since is None:
+            self._all_off_since = now_ts
 
+    def _sample_zone_environment(self, now_ts: float, local_hour: float) -> None:
+        """Tick-only: temps, series, doors/fans/presence, drift, baseline learn."""
+        for zone in self.zones.values():
+            cfg = zone.config
             zone.temp = self._zone_temp(zone)
             if zone.temp is not None:
                 zone.temp_series.append(now_ts, zone.temp)
@@ -763,7 +964,7 @@ class AdaptiveComfortRuntime:
             zone.head_internal_temp = sum(internals) / len(internals) if internals else None
             zone.device_setpoint = sum(setpoints) / len(setpoints) if setpoints else None
 
-            # Drift learning: stable state >= 10 min with an external reference.
+            # Drift learning keys on each head's own state (not aggregate).
             external = _float_state(self.hass, cfg.temp_sensor)
             if external is not None and now_ts - zone.head_state_since >= STABLE_STATE_S:
                 for head in cfg.heads:
@@ -772,14 +973,10 @@ class AdaptiveComfortRuntime:
                         continue
                     internal = state.attributes.get("current_temperature")
                     if isinstance(internal, (int, float)):
-                        zone.drift[head].update(zone.head_state, float(internal), external)
+                        zone.drift[head].update(
+                            _head_state(self.hass, head), float(internal), external
+                        )
 
-        if any_on:
-            self._all_off_since = None
-        elif self._all_off_since is None:
-            self._all_off_since = now_ts
-
-        # Baseline learning while every head has been off long enough.
         if (
             self.p_load is not None
             and self._all_off_since is not None
@@ -794,10 +991,11 @@ class AdaptiveComfortRuntime:
             if age < EVENT_SETTLE_S:
                 remaining.append(event)
                 continue
-            # Reject events with a neighbour too close to isolate the step.
+            eid = event.get("event_id")
+            # Reject events with a neighbour within EVENT_SETTLE_S (by id).
             isolated = all(
-                abs(other_ts - event["ts"]) < 1.0 or abs(other_ts - event["ts"]) > EVENT_SETTLE_S
-                for other_ts, _zid in self._all_events
+                other_id == eid or abs(other_ts - event["ts"]) > EVENT_SETTLE_S
+                for other_ts, _zid, other_id in self._all_events
             )
             if isolated:
                 pre = self.p_load_series.window(event["ts"] - 240.0, event["ts"] - 15.0)
@@ -807,7 +1005,7 @@ class AdaptiveComfortRuntime:
                     self.draws.add_event(event["zone"], event["mode"], delta)
         self._pending_events = remaining
         self._all_events = [
-            (ts, zid) for ts, zid in self._all_events if now_ts - ts < 2 * EVENT_SETTLE_S
+            (ts, zid, eid) for ts, zid, eid in self._all_events if now_ts - ts < 2 * EVENT_SETTLE_S
         ]
 
     def _compression_floor_w(self, active: list, parked_ids: set[str]) -> float:
@@ -823,27 +1021,8 @@ class AdaptiveComfortRuntime:
         )
 
     def _update_estimators(self, now_ts: float, local_hour: float) -> None:
-        # Continuous AC power estimate and per-zone allocation.
+        # p_ac / starts already refreshed by _sample_power on this tick.
         active = [z for z in self.zones.values() if z.is_on]
-        self.p_ac = None
-        if self.p_load is not None:
-            if active:
-                self.p_ac = power.estimate_ac_power(self.p_load, self.baseline.value(local_hour))
-            else:
-                self.p_ac = 0.0
-        # Always count starts from the electrical record when we have a reading.
-        # (A prior draft only updated in the idle branch — starts never fired.)
-        parked_ids = set(self.controller_state.zone_parked_since)
-        self._last_state_key = power.control_state_key(
-            any(z.config.zone_id not in parked_ids for z in active),
-            any(z.config.zone_id in parked_ids for z in active),
-        )
-        self.starts.update(
-            now_ts,
-            self.p_ac,
-            self._last_state_key,
-            floor_w=self._compression_floor_w(active, parked_ids),
-        )
         allocations: dict[str, float] = {}
         if self.p_ac and active:
             mode = MODE_HEAT if any(z.head_state == STATE_HEATING for z in active) else MODE_COOL
@@ -861,6 +1040,7 @@ class AdaptiveComfortRuntime:
         for zone in self.zones.values():
             zone.allocated_w = allocations.get(zone.config.zone_id, 0.0)
 
+        self._conditioning_fit_refreshed = False
         total_sensible = 0.0
         total_latent = 0.0
         for zone in self.zones.values():
@@ -871,13 +1051,16 @@ class AdaptiveComfortRuntime:
 
         # Park duty/extraction on the 60 s tick (debounced electrically), not
         # gated behind the 5 min thermal fit.
-        self._update_park_learners(now_ts)
+        self._update_park_learners(now_ts, local_hour)
 
-        # Empirical COP table by active head count (and by outdoor band, to
-        # separate head-count physics from weather: three-head samples cluster
-        # in hot afternoons and single-head samples in mild nights, so the
-        # unbanded table conflates the two).
-        if self.p_ac and self.p_ac > HOUSE_COP_MIN_POWER_W and active:
+        # House COP only when at least one *conditioning* zone refreshed
+        # sensible this tick (free-float zeros must not reopen 60 s sampling).
+        if (
+            self._conditioning_fit_refreshed
+            and self.p_ac
+            and self.p_ac > HOUSE_COP_MIN_POWER_W
+            and active
+        ):
             n_heads = sum(z.config.n_rooms for z in active)
             house_cop = (total_sensible + total_latent) / self.p_ac
             if 0.3 <= house_cop <= 8.0:
@@ -945,6 +1128,7 @@ class AdaptiveComfortRuntime:
                     outdoor_exhaust_on=zone.outdoor_exhaust_on,
                 )
             zone.sensible_w = 0.0
+            zone.sensible_ts = now_ts
             zone.latent_w = 0.0
             self._update_moisture_baseline(zone, dt_h)
             return
@@ -994,6 +1178,8 @@ class AdaptiveComfortRuntime:
                     local_hour,
                     zone.door_open,
                     t_house,
+                    indoor_fans_on=zone.indoor_fans_on,
+                    outdoor_exhaust_on=zone.outdoor_exhaust_on,
                 )
         zone.sensible_w = zone.model.sensible_power_w(
             smoothed,
@@ -1005,17 +1191,24 @@ class AdaptiveComfortRuntime:
             indoor_fans_on=zone.indoor_fans_on,
             outdoor_exhaust_on=zone.outdoor_exhaust_on,
         )
+        zone.sensible_ts = now_ts
         zone.latent_w = self._latent_power(zone, dt_h)
+        self._conditioning_fit_refreshed = True
 
-    def _update_park_learners(self, now_ts: float) -> None:
+    def _update_park_learners(self, now_ts: float, local_hour: float) -> None:
         """Feed parked-zone learners once per control tick.
 
         Activity (compression vs coast) is judged electrically with a
         PARK_DUTY_DEBOUNCE_S settle so brief meter blips do not flip duty.
         Extraction magnitude reuses the latest thermal sensible_w (updated on
-        the 5 min fit); when coasting it is forced to zero.
+        the 5 min fit); stale values from before park entry are skipped so
+        honest p_ac cannot promote an idler via frozen full-conditioning W.
         """
+        if self.manual_control:
+            # Not commanding: never attribute user/remote setpoints to park learning.
+            return
         parked_ids = set(self.controller_state.zone_parked_since)
+        park_pac = self._park_p_ac(local_hour)
         for zone in self.zones.values():
             zid = zone.config.zone_id
             parked_since = self.controller_state.zone_parked_since.get(zid)
@@ -1024,12 +1217,18 @@ class AdaptiveComfortRuntime:
                 continue
             if now_ts - parked_since < PARK_OBS_DELAY_S:
                 continue
+            # Skip observations whose sensible predates this park or is older
+            # than one fit step (head idle freezes the fit refresh).
+            if (
+                zone.sensible_ts is None
+                or zone.sensible_ts < parked_since
+                or now_ts - zone.sensible_ts > FIT_STEP_S
+            ):
+                continue
             if zone.head_state == STATE_HEATING or self.controller_state.mode == MODE_HEAT:
                 raw_extraction = max(0.0, zone.sensible_w)
             else:
                 raw_extraction = max(0.0, -zone.sensible_w)
-            # Sensed-room extraction; ParkEstimator / trickle thresholds are
-            # per-head. Electrical floor scales with mirrored head count.
             n_heads = zone.config.n_rooms
             solo = not any(
                 other.is_on
@@ -1037,10 +1236,14 @@ class AdaptiveComfortRuntime:
                 and other.config.zone_id not in parked_ids
                 for other in self.zones.values()
             )
-            if solo and self.p_ac is not None:
+            if solo:
+                if park_pac is None:
+                    # Unknown baseline slot: do not fall through to thermal-only
+                    # activity (would invent compression from stale sensible).
+                    continue
                 settled = zone.park_power.settle(
                     now_ts,
-                    self.p_ac,
+                    park_pac,
                     floor_w=park.fan_floor_w(
                         n_heads, per_head_w=self.settings.fan_floor_per_head_w
                     ),
@@ -1052,7 +1255,7 @@ class AdaptiveComfortRuntime:
             else:
                 zone.park_power.reset()
                 extraction, active = park.gate_observation(
-                    self.p_ac,
+                    park_pac,
                     solo,
                     raw_extraction,
                     n_heads=n_heads,
@@ -1071,9 +1274,12 @@ class AdaptiveComfortRuntime:
             return
         dw_dt = (latest[1] - earlier) / (FIT_STEP_S / 3600.0)
         w_out = self._outdoor_humidity_ratio()
+        outdoor_flow = zone.model.outdoor_airflow_m3h(
+            zone.door_open, outdoor_exhaust_on=zone.outdoor_exhaust_on
+        )
         infiltration = 0.0
         if w_out is not None:
-            infiltration = psychro.AIR_DENSITY_KG_M3 * zone.model.airflow_m3h * (w_out - latest[1])
+            infiltration = psychro.AIR_DENSITY_KG_M3 * outdoor_flow * (w_out - latest[1])
         storage = psychro.AIR_DENSITY_KG_M3 * zone.config.sensed_room.volume_m3 * dw_dt
         sources = max(0.0, storage - infiltration)
         zone.moisture_sources_kg_h += 0.05 * (sources - zone.moisture_sources_kg_h)
@@ -1093,9 +1299,12 @@ class AdaptiveComfortRuntime:
             return 0.0
         dw_dt = (latest[1] - earlier) / (FIT_STEP_S / 3600.0)
         w_out = self._outdoor_humidity_ratio()
+        outdoor_flow = zone.model.outdoor_airflow_m3h(
+            zone.door_open, outdoor_exhaust_on=zone.outdoor_exhaust_on
+        )
         removed = psychro.moisture_removal_kg_h(
             zone.config.sensed_room.volume_m3,
-            zone.model.airflow_m3h,
+            outdoor_flow,
             latest[1],
             w_out if w_out is not None else latest[1],
             dw_dt,
@@ -1107,7 +1316,7 @@ class AdaptiveComfortRuntime:
 
     def _build_snapshot(self, now_ts: float, local_hour: float) -> HouseSnapshot:
         zone_snaps: list[ZoneSnapshot] = []
-        forecast = self.forecast or ([self.t_out] * FORECAST_HOURS if self.t_out else [])
+        forecast = self._effective_forecast(now_ts)
         volume_readings = self._volume_readings()
         aux_readings = self._aux_volume_readings()
         for zone in self.zones.values():
@@ -1180,6 +1389,7 @@ class AdaptiveComfortRuntime:
             settings=self.settings,
             zones=zone_snaps,
             t_out=self.t_out,
+            t_out_synthetic=self._t_out_synthetic,
             t_rm=self.t_rm,
             house_occupied=self.house_occupied,
             p_grid=self.p_grid,
@@ -1193,7 +1403,81 @@ class AdaptiveComfortRuntime:
             aux_indoor=tuple(aux_indoor),
         )
 
-    async def _async_control(self, now_ts: float, local_hour: float) -> None:
+    def reset_track_deltas(self) -> None:
+        """Clear sticky tracking depth (Manual enter / house vacant→occupied)."""
+        self.controller_state.zone_track_delta.clear()
+
+    def _clear_park_sessions(self) -> None:
+        """Drop in-flight parks (Manual enter — not commanding)."""
+        from .core.controller import _clear_park_session
+
+        now = time.time()
+        for zid in list(self.controller_state.zone_parked_since):
+            # zone=None: drop session without charging probe spacing.
+            _clear_park_session(self.controller_state, zid, None, now)
+
+    def set_preset(self, preset: str) -> None:
+        """Apply a climate preset; Manual clears track/park and remembers prior preset."""
+        prev = self.settings.preset
+        if preset == PRESET_MANUAL and prev != PRESET_MANUAL:
+            self._preset_before_manual = prev if prev != PRESET_MANUAL else PRESET_NONE
+            self.settings.preset = PRESET_MANUAL
+            self.reset_track_deltas()
+            self._clear_park_sessions()
+            return
+        if prev == PRESET_MANUAL and preset != PRESET_MANUAL:
+            # Leaving Manual via climate preset picker — honour the requested preset.
+            self.settings.preset = preset
+            return
+        self.settings.preset = preset
+
+    def clear_manual(self) -> None:
+        """Exit Manual via the switch, restoring the pre-Manual preset."""
+        if not self.manual_control:
+            return
+        restored = self._preset_before_manual or PRESET_NONE
+        if restored == PRESET_MANUAL:
+            restored = PRESET_NONE
+        self.settings.preset = restored
+
+    @property
+    def manual_control(self) -> bool:
+        return self.settings.preset == PRESET_MANUAL
+
+    @property
+    def effective_preset(self) -> str:
+        return comfort.effective_preset(self.settings, self.house_occupied)
+
+    def zone_want(self, zone: ZoneRuntime) -> str:
+        """Controller desire for this zone (demand/helper/off) from last tick."""
+        return (self.last_diag.get("want") or {}).get(zone.config.zone_id, "off")
+
+    async def _async_apply_zone_disable_edges(self) -> None:
+        """On zone_enabled false edge, emit Off once (do not spam while disabled)."""
+        for zid, zone in self.zones.items():
+            enabled = self.settings.zone_enabled.get(zid, True)
+            prev = self._prev_zone_enabled.get(zid, True)
+            if prev and not enabled:
+                from .core.controller import _clear_park_session
+
+                _clear_park_session(self.controller_state, zid, None, time.time())
+                await self._async_execute(
+                    Command(zone_id=zid, hvac_mode=MODE_OFF, reason="disabled")
+                )
+                zone.last_control_reason = "disabled"
+            self._prev_zone_enabled[zid] = enabled
+
+    async def _async_control(
+        self, now_ts: float, local_hour: float, *, skip_if_busy: bool = False
+    ) -> None:
+        # React: skip if tick holds the lock (stale queued shed is worse).
+        # Tick: await the lock normally.
+        if skip_if_busy and self._control_lock.locked():
+            return
+        async with self._control_lock:
+            await self._async_control_locked(now_ts, local_hour)
+
+    async def _async_control_locked(self, now_ts: float, local_hour: float) -> None:
         snapshot = self._build_snapshot(now_ts, local_hour)
         decision = controller.tick(snapshot, self.controller_state)
         self.last_diag = decision.diag
@@ -1211,11 +1495,20 @@ class AdaptiveComfortRuntime:
             if zone is not None:
                 zone.last_control_reason = command.reason
         self._update_free_float_bias(snapshot)
+        if self.manual_control:
+            # Still force children off when hub HVAC is Off; otherwise hands-off.
+            if self.settings.hvac_mode == MODE_OFF:
+                for command in decision.commands:
+                    if command.hvac_mode == MODE_OFF:
+                        await self._async_execute(command)
+            return
         for command in decision.commands:
             await self._async_execute(command)
 
     def zone_control_state(self, zone: ZoneRuntime) -> str:
-        """Coarse per-zone role for history charts."""
+        """Coarse per-zone action for history charts (what we commanded/held)."""
+        if self.manual_control and self.settings.hvac_mode != MODE_OFF:
+            return "manual"
         zid = zone.config.zone_id
         st = self.controller_state
         if zid in st.shed:
@@ -1274,6 +1567,7 @@ class AdaptiveComfortRuntime:
         zone = self.zones.get(command.zone_id)
         if zone is None:
             return
+        park_expressed = False
         for head in zone.config.heads:
             state = self.hass.states.get(head)
             if state is None:
@@ -1305,6 +1599,7 @@ class AdaptiveComfortRuntime:
                 maximum = state.attributes.get("max_temp", 30.0)
                 internal = state.attributes.get("current_temperature")
                 if command.park and isinstance(internal, (int, float)):
+                    park_expressed = True
                     margin = command.park_margin or controller.PARK_MARGIN_K
                     # Park: ride just above the internal reading, keeping the
                     # compressor mode, so the device's own above-setpoint
@@ -1316,8 +1611,7 @@ class AdaptiveComfortRuntime:
                         else float(internal) - margin
                     )
                 elif command.park:
-                    # No usable internal reading: a park command cannot be
-                    # expressed safely; leave the head as-is this tick.
+                    # This head has no internal reading; try sibling heads.
                     continue
                 elif command.track_delta is not None and isinstance(internal, (int, float)):
                     # Tracking control: anchor to the live internal reading so
@@ -1336,7 +1630,14 @@ class AdaptiveComfortRuntime:
                     # missing internal reading, or tracking disabled).
                     offset = zone.drift[head].offset(active)
                     raw = (command.setpoint or self.settings.target) + offset
-                setpoint = controller.quantize_setpoint(raw, float(minimum), float(maximum))
+                step = state.attributes.get("target_temp_step", 0.5)
+                try:
+                    step_f = float(step) if step is not None else 0.5
+                except (TypeError, ValueError):
+                    step_f = 0.5
+                setpoint = controller.quantize_setpoint(
+                    raw, float(minimum), float(maximum), step=step_f
+                )
                 if state.state != command.hvac_mode:
                     await self.hass.services.async_call(
                         "climate",
@@ -1352,6 +1653,12 @@ class AdaptiveComfortRuntime:
                 )
             except Exception:
                 _LOGGER.exception("Failed to command %s", head)
+        if command.park and not park_expressed:
+            # No head could express the park — drop session so the learner does
+            # not attribute observations to a park that never executed.
+            from .core.controller import _clear_park_session
+
+            _clear_park_session(self.controller_state, command.zone_id, None, time.time())
 
     # -- entity-facing helpers ------------------------------------------------------
 

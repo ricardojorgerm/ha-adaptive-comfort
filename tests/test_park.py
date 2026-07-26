@@ -503,6 +503,13 @@ def test_observed_probe_charges_budget():
     assert "sat" not in state.zone_last_park_abort
 
 
+def test_park_ok_now_keep_temp_only():
+    hot = make_zone("hot", 27.0)
+    ok = make_zone("ok", 23.0)
+    assert controller._park_ok_now(hot, 21.8, 23.2, MODE_COOL) is False
+    assert controller._park_ok_now(ok, 21.8, 23.2, MODE_COOL) is True
+
+
 def test_runout_zone_parks_for_free_observation():
     """A zone wanting off but blocked by min_on parks (no sibling needed, no
     probe budget): the compressor runs regardless, so observation is free.
@@ -519,6 +526,19 @@ def test_runout_zone_parks_for_free_observation():
     assert cmd is not None and cmd.park is True
     assert "z1" in state.zone_parked_since
     assert "z1" not in state.zone_park_probe_entry  # free: no budget involved
+
+
+def test_runout_does_not_park_while_still_hot():
+    """Unfinished pull-down: mode idle + min_on must not park-coast a hot room."""
+    zone = make_zone("z1", 27.0, is_on=True, head_mode=MODE_COOL)
+    zone.free_float = tuple([22.5] * 24)  # mode drops idle; room still hot
+    state = ControllerState(mode=MODE_COOL, mode_since=0.0)
+    state.zone_on["z1"] = True
+    state.zone_since["z1"] = NOW - 300.0
+    decision = tick([zone], state)
+    assert "z1" not in state.zone_parked_since
+    cmd = find_cmd(decision, "z1")
+    assert cmd is None or cmd.park is False
 
 
 def test_runout_park_survives_probe_window_while_min_on_blocks():

@@ -22,11 +22,18 @@ async def async_setup_entry(
     async_add_entities: AddConfigEntryEntitiesCallback,
 ) -> None:
     runtime: AdaptiveComfortRuntime = hass.data[DOMAIN][entry.entry_id]
-    async_add_entities([SheddingActiveSensor(runtime), WindowSuggestionSensor(runtime)])
+    async_add_entities(
+        [
+            SheddingActiveSensor(runtime),
+            WindowSuggestionSensor(runtime),
+            HouseOccupiedSensor(runtime),
+        ]
+    )
     for zone in runtime.zones.values():
         async_add_entities(
             [
                 ZoneConditioningSensor(runtime, zone),
+                ZoneOccupiedSensor(runtime, zone),
                 ZoneShedSensor(runtime, zone),
                 ZoneWindowSuggestionSensor(runtime, zone),
             ],
@@ -52,6 +59,32 @@ class SheddingActiveSensor(AdaptiveComfortEntity, BinarySensorEntity):
             zid: self.runtime.zones[zid].config.name for zid in shed if zid in self.runtime.zones
         }
         return {"shed_zones": list(names.values())}
+
+
+class HouseOccupiedSensor(AdaptiveComfortEntity, BinarySensorEntity):
+    _attr_translation_key = "house_occupied"
+    _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, runtime: AdaptiveComfortRuntime) -> None:
+        super().__init__(runtime, "house_occupied")
+
+    @property
+    def is_on(self) -> bool | None:
+        return self.runtime.house_occupied
+
+
+class ZoneOccupiedSensor(AdaptiveComfortZoneEntity, BinarySensorEntity):
+    _attr_translation_key = "zone_occupied"
+    _attr_device_class = BinarySensorDeviceClass.OCCUPANCY
+    _attr_entity_category = EntityCategory.DIAGNOSTIC
+
+    def __init__(self, runtime: AdaptiveComfortRuntime, zone) -> None:
+        super().__init__(runtime, zone, "occupied")
+
+    @property
+    def is_on(self) -> bool | None:
+        return self.zone.occupied
 
 
 class ZoneConditioningSensor(AdaptiveComfortZoneEntity, BinarySensorEntity):

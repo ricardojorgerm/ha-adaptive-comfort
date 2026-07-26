@@ -238,6 +238,25 @@ class ThermalModel:
     def airflow_m3h(self) -> float:
         return self.ach * self.volume_m3
 
+    def outdoor_airflow_m3h(
+        self,
+        door_open: bool = False,
+        *,
+        outdoor_exhaust_on: bool = False,
+    ) -> float:
+        """Outdoor-exchange volume flow (m³/h) — for moisture coupling to outdoor w.
+
+        House-mixing (`k_mix`) exchanges indoor air with other rooms, not outdoor
+        humidity; using total ACH here inflated latent removal and moisture
+        baselines.
+        """
+        k_out, _k_mix = self._scaled_k(
+            door_open,
+            indoor_fans_on=False,
+            outdoor_exhaust_on=outdoor_exhaust_on,
+        )
+        return k_out * self.volume_m3
+
     @property
     def ua_w_per_k(self) -> float:
         return AIR_HEAT_WH_M3K * self.k(False) * self.volume_m3
@@ -245,6 +264,34 @@ class ThermalModel:
     @property
     def ua_mix_w_per_k(self) -> float:
         return AIR_HEAT_WH_M3K * self.k_mix(False) * self.volume_m3
+
+    def ua_out_w_per_k(
+        self,
+        door_open: bool = False,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
+    ) -> float:
+        k_out, _ = self._scaled_k(
+            door_open,
+            indoor_fans_on=indoor_fans_on,
+            outdoor_exhaust_on=outdoor_exhaust_on,
+        )
+        return AIR_HEAT_WH_M3K * k_out * self.volume_m3
+
+    def ua_mix_scaled_w_per_k(
+        self,
+        door_open: bool = False,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
+    ) -> float:
+        _k_out, k_mix = self._scaled_k(
+            door_open,
+            indoor_fans_on=indoor_fans_on,
+            outdoor_exhaust_on=outdoor_exhaust_on,
+        )
+        return AIR_HEAT_WH_M3K * k_mix * self.volume_m3
 
     @property
     def c_air_wh_per_k(self) -> float:
@@ -347,6 +394,9 @@ class ThermalModel:
         door_open: bool = False,
         t_house_other: float | None = None,
         alpha: float = 0.05,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
     ) -> None:
         if p_ac_w < 50.0:
             return
@@ -354,10 +404,19 @@ class ThermalModel:
         denom = dtdt_per_h - self.q_hat(local_hour, door_open)
         if abs(denom) < 0.1:
             return
+        ua_out = self.ua_out_w_per_k(
+            door_open,
+            indoor_fans_on=indoor_fans_on,
+            outdoor_exhaust_on=outdoor_exhaust_on,
+        )
         mix_w = 0.0
         if t_house_other is not None:
-            mix_w = self.ua_mix_w_per_k * (t_house_other - t_in)
-        c_est = (q_hvac + self.ua_w_per_k * (t_out - t_in) + mix_w) / denom
+            mix_w = self.ua_mix_scaled_w_per_k(
+                door_open,
+                indoor_fans_on=indoor_fans_on,
+                outdoor_exhaust_on=outdoor_exhaust_on,
+            ) * (t_house_other - t_in)
+        c_est = (q_hvac + ua_out * (t_out - t_in) + mix_w) / denom
         factor = c_est / self.c_air_wh_per_k
         if not (FURNITURE_MIN <= factor <= FURNITURE_MAX):
             return

@@ -163,6 +163,21 @@
     }
   },
   "entity": {
+    "climate": {
+      "house_climate": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "none": "None",
+              "eco": "Eco",
+              "away": "Away",
+              "boost": "Boost",
+              "manual": "Manual"
+            }
+          }
+        }
+      }
+    },
     "sensor": {
       "house_load": { "name": "House load" },
       "ac_power_estimate": { "name": "Estimated AC power" },
@@ -172,6 +187,16 @@
       "dominant_mode": {
         "name": "Dominant mode",
         "state": { "off": "Off", "heat": "Heat", "cool": "Cool" }
+      },
+      "effective_preset": {
+        "name": "Effective preset",
+        "state": {
+          "none": "None",
+          "eco": "Eco",
+          "away": "Away",
+          "boost": "Boost",
+          "manual": "Manual"
+        }
       },
       "free_float_bias": { "name": "Free-float bias" },
       "warm_excess": { "name": "Predicted warm excess" },
@@ -206,8 +231,12 @@
       "zone_confidence": { "name": "Fit confidence" },
       "allocated_power": { "name": "Allocated AC power" },
       "head_internal_temp": { "name": "Head internal temperature" },
+      "zone_want": {
+        "name": "Want",
+        "state": { "off": "Off", "demand": "Demand", "helper": "Helper" }
+      },
       "control_state": {
-        "name": "Control state",
+        "name": "Action",
         "state": {
           "off": "Off",
           "demand": "Demand",
@@ -216,7 +245,8 @@
           "runout": "Run-out",
           "fan_assist": "Fan assist",
           "shed": "Shed",
-          "conditioning": "Conditioning"
+          "conditioning": "Conditioning",
+          "manual": "Manual"
         }
       },
       "track_delta": { "name": "Tracking depth" },
@@ -229,7 +259,9 @@
     },
     "binary_sensor": {
       "shedding_active": { "name": "Shedding active" },
+      "house_occupied": { "name": "House occupied" },
       "conditioning_active": { "name": "Conditioning" },
+      "zone_occupied": { "name": "Zone occupied" },
       "zone_shed": { "name": "Shed" },
       "window_suggestion": { "name": "Open windows suggested" },
       "zone_window_suggestion": { "name": "Open window suggested" }
@@ -255,6 +287,7 @@
       "auto_regime": { "name": "Automatic regime (ventilate / continuous / cycling)" },
       "night_ventilate": { "name": "Night outdoor gating (prefer free cooling overnight)" },
       "window_suggest": { "name": "Wait for manual ventilation" },
+      "manual_control": { "name": "Manual control (pause adaptive)" },
       "zone_enabled": { "name": "Zone enabled" }
     }
   }

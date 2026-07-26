@@ -6,7 +6,7 @@ Self-learning whole-home thermostat for Home Assistant. Coordinates multiple AC 
 
 ## Features
 
-- **One house climate entity** — set target, mode (off/heat/cool/auto), and presets (eco/away/boost); the integration drives your existing AC `climate` entities.
+- **One house climate entity** — set target, mode (off/heat/cool/auto), and presets (eco/away/boost/manual); the integration drives your existing AC `climate` entities.
 - **Minimal configuration** — only room floor areas are required model inputs; everything else (UA, capacitance, air exchange, COP, latent load) is inferred.
 - **Multi-split aware** — all heads share one HVAC mode; optional fan assist for opposite-demand zones (respects wet-coil latent penalty).
 - **Model-driven mode selection** — predicts free-float drift instead of outdoor-temperature hysteresis; works from cold start with sensible priors and Lisbon climatology fallback.
@@ -48,7 +48,7 @@ Add one zone per climatized area. Each zone can include **one or more AC heads**
 
 For each head you enter the **room area in m²** separately — areas are **not summed**. A zone with two 12 m² rooms is modeled as two small rooms, not one 24 m² room.
 
-Optional per zone: external temperature sensor, humidity, door, presence.
+Optional per zone: external temperature sensor, humidity, door, presence, indoor circulation fans, outdoor exhaust fans.
 
 ### 3. Unconditioned rooms (subentries)
 
@@ -76,12 +76,20 @@ Add bathrooms, hallways, etc. for whole-house volume and humidity accounting. An
 | `sensor.*_dominant_mode` | Current arbitration mode (off/heat/cool) |
 | `binary_sensor.*_window_suggestion` | Open windows suggested (with zone names attribute) |
 | `binary_sensor.*_shedding_active` | Load shedding in progress |
-| Switches | Coordination, presence adaptation, shedding, fan assist, window suggest |
-| Numbers | Comfort band, min on/off, contracted kVA, shed thresholds |
+| Switches | Coordination, presence adaptation, shedding, tracking, park learning, auto regime, night ventilate, fan assist, window suggest, manual control |
+| Numbers | Comfort band, adaptive blend, min on/off, contracted kVA, shed thresholds, fan floor per head |
 
 ### Zone devices
 
-Corrected temperature, predicted +60 min, k, ACH, UA, COP, sensible/latent power, drift offset, fit confidence, conditioning/shed/window-suggestion binary sensors, comfort offset, zone enabled.
+Corrected temperature, predicted +60 min, k, ACH, UA, COP, sensible/latent power, drift offset, fit confidence, want/control_state (with park/track attributes), head internal temp, park margin/extraction/classification, conditioning/shed/window-suggestion/occupied binary sensors, comfort offset, zone enabled.
+
+### Regime and parking (summary)
+
+With **auto regime** on, the controller picks `ventilate` / `continuous` / `cycling` from outdoor vs target and standing load. Parking holds a satisfied multi-split head above its internal sensor to learn idle vs trickle behavior (electrically gated); see AGENTS.md for the full semantics.
+
+### Manual preset
+
+**Manual** (climate preset or switch) stops all adaptive actuation — comfort commands, parking, fan assist, and contracted-power shedding — and leaves heads as you set them. Estimators keep learning in the background. Hub HVAC **Off** still force-stops children even under Manual.
 
 ## Optional features
 

@@ -164,23 +164,53 @@
   },
   "entity": {
     "sensor": {
-      "house_load": { "name": "House load" },
-      "ac_power_estimate": { "name": "Estimated AC power" },
-      "power_headroom": { "name": "Power headroom" },
-      "outdoor_effective": { "name": "Outdoor temperature (effective)" },
-      "outdoor_running_mean": { "name": "Outdoor running mean (7 d)" },
+      "house_load": {
+        "name": "House load"
+      },
+      "ac_power_estimate": {
+        "name": "Estimated AC power"
+      },
+      "power_headroom": {
+        "name": "Power headroom"
+      },
+      "outdoor_effective": {
+        "name": "Outdoor temperature (effective)"
+      },
+      "outdoor_running_mean": {
+        "name": "Outdoor running mean (7 d)"
+      },
       "dominant_mode": {
         "name": "Dominant mode",
-        "state": { "off": "Off", "heat": "Heat", "cool": "Cool" }
+        "state": {
+          "off": "Off",
+          "heat": "Heat",
+          "cool": "Cool"
+        }
       },
-      "free_float_bias": { "name": "Free-float bias" },
-      "warm_excess": { "name": "Predicted warm excess" },
-      "cold_deficit": { "name": "Predicted cold deficit" },
-      "total_sensible": { "name": "Total sensible power" },
-      "total_latent": { "name": "Total latent power" },
-      "house_cop": { "name": "House COP" },
-      "model_confidence": { "name": "Model confidence" },
-      "parked_zones": { "name": "Parked zones" },
+      "free_float_bias": {
+        "name": "Free-float bias"
+      },
+      "warm_excess": {
+        "name": "Predicted warm excess"
+      },
+      "cold_deficit": {
+        "name": "Predicted cold deficit"
+      },
+      "total_sensible": {
+        "name": "Total sensible power"
+      },
+      "total_latent": {
+        "name": "Total latent power"
+      },
+      "house_cop": {
+        "name": "House COP"
+      },
+      "model_confidence": {
+        "name": "Model confidence"
+      },
+      "parked_zones": {
+        "name": "Parked zones"
+      },
       "operating_regime": {
         "name": "Operating regime",
         "state": {
@@ -189,25 +219,59 @@
           "cycling": "Cycling"
         }
       },
-      "compressor_starts_per_hour": { "name": "Compressor starts per hour" },
-      "zone_temperature": { "name": "Temperature (corrected)" },
-      "predicted_60m": { "name": "Predicted temperature +60 min" },
-      "k_exchange": { "name": "Outdoor exchange constant k" },
-      "k_mix": { "name": "House mixing constant k" },
-      "ach": { "name": "Air changes per hour (total)" },
-      "airflow": { "name": "Air-exchange flow" },
-      "ua": { "name": "UA (heat loss coefficient)" },
-      "c_eff": { "name": "Effective capacitance" },
-      "furniture_factor": { "name": "Furniture factor" },
-      "zone_cop": { "name": "COP" },
-      "sensible_power": { "name": "Sensible power" },
-      "latent_power": { "name": "Latent power" },
-      "drift_offset": { "name": "Sensor drift offset" },
-      "zone_confidence": { "name": "Fit confidence" },
-      "allocated_power": { "name": "Allocated AC power" },
-      "head_internal_temp": { "name": "Head internal temperature" },
+      "compressor_starts_per_hour": {
+        "name": "Compressor starts per hour"
+      },
+      "zone_temperature": {
+        "name": "Temperature (corrected)"
+      },
+      "predicted_60m": {
+        "name": "Predicted temperature +60 min"
+      },
+      "k_exchange": {
+        "name": "Outdoor exchange constant k"
+      },
+      "k_mix": {
+        "name": "House mixing constant k"
+      },
+      "ach": {
+        "name": "Air changes per hour (total)"
+      },
+      "airflow": {
+        "name": "Air-exchange flow"
+      },
+      "ua": {
+        "name": "UA (heat loss coefficient)"
+      },
+      "c_eff": {
+        "name": "Effective capacitance"
+      },
+      "furniture_factor": {
+        "name": "Furniture factor"
+      },
+      "zone_cop": {
+        "name": "COP"
+      },
+      "sensible_power": {
+        "name": "Sensible power"
+      },
+      "latent_power": {
+        "name": "Latent power"
+      },
+      "drift_offset": {
+        "name": "Sensor drift offset"
+      },
+      "zone_confidence": {
+        "name": "Fit confidence"
+      },
+      "allocated_power": {
+        "name": "Allocated AC power"
+      },
+      "head_internal_temp": {
+        "name": "Head internal temperature"
+      },
       "control_state": {
-        "name": "Control state",
+        "name": "Action",
         "state": {
           "off": "Off",
           "demand": "Demand",
@@ -216,46 +280,147 @@
           "runout": "Run-out",
           "fan_assist": "Fan assist",
           "shed": "Shed",
-          "conditioning": "Conditioning"
+          "conditioning": "Conditioning",
+          "manual": "Manual"
         }
       },
-      "track_delta": { "name": "Tracking depth" },
+      "track_delta": {
+        "name": "Tracking depth"
+      },
       "park_classification": {
         "name": "Park classification",
-        "state": { "unknown": "Unknown", "idle": "Idle", "trickle": "Trickle" }
+        "state": {
+          "unknown": "Unknown",
+          "idle": "Idle",
+          "trickle": "Trickle"
+        }
       },
-      "park_margin": { "name": "Park margin" },
-      "park_extraction": { "name": "Park extraction" }
+      "park_margin": {
+        "name": "Park margin"
+      },
+      "park_extraction": {
+        "name": "Park extraction"
+      },
+      "effective_preset": {
+        "name": "Effective preset",
+        "state": {
+          "none": "None",
+          "eco": "Eco",
+          "away": "Away",
+          "boost": "Boost",
+          "manual": "Manual"
+        }
+      },
+      "zone_want": {
+        "name": "Want",
+        "state": {
+          "off": "Off",
+          "demand": "Demand",
+          "helper": "Helper"
+        }
+      }
     },
     "binary_sensor": {
-      "shedding_active": { "name": "Shedding active" },
-      "conditioning_active": { "name": "Conditioning" },
-      "zone_shed": { "name": "Shed" },
-      "window_suggestion": { "name": "Open windows suggested" },
-      "zone_window_suggestion": { "name": "Open window suggested" }
+      "shedding_active": {
+        "name": "Shedding active"
+      },
+      "conditioning_active": {
+        "name": "Conditioning"
+      },
+      "zone_shed": {
+        "name": "Shed"
+      },
+      "window_suggestion": {
+        "name": "Open windows suggested"
+      },
+      "zone_window_suggestion": {
+        "name": "Open window suggested"
+      },
+      "house_occupied": {
+        "name": "House occupied"
+      },
+      "zone_occupied": {
+        "name": "Zone occupied"
+      }
     },
     "number": {
-      "band": { "name": "Comfort band (±)" },
-      "min_on": { "name": "Minimum runtime" },
-      "min_off": { "name": "Minimum off time" },
-      "contracted_kva": { "name": "Contracted power" },
-      "shed_start": { "name": "Shed start threshold" },
-      "shed_restore": { "name": "Shed restore threshold" },
-      "adaptive_blend": { "name": "Seasonal adaptation weight" },
-      "comfort_offset": { "name": "Comfort offset" },
-      "fan_floor_per_head": { "name": "Fan floor per open head" }
+      "band": {
+        "name": "Comfort band (±)"
+      },
+      "min_on": {
+        "name": "Minimum runtime"
+      },
+      "min_off": {
+        "name": "Minimum off time"
+      },
+      "contracted_kva": {
+        "name": "Contracted power"
+      },
+      "shed_start": {
+        "name": "Shed start threshold"
+      },
+      "shed_restore": {
+        "name": "Shed restore threshold"
+      },
+      "adaptive_blend": {
+        "name": "Seasonal adaptation weight"
+      },
+      "comfort_offset": {
+        "name": "Comfort offset"
+      },
+      "fan_floor_per_head": {
+        "name": "Fan floor per open head"
+      }
     },
     "switch": {
-      "coordination": { "name": "Multi-split coordination" },
-      "presence_adaptation": { "name": "Presence adaptation" },
-      "shedding_enabled": { "name": "Power shedding" },
-      "fan_assist": { "name": "Fan assist (opposite-demand zones)" },
-      "tracking": { "name": "Tracking setpoint control" },
-      "park_learning": { "name": "Park-behavior learning" },
-      "auto_regime": { "name": "Automatic regime (ventilate / continuous / cycling)" },
-      "night_ventilate": { "name": "Night outdoor gating (prefer free cooling overnight)" },
-      "window_suggest": { "name": "Wait for manual ventilation" },
-      "zone_enabled": { "name": "Zone enabled" }
+      "coordination": {
+        "name": "Multi-split coordination"
+      },
+      "presence_adaptation": {
+        "name": "Presence adaptation"
+      },
+      "shedding_enabled": {
+        "name": "Power shedding"
+      },
+      "fan_assist": {
+        "name": "Fan assist (opposite-demand zones)"
+      },
+      "tracking": {
+        "name": "Tracking setpoint control"
+      },
+      "park_learning": {
+        "name": "Park-behavior learning"
+      },
+      "auto_regime": {
+        "name": "Automatic regime (ventilate / continuous / cycling)"
+      },
+      "night_ventilate": {
+        "name": "Night outdoor gating (prefer free cooling overnight)"
+      },
+      "window_suggest": {
+        "name": "Wait for manual ventilation"
+      },
+      "zone_enabled": {
+        "name": "Zone enabled"
+      },
+      "manual_control": {
+        "name": "Manual control (pause adaptive)"
+      }
+    },
+    "climate": {
+      "house_climate": {
+        "state_attributes": {
+          "preset_mode": {
+            "state": {
+              "none": "None",
+              "eco": "Eco",
+              "away": "Away",
+              "boost": "Boost",
+              "manual": "Manual"
+            }
+          }
+        }
+      }
     }
   }
 }
