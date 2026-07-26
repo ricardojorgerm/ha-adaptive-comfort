@@ -141,9 +141,12 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   `park_classification`, `parked_zones`, `operating_regime`, `compressor_starts_per_hour`.
 - **Mode integrals include on zones.** `demand_integrals` uses no-AC free-float (including
   while conditioning — `predict_free` is the counterfactual) over `MODE_HORIZON_H` (~8 h),
-  with temp persistence when confidence is low. Enter cool/heat above `MODE_DEADBAND_KH`;
-  hold until below `MODE_EXIT_KH`. Boost beats presence-Away and skips vacant band widen;
-  Away/vacant demand setpoints hold near the band edge (not the comfort center).
+  with temp persistence when confidence is low (for mixed houses). Enter cool/heat above
+  `MODE_DEADBAND_KH`; hold until below `MODE_EXIT_KH` — but seasonal demotion is not
+  re-promoted by the exit hold. With **no** confident free-float yet, arbitration uses
+  `fallback_mode` (outdoor season + indoor deviation), not flat persistence alone — so a
+  winter sunlit room cannot command house cooling. Boost beats presence-Away and skips
+  vacant band widen; Away/vacant demand setpoints hold near the band edge (not center).
 
 ## Control-loop cheatsheet (what happens each 60 s tick)
 

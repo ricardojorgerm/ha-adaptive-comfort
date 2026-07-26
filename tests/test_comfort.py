@@ -158,12 +158,12 @@ def test_emergency_override_beats_dwell():
 
 
 def test_fallback_no_model_hot_room_in_summer():
-    # Cold start: no fitted model — persistence still feeds the model path.
+    # Cold start: no fitted model — seasonal fallback cools a hot summer room.
     zone = make_zone(temp=25.5, confidence=0.0, free_float=())
     snap = make_snapshot([zone], t_rm=23.5)
     state = ControllerState()
     decision = comfort.dominant_mode(snap, state, {"z1": (21.8, 23.2)})
-    assert decision.source == "model"
+    assert decision.source == "fallback"
     assert decision.mode == MODE_COOL
 
 
@@ -172,6 +172,27 @@ def test_fallback_does_not_fight_season_on_small_error():
     zone = make_zone(temp=23.5, confidence=0.0, free_float=())
     snap = make_snapshot([zone], t_rm=12.0)
     state = ControllerState()
+    decision = comfort.dominant_mode(snap, state, {"z1": (21.8, 23.2)})
+    assert decision.mode == MODE_OFF
+
+
+def test_winter_cold_start_does_not_cool_on_persistence():
+    """Regression: flat temp persistence must not command cool in winter."""
+    # 0.4 K over band x 8 h = 3.2 K.h would cross MODE_DEADBAND if treated as model.
+    zone = make_zone(temp=23.6, confidence=0.0, free_float=())
+    snap = make_snapshot([zone], t_rm=9.0)
+    state = ControllerState()
+    decision = comfort.dominant_mode(snap, state, {"z1": (21.8, 23.2)})
+    assert decision.source == "fallback"
+    assert decision.mode == MODE_OFF
+
+
+def test_seasonal_guard_demotes_latched_cool_in_winter():
+    """Exit hysteresis must not re-promote cool after seasonal demotion."""
+    # Room in band now; forecast-only warm free-float would hold via EXIT otherwise.
+    zone = make_zone(temp=22.0, free_float=[24.5] * 24, confidence=0.9)
+    snap = make_snapshot([zone], t_rm=10.0)
+    state = ControllerState(mode=MODE_COOL, mode_since=0.0)
     decision = comfort.dominant_mode(snap, state, {"z1": (21.8, 23.2)})
     assert decision.mode == MODE_OFF
 

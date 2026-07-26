@@ -286,11 +286,11 @@ def _clear_park_session(
     state: ControllerState, zid: str, zone: ZoneSnapshot | None = None, now: float = 0.0
 ) -> None:
     # Probe bookkeeping: the 6 h probe spacing is only charged when the probe
-    # produced at least one observation; a stillborn probe gets the short
-    # retry clock instead, so a killed session cannot lock learning out.
+    # produced at least one observation; a stillborn / unexpressible probe
+    # (zone is None, or no new samples) gets the short retry clock instead.
     entry_samples = state.zone_park_probe_entry.pop(zid, None)
-    if entry_samples is not None and zone is not None:
-        if zone.park_samples > entry_samples:
+    if entry_samples is not None:
+        if zone is not None and zone.park_samples > entry_samples:
             state.zone_last_park_probe[zid] = now
             state.zone_last_park_abort.pop(zid, None)
         else:
@@ -434,15 +434,23 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         for z in zones
     }
 
+    # Coil-wet bookkeeping always (including Manual — remotes may still cool).
+    for zone in zones:
+        if zone.head_state == STATE_COOLING:
+            state.zone_last_cool[zone.zone_id] = now
+
     # Manual: full hands-off — no comfort commands, no shedding, no fan assist.
-    # Compute want/mode for diagnostics, clear park sessions (so park learning
-    # cannot attribute user setpoints), and emit nothing — unless the hub HVAC
-    # mode is Off, which still force-stops children.
+    # Compute want/mode for diagnostics, clear park/shed/fan bookkeeping so
+    # sensors and the react path cannot latch a lie, and emit nothing — unless
+    # the hub HVAC mode is Off, which still force-stops children.
     if s.preset == PRESET_MANUAL:
         diag["manual"] = True
         for zone in zones:
             if zone.zone_id in state.zone_parked_since:
                 _clear_park_session(state, zone.zone_id, zone, now)
+        state.shed.clear()
+        state.zone_fan.clear()
+        state.last_shed_action = 0.0
         if s.hvac_mode != MODE_OFF:
             return Decision([], state, diag, [])
 
@@ -454,12 +462,6 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     # the window_suggest option — open within the grace period, or the
     # compressor proceeds anyway (at its best COP, given the cold outdoors).
     # A hot room is never stranded because nobody was around to open up.
-
-    # Remember when each zone last ran its compressor in cooling: the coil
-    # stays wet for a while and fan-only would re-evaporate condensate.
-    for zone in zones:
-        if zone.head_state == STATE_COOLING:
-            state.zone_last_cool[zone.zone_id] = now
 
     # Window suggestion: when outdoor air would help a room in demand (cooler
     # outdoors for cooling, warmer outdoors for heating) and someone is around

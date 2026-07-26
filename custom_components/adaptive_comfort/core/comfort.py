@@ -348,12 +348,14 @@ def dominant_mode(
             state.mode_since = now
         return ModeDecision(override, "override")
 
-    # Prefer model integrals whenever any zone can contribute (free-float or
-    # temperature persistence). Only fall back when nothing is measurable.
-    has_signal = any(
-        (z.confidence >= MIN_MODEL_CONFIDENCE and z.free_float) or z.temp is not None for z in zones
+    # Model integrals need at least one confident free-float. Flat temperature
+    # persistence alone must not drive cool/heat — in winter a sunlit room
+    # 0.4 K over the band would otherwise cross MODE_DEADBAND_KH and the
+    # seasonal guard cannot demote (max_hot_k > 0 by construction).
+    has_model = any(
+        z.confidence >= MIN_MODEL_CONFIDENCE and z.free_float for z in zones
     )
-    if not has_signal:
+    if not has_model:
         dev = indoor_deviation(zones, bands, snap.aux_indoor)
         mode = fallback_mode(snap.t_rm, state.mode, dev, snap.settings.band_k)
         if mode != state.mode:
@@ -369,23 +371,26 @@ def dominant_mode(
     max_hot_k = _max_present_excess(zones, bands, cool=True)
     max_cold_k = _max_present_excess(zones, bands, cool=False)
 
+    seasonally_demoted = False
     if warm - cold > MODE_DEADBAND_KH:
         desired = MODE_COOL
         # Winter: ignore forecast-only cool when no zone is above the band now.
         if season_heat and (max_hot_k is None or max_hot_k <= 0.0):
             desired = MODE_OFF
+            seasonally_demoted = True
     elif cold - warm > MODE_DEADBAND_KH:
         desired = MODE_HEAT
         # Summer: ignore forecast-only heat when no zone is below the band now.
         if season_cool and (max_cold_k is None or max_cold_k <= 0.0):
             desired = MODE_OFF
+            seasonally_demoted = True
     else:
         desired = MODE_OFF
 
-    # Asymmetric exit: hold cool/heat until excess falls below MODE_EXIT_KH
-    # (applies after seasonal demotion so a latched cool with real warm excess
-    # cannot be forced off by a diluted house-mean guard).
-    if desired == MODE_OFF:
+    # Asymmetric exit: hold cool/heat until excess falls below MODE_EXIT_KH.
+    # Do not re-promote a mode the seasonal guard just demoted (otherwise a
+    # latched cool with forecast-only warm excess stays cool all winter).
+    if desired == MODE_OFF and not seasonally_demoted:
         if state.mode == MODE_COOL and warm - cold > MODE_EXIT_KH:
             desired = MODE_COOL
         elif state.mode == MODE_HEAT and cold - warm > MODE_EXIT_KH:

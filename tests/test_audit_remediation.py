@@ -240,7 +240,8 @@ def test_react_runs_on_shed_engage():
     assert AdaptiveComfortRuntime._react_should_run_control(rt)
 
 
-def test_park_learners_skip_stale_sensible():
+def test_park_learners_solo_stale_sensible_still_duty_samples():
+    """Solo parks: electrical gate runs even when sensible is stale (idler path)."""
     from custom_components.adaptive_comfort.coordinator import (
         FIT_STEP_S,
         PARK_OBS_DELAY_S,
@@ -264,18 +265,83 @@ def test_park_learners_skip_stale_sensible():
     zone.sensible_w = -500.0  # stale full-conditioning extraction
     zone.sensible_ts = NOW - FIT_STEP_S - 10.0
     rt = AdaptiveComfortRuntime.__new__(AdaptiveComfortRuntime)
-    rt.settings = Settings()  # not Manual → park learners run
+    rt.settings = Settings()
     rt.controller_state = ControllerState()
     rt.controller_state.zone_parked_since["z"] = NOW - PARK_OBS_DELAY_S - 10.0
     rt.controller_state.zone_park_margin["z"] = 1.0
     rt.controller_state.mode = MODE_COOL
     rt.zones = {"z": zone}
-    rt.p_load = 400.0
+    # Below fan floor → coast: must still observe (extraction 0), not skip.
+    rt.p_load = 50.0
     rt.baseline = power.BaselineModel()
-    rt.baseline.update(12.0, 100.0)  # learned slot → park_pac available
+    rt.baseline.update(12.0, 40.0)
+    # Pre-settle PowerDebounce past PARK_DUTY_DEBOUNCE_S.
+    from custom_components.adaptive_comfort.core import park as park_mod
+
+    floor = park_mod.fan_floor_w(1, per_head_w=rt.settings.fan_floor_per_head_w)
+    pac = power.estimate_ac_power(50.0, 40.0)
+    assert pac is not None and pac < floor
+    zone.park_power.settle(NOW - 120.0, pac, floor_w=floor)
+    zone.park_power.settle(NOW - 60.0, pac, floor_w=floor)
     samples_before = zone.park.samples
     AdaptiveComfortRuntime._update_park_learners(rt, NOW, 12.0)
-    assert zone.park.samples == samples_before  # stale sensible skipped
+    assert zone.park.samples == samples_before + 1
+    assert (zone.park.extraction_w or 0.0) < 60.0
+
+
+def test_park_learners_nonsolo_skips_stale_sensible():
+    from custom_components.adaptive_comfort.coordinator import (
+        FIT_STEP_S,
+        PARK_OBS_DELAY_S,
+        AdaptiveComfortRuntime,
+        ZoneRuntime,
+    )
+    from custom_components.adaptive_comfort.core.types import (
+        STATE_COOLING,
+        ControllerState,
+        RoomConfig,
+        Settings,
+        ZoneConfig,
+    )
+
+    def _zone(zid: str) -> ZoneRuntime:
+        cfg = ZoneConfig(
+            zone_id=zid,
+            name=zid,
+            heads=(f"climate.{zid}",),
+            rooms=(RoomConfig(12.0, 2.5),),
+        )
+        return ZoneRuntime(cfg)
+
+    parked = _zone("park")
+    parked.sensible_w = -500.0
+    parked.sensible_ts = NOW - FIT_STEP_S - 10.0
+    sibling = _zone("sib")
+    sibling.head_state = STATE_COOLING
+    rt = AdaptiveComfortRuntime.__new__(AdaptiveComfortRuntime)
+    rt.settings = Settings()
+    rt.controller_state = ControllerState()
+    rt.controller_state.zone_parked_since["park"] = NOW - PARK_OBS_DELAY_S - 10.0
+    rt.controller_state.mode = MODE_COOL
+    rt.zones = {"park": parked, "sib": sibling}
+    rt.p_load = 900.0
+    rt.baseline = power.BaselineModel()
+    rt.baseline.update(12.0, 100.0)
+    before = parked.park.samples
+    AdaptiveComfortRuntime._update_park_learners(rt, NOW, 12.0)
+    assert parked.park.samples == before
+
+
+def test_clear_park_unexpressible_charges_abort():
+    from custom_components.adaptive_comfort.core.controller import _clear_park_session
+    from custom_components.adaptive_comfort.core.types import ControllerState
+
+    state = ControllerState()
+    state.zone_parked_since["z"] = NOW
+    state.zone_park_probe_entry["z"] = 0
+    _clear_park_session(state, "z", None, NOW + 10.0)
+    assert "z" not in state.zone_parked_since
+    assert state.zone_last_park_abort.get("z") == NOW + 10.0
 
 
 def test_honest_pac_positive_without_active_heads():

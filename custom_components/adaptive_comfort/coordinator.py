@@ -107,6 +107,9 @@ OUTDOOR_LKG_S = 2.0 * 3600.0
 # Moisture baselines learned against (k_out+k_mix) are invalid after the
 # outdoor-only airflow fix; wipe on restore from older schema.
 MOISTURE_SCHEMA = 2
+# House/zone COP learned with inflated latent must be re-fit after outdoor-only
+# airflow; wipe tables and per-zone COP on restore from older schema.
+COP_SCHEMA = 2
 
 
 def _float_state(hass: HomeAssistant, entity_id: str | None) -> float | None:
@@ -551,21 +554,31 @@ class AdaptiveComfortRuntime:
             best = max(persisted, working) if working is not None else persisted
             self.controller_state.zone_park_preferred[zid] = best
             zone.park.preferred_margin_k = best
-        for key, value in data.get("cop_table", {}).items():
-            try:
-                self.cop_table[int(key)] = (float(value[0]), int(value[1]))
-            except (TypeError, ValueError, IndexError):
-                continue
-        for key, value in data.get("cop_table_banded", {}).items():
-            try:
-                self.cop_table_banded[str(key)] = (float(value[0]), int(value[1]))
-            except (TypeError, ValueError, IndexError):
-                continue
-        for key, value in data.get("cop_table_state", {}).items():
-            try:
-                self.cop_table_state[str(key)] = (float(value[0]), int(value[1]))
-            except (TypeError, ValueError, IndexError):
-                continue
+        if int(data.get("cop_schema", 0)) >= COP_SCHEMA:
+            for key, value in data.get("cop_table", {}).items():
+                try:
+                    self.cop_table[int(key)] = (float(value[0]), int(value[1]))
+                except (TypeError, ValueError, IndexError):
+                    continue
+            for key, value in data.get("cop_table_banded", {}).items():
+                try:
+                    self.cop_table_banded[str(key)] = (float(value[0]), int(value[1]))
+                except (TypeError, ValueError, IndexError):
+                    continue
+            for key, value in data.get("cop_table_state", {}).items():
+                try:
+                    self.cop_table_state[str(key)] = (float(value[0]), int(value[1]))
+                except (TypeError, ValueError, IndexError):
+                    continue
+        else:
+            # Inflated-latent COP history is not reusable.
+            self.cop_table.clear()
+            self.cop_table_banded.clear()
+            self.cop_table_state.clear()
+            self.house_cop = None
+            for zone in self.zones.values():
+                zone.model.cop = None
+                zone.model.cop_samples = 0
         if "starts" in data:
             self.starts = power.StartCounter.from_dict(data["starts"])
 
@@ -605,6 +618,7 @@ class AdaptiveComfortRuntime:
             "outdoor_diurnal": self.outdoor_diurnal.to_dict(),
             "controller": self.controller_state.to_dict(),
             "zones": {zid: zone.to_dict() for zid, zone in self.zones.items()},
+            "cop_schema": COP_SCHEMA,
             "cop_table": {str(k): [v[0], v[1]] for k, v in self.cop_table.items()},
             "cop_table_banded": {k: [v[0], v[1]] for k, v in self.cop_table_banded.items()},
             "cop_table_state": {k: [v[0], v[1]] for k, v in self.cop_table_state.items()},
@@ -807,8 +821,9 @@ class AdaptiveComfortRuntime:
         self._sample_house(now_ts, local_hour, dt_h)
         await self._async_refresh_forecast(now_ts)
         self._sample_head_states(now_ts)
-        self._sample_zone_environment(now_ts, local_hour)
+        # Power before environment so baseline learning sees a fresh p_load.
         self._sample_power(now_ts, local_hour)
+        self._sample_zone_environment(now_ts, local_hour)
         self._process_power_events(now_ts)
         self._update_estimators(now_ts, local_hour)
         self._finalize_demand(now_ts)
@@ -851,14 +866,16 @@ class AdaptiveComfortRuntime:
             any(z.config.zone_id not in parked_ids for z in active),
             any(z.config.zone_id in parked_ids for z in active),
         )
-        # Prefer a learned baseline slot for start counting when available.
-        starts_pac = self.p_ac
-        learned = self.baseline.value(local_hour, fallback=False)
-        if self.p_load is not None and learned is not None:
-            starts_pac = power.estimate_ac_power(self.p_load, learned)
-        elif learned is None and self.baseline.value(local_hour) is not None:
-            # Slot unknown: do not invent compression for StartCounter.
-            starts_pac = 0.0 if not active else self.p_ac
+        # StartCounter: never invent compression with no heads open. Prefer a
+        # learned baseline slot when counting starts while heads are active.
+        if not active:
+            starts_pac = 0.0
+        else:
+            learned = self.baseline.value(local_hour, fallback=False)
+            if self.p_load is not None and learned is not None:
+                starts_pac = power.estimate_ac_power(self.p_load, learned)
+            else:
+                starts_pac = self.p_ac
         self.starts.update(
             now_ts,
             starts_pac,
@@ -1217,14 +1234,11 @@ class AdaptiveComfortRuntime:
                 continue
             if now_ts - parked_since < PARK_OBS_DELAY_S:
                 continue
-            # Skip observations whose sensible predates this park or is older
-            # than one fit step (head idle freezes the fit refresh).
-            if (
+            stale_sensible = (
                 zone.sensible_ts is None
                 or zone.sensible_ts < parked_since
                 or now_ts - zone.sensible_ts > FIT_STEP_S
-            ):
-                continue
+            )
             if zone.head_state == STATE_HEATING or self.controller_state.mode == MODE_HEAT:
                 raw_extraction = max(0.0, zone.sensible_w)
             else:
@@ -1250,9 +1264,19 @@ class AdaptiveComfortRuntime:
                 )
                 if settled is None:
                     continue
-                extraction = 0.0 if not settled else max(0.0, raw_extraction)
-                active = settled
+                # Solo: electrical gate is authoritative. Stale thermal magnitude
+                # must not drop the observation (idler classification needs it)
+                # and must not feed frozen full-conditioning watts.
+                if not settled:
+                    extraction, active = 0.0, False
+                elif stale_sensible:
+                    extraction, active = 0.0, True
+                else:
+                    extraction, active = max(0.0, raw_extraction), True
             else:
+                # Non-solo activity is thermal-judged — need a fresh sensible.
+                if stale_sensible:
+                    continue
                 zone.park_power.reset()
                 extraction, active = park.gate_observation(
                     park_pac,

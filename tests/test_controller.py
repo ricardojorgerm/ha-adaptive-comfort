@@ -114,6 +114,23 @@ def test_manual_does_not_shed():
     assert state.shed == {}
 
 
+def test_manual_clears_latched_shed_and_fan_keeps_coil_clock():
+    from custom_components.adaptive_comfort.core.types import PRESET_MANUAL, STATE_COOLING
+
+    settings = Settings(hvac_mode=MODE_AUTO, preset=PRESET_MANUAL, shedding_enabled=True)
+    zone = make_zone("bed", 26.0, is_on=True, head_state=STATE_COOLING)
+    snap = make_snapshot([zone], settings, p_demand=2000.0)
+    state = warmed_state([zone])
+    state.shed["bed"] = NOW - 10.0
+    state.zone_fan["bed"] = True
+    state.last_shed_action = NOW - 5.0
+    decision = controller.tick(snap, state)
+    assert decision.commands == []
+    assert state.shed == {}
+    assert state.zone_fan == {}
+    assert state.zone_last_cool.get("bed") == NOW
+
+
 def test_coordination_spreads_to_helper_zones():
     hot = make_zone("hot", 25.0)
     ok = make_zone("ok", 22.6)
