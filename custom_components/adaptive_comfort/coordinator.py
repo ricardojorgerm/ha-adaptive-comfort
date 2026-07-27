@@ -164,6 +164,8 @@ class ZoneRuntime:
         self.sensible_w = 0.0  # sensed room, signed
         self.sensible_ts: float | None = None  # when sensible_w was last fitted
         self.latent_w = 0.0  # sensed room
+        # Zone-total free-float heat that must be rejected/supplied to hold T (W).
+        self.standing_load_w: float | None = None
         self.park = park.ParkEstimator()
         self.park_power = park.PowerDebounce()
         self.moisture_sources_kg_h = 0.0
@@ -1364,6 +1366,7 @@ class AdaptiveComfortRuntime:
                     pred_60m = trajectory[1]
             zone.free_float = free_float
             zone.pred_60m = pred_60m
+            zone.standing_load_w = self._standing_load_w(zone)
             mode = MODE_HEAT if zone.head_state == STATE_HEATING else MODE_COOL
             zone_snaps.append(
                 ZoneSnapshot(
@@ -1393,7 +1396,7 @@ class AdaptiveComfortRuntime:
                         if zone.head_state == STATE_COOLING
                         else None
                     ),
-                    standing_load_w=self._standing_load_w(zone),
+                    standing_load_w=zone.standing_load_w,
                 )
             )
         cop_hints = {
@@ -1747,6 +1750,12 @@ class AdaptiveComfortRuntime:
                     "sensible_w": z.sensible_w,
                     "latent_w": z.latent_w,
                     "allocated_w": z.allocated_w,
+                    "standing_load_w": (
+                        None if z.standing_load_w is None else round(z.standing_load_w, 1)
+                    ),
+                    "disturbance": z.model.disturbance_diag(
+                        self._local_hour(), z.door_open
+                    ),
                 }
                 for zid, z in self.zones.items()
             },

@@ -196,6 +196,39 @@ class ThermalModel:
             q *= fit.samples / MIN_FIT_SAMPLES
         return q
 
+    def q_coeffs(self, door_open: bool) -> dict[str, float | int] | None:
+        """Raw learned harmonic coefficients for one door regime (no fallback).
+
+        q(t) = a0 + a1·cos(ωt) + b1·sin(ωt) + a2·cos(2ωt) + b2·sin(2ωt),
+        with ω = 2π/24 and t in local hours. Returns None when that regime
+        has never been observed.
+        """
+        fit = self.fits[door_open]
+        if fit.samples == 0 or len(fit.theta) < N_PARAMS:
+            return None
+        th = fit.theta
+        return {
+            "a0": round(float(th[2]), 5),
+            "a1": round(float(th[3]), 5),
+            "b1": round(float(th[4]), 5),
+            "a2": round(float(th[5]), 5),
+            "b2": round(float(th[6]), 5),
+            "samples": int(fit.samples),
+        }
+
+    def disturbance_diag(self, local_hour: float, door_open: bool = False) -> dict:
+        """Diagnostics for the learned diurnal disturbance q(t)."""
+        q = self.q_hat(local_hour, door_open)
+        return {
+            "q_hat_k_per_h": round(q, 5),
+            "q_hat_w": round(q * self.c_eff_wh_per_k, 1),
+            "local_hour": round(local_hour % 24.0, 2),
+            "active_regime": "door_open" if door_open else "door_closed",
+            "fallback": self.fit_is_fallback(door_open),
+            "coeffs_closed": self.q_coeffs(False),
+            "coeffs_open": self.q_coeffs(True),
+        }
+
     @property
     def cop_effective(self) -> float:
         if self.cop is None or self.cop_samples < 10:

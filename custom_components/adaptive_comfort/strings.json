@@ -255,6 +255,9 @@
       "sensible_power": {
         "name": "Sensible power"
       },
+      "standing_load": {
+        "name": "Standing thermal load"
+      },
       "latent_power": {
         "name": "Latent power"
       },

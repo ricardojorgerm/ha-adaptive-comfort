@@ -85,6 +85,27 @@ def test_cold_start_uses_priors():
     traj = model.predict_free(25.0, [30.0] * 24, start_hour=12.0)
     assert len(traj) == 25
     assert traj[-1] > traj[0]  # drifts toward hot outdoors
+    assert model.q_coeffs(False) is None
+    diag = model.disturbance_diag(12.0)
+    assert diag["q_hat_k_per_h"] == 0.0
+    assert diag["coeffs_closed"] is None
+
+
+def test_disturbance_coeffs_from_fit():
+    model = ThermalModel(volume_m3=30.0)
+    model.fits[False].theta = [0.3, 0.1, 0.05, 0.02, -0.01, 0.0, 0.0]
+    model.fits[False].samples = 100
+    coeffs = model.q_coeffs(False)
+    assert coeffs is not None
+    assert coeffs["a0"] == 0.05
+    assert coeffs["a1"] == 0.02
+    assert coeffs["b1"] == -0.01
+    assert coeffs["samples"] == 100
+    diag = model.disturbance_diag(0.0, door_open=False)
+    # At hour 0: cos=1, sin=0 → q = a0 + a1 + a2
+    assert abs(diag["q_hat_k_per_h"] - 0.07) < 1e-4
+    assert diag["coeffs_closed"]["a0"] == 0.05
+    assert diag["coeffs_open"] is None
 
 
 def test_prior_blends_into_fit():

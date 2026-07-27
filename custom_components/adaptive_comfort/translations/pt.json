@@ -226,6 +226,7 @@
       "furniture_factor": { "name": "Fator de mobiliário" },
       "zone_cop": { "name": "COP" },
       "sensible_power": { "name": "Potência sensível" },
+      "standing_load": { "name": "Carga térmica permanente" },
       "latent_power": { "name": "Potência latente" },
       "drift_offset": { "name": "Desvio do sensor" },
       "zone_confidence": { "name": "Confiança do ajuste" },

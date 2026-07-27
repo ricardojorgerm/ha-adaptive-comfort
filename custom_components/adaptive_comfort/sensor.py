@@ -328,6 +328,23 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         },
     ),
     ZoneSensorDescription(
+        key="standing_load",
+        translation_key="standing_load",
+        native_unit_of_measurement=UnitOfPower.WATT,
+        device_class=SensorDeviceClass.POWER,
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=lambda z, r: _round(z.standing_load_w, 0),
+        attr_fn=lambda z, r: {
+            "per_room_w": (
+                None
+                if z.standing_load_w is None
+                else round(z.standing_load_w / max(1, z.config.n_rooms), 1)
+            ),
+            "n_rooms": z.config.n_rooms,
+        },
+    ),
+    ZoneSensorDescription(
         key="latent_power",
         translation_key="latent_power",
         native_unit_of_measurement=UnitOfPower.WATT,
