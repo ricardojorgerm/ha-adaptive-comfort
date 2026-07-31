@@ -28,6 +28,10 @@ from .types import (
 PREDICT_MARGIN_K = 0.1
 HELPER_BAND_FRACTION = 0.5
 MAX_MODE_CHANGES_PER_H = 3
+# Per-zone anti-chatter dwell (s). Plant-level min_on_min is enforced against
+# the compressor run clock, not this — zones may leave demand into residual
+# park while the plant minimum is still running.
+ZONE_CHATTER_S = 180.0
 SHED_ACTION_SPACING_S = 30.0
 SHED_URGENT_SPACING_S = 3.0
 COMMAND_SPACING_S = 180.0
@@ -126,7 +130,7 @@ PARK_ADAPT_EPS_K = 0.1
 PARK_MIN_DWELL_S = 600.0
 PARK_PROBE_S = 900.0
 PARK_PROBE_SPACING_S = 6.0 * 3600.0
-# Trickle output must plausibly carry the zone's standing load to justify
+# Residual output must plausibly carry the zone's standing load to justify
 # exploitation-parking instead of a plain off.
 PARK_LOAD_COVER_FRACTION = 0.6
 COP_TABLE_ADVANTAGE = 1.05
@@ -140,6 +144,21 @@ FAN_ASSIST_MIN_DEV_K = 0.3
 # Window suggestion: outdoors clearly colder than the room, someone present.
 WINDOW_DELTA_K = 2.0
 WINDOW_GRACE_S = 15.0 * 60.0
+# Sibling-sustain: EWMA in-band ratio while a rider zone free-rides a
+# conditioning sibling. Opportunistic observation only - see
+# _update_sibling_sustain / _sibling_sustain_ok.
+SIBLING_SUSTAIN_ALPHA = 0.2
+SIBLING_SUSTAIN_MIN_SAMPLES = 6
+SIBLING_SUSTAIN_MIN_RATIO = 0.6
+# Mixing free-ride for out-of-band rooms: free-float (heads off, house
+# mixing included) must enter the band within this many hours — hold-load
+# cover alone is not enough (that only stops drift, it does not pull down).
+FREE_RIDE_PULL_HORIZON_H = 3
+# Transport grace: cold/warm air from a sibling takes minutes to reach a
+# far room. While the youngest conditioning sibling is still this young,
+# permit free-ride on hold-cover alone so we do not recruit a head for a
+# lag that mixing is about to clear.
+FREE_RIDE_TRANSPORT_GRACE_S = 900.0
 
 
 def quantize_setpoint(
@@ -168,19 +187,84 @@ def _comfort_error(zone: ZoneSnapshot, center: float, mode: str) -> float:
     return 0.0
 
 
-def _wants_conditioning(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> bool:
-    """Demand: out of band now, or predicted to exit within the horizon."""
+def _predicted_breach(
+    zone: ZoneSnapshot, lo: float, hi: float, mode: str
+) -> tuple[float | None, float]:
+    """(time_to_breach_h, peak_breach_k) from free_float, else pred_60m.
+
+    Peak breach is max excursion past the band edge over the scored horizon
+    (hours where the trajectory is already out). None ttb means no breach.
+    """
+    traj = list(zone.free_float) if zone.free_float else []
+    if not traj and zone.pred_60m is not None:
+        traj = [zone.temp if zone.temp is not None else zone.pred_60m, zone.pred_60m]
+    ttb: float | None = None
+    peak = 0.0
+    for i, t in enumerate(traj[:12]):
+        if t is None:
+            continue
+        if mode == MODE_COOL:
+            excess = t - hi
+        elif mode == MODE_HEAT:
+            excess = lo - t
+        else:
+            return None, 0.0
+        if excess > 0.0:
+            if ttb is None:
+                ttb = float(i)
+            peak = max(peak, excess)
+    return ttb, peak
+
+
+def _prediction_justifies_run(
+    zone: ZoneSnapshot, lo: float, hi: float, mode: str, min_on_min: float
+) -> bool:
+    """True when predicted breach size and time-to-breach justify one plant min run.
+
+    Uses the prediction — no floor/center deadband that ignores it. A small
+    far-away breach fails naturally (ttb ≫ min_on or peak < PREDICT_MARGIN_K).
+    """
+    ttb_h, peak = _predicted_breach(zone, lo, hi, mode)
+    if ttb_h is None or peak < PREDICT_MARGIN_K:
+        return False
+    min_on_h = max(min_on_min / 60.0, 1.0 / 60.0)
+    # Near, meaningful breaches fire; distant ones wait for a closer horizon.
+    return ttb_h <= max(1.0, 2.0 * min_on_h)
+
+
+def _wants_conditioning(
+    zone: ZoneSnapshot, lo: float, hi: float, mode: str, min_on_min: float = 20.0
+) -> bool:
+    """Demand: out of band now, or prediction justifies a plant-minimum run."""
     if zone.temp is None:
         return False
     if mode == MODE_COOL:
         if zone.temp > hi:
             return True
-        return zone.pred_60m is not None and zone.pred_60m > hi + PREDICT_MARGIN_K
+        return _prediction_justifies_run(zone, lo, hi, mode, min_on_min)
     if mode == MODE_HEAT:
         if zone.temp < lo:
             return True
-        return zone.pred_60m is not None and zone.pred_60m < lo - PREDICT_MARGIN_K
+        return _prediction_justifies_run(zone, lo, hi, mode, min_on_min)
     return False
+
+
+def _predicted_oob_duration_s(
+    zone: ZoneSnapshot, lo: float, hi: float, mode: str
+) -> float:
+    """Hours of free-float spent out of band, as seconds (handoff gate)."""
+    hours = 0
+    for t in list(zone.free_float)[:12]:
+        if t is None:
+            continue
+        if (mode == MODE_COOL and t > hi) or (mode == MODE_HEAT and t < lo):
+            hours += 1
+    if hours == 0 and zone.pred_60m is not None and (
+        (mode == MODE_COOL and zone.pred_60m > hi)
+        or (mode == MODE_HEAT and zone.pred_60m < lo)
+    ):
+        hours = 1
+    return float(hours) * 3600.0
 
 
 def _reached_far_edge(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> bool:
@@ -201,6 +285,39 @@ def _park_ok_now(zone: ZoneSnapshot, lo: float, hi: float, pmode: str | None) ->
     return zone.temp <= hi if pmode == MODE_COOL else zone.temp >= lo
 
 
+def _update_plant_compress(state: ControllerState, snap: HouseSnapshot) -> None:
+    """Track plant compression from electrical p_ac with StartCounter-class debounce.
+
+    Brief sub-floor dips (inverter modulation, baseline noise) must not clear
+    the run clock — otherwise plant min_on never completes. Same 180 s floor
+    dwell as StartCounter before we treat compression as ended.
+    """
+    compressing = (
+        snap.p_ac is not None and snap.p_ac >= snap.compression_floor_w
+    )
+    if compressing:
+        if state.plant_compress_since <= 0.0:
+            state.plant_compress_since = snap.now_ts
+        state.plant_below_since = 0.0
+        return
+    if state.plant_compress_since <= 0.0:
+        state.plant_below_since = 0.0
+        return
+    if state.plant_below_since <= 0.0:
+        state.plant_below_since = snap.now_ts
+        return
+    if snap.now_ts - state.plant_below_since >= power.START_DEBOUNCE_S:
+        state.plant_compress_since = 0.0
+        state.plant_below_since = 0.0
+
+
+def _plant_min_on_active(state: ControllerState, snap: HouseSnapshot, s) -> bool:
+    """True while a live compression run has not yet reached min_on_min."""
+    if state.plant_compress_since <= 0.0:
+        return False
+    return snap.now_ts - state.plant_compress_since < s.min_on_min * 60.0
+
+
 def _transition_allowed(
     state: ControllerState, zone_id: str, now: float, turning_on: bool, s
 ) -> bool:
@@ -208,7 +325,9 @@ def _transition_allowed(
     elapsed = now - since
     if turning_on and elapsed < s.min_off_min * 60.0:
         return False
-    if not turning_on and elapsed < s.min_on_min * 60.0:
+    # Zone off uses a short anti-chatter dwell; plant min_on is separate
+    # (residual park / handoff keep the compressor loaded).
+    if not turning_on and elapsed < ZONE_CHATTER_S:
         return False
     changes = state.zone_mode_changes.get(zone_id, [])
     recent = [t for t in changes if now - t < 3600.0]
@@ -224,18 +343,18 @@ def _record_transition(state: ControllerState, zone_id: str, now: float, on: boo
 
 
 def _park_exploit_ok(zone: ZoneSnapshot, mode: str) -> bool:
-    """Known trickler whose parked output plausibly carries the standing load.
+    """Known residual head whose parked output plausibly carries the standing load.
 
     park_extraction_w is sensed-room / per-head; standing_load_w is zone-total
     (x n_rooms). Compare in the per-room frame so mirrored zones are not
     falsely judged unable to cover their load.
     """
-    if zone.park_trickles is not True:
+    if zone.park_residuals is not True:
         return False
     if zone.park_extraction_w is None:
         return False
     if zone.standing_load_w is None:
-        # No load estimate: trickling while satisfied is still calmer than
+        # No load estimate: residual hold while satisfied is still calmer than
         # off/on cycling, accept.
         return True
     per_room_load = zone.standing_load_w / max(1, zone.n_rooms)
@@ -245,24 +364,33 @@ def _park_exploit_ok(zone: ZoneSnapshot, mode: str) -> bool:
 def _park_preferred(zone: ZoneSnapshot, state: ControllerState) -> float:
     """Learned park depth for this zone, falling back to the base margin.
 
-    Once the hysteresis map has found a coasting depth, prefer that over the
-    static default — it is the cheapest hold inside the head's dead-band.
+    Once the hysteresis map has found a residual-hold depth (deepest margin
+    still meaningfully compressing, just before the dead-band edge), prefer
+    that: it is real compressor output at the cheapest depth that gives it,
+    ranked above a fan-type hold (fan running, no output) or a stale default.
     """
     zid = zone.zone_id
     if zid in state.zone_park_preferred:
         return state.zone_park_preferred[zid]
-    if zone.park_coast_margin_k is not None:
-        return min(max(zone.park_coast_margin_k, PARK_MARGIN_K), PARK_MARGIN_MAX_K)
+    if zone.park_residual_edge_k is not None:
+        return min(max(zone.park_residual_edge_k, PARK_MARGIN_K), PARK_MARGIN_MAX_K)
     if zone.park_preferred_margin_k is not None:
         return zone.park_preferred_margin_k
     return PARK_MARGIN_K
 
 
 def _park_entry_margin(zone: ZoneSnapshot, state: ControllerState) -> float:
-    """Park entry depth: coast band when mapped, else preferred - undershoot."""
-    if zone.park_coast_margin_k is not None:
-        # Land inside the coast region; undershooting would re-engage compression.
-        return min(max(zone.park_coast_margin_k, PARK_MARGIN_K), PARK_MARGIN_MAX_K)
+    """Park entry depth: learned residual-hold edge when mapped, else preferred - undershoot.
+
+    Deliberately does not fall back to fan_type_min_margin_k here: a fan-type
+    depth exploits nothing (fan running, no compression), so entry prefers
+    either a proven residual-hold depth or the undershoot-from-preferred
+    probe, never the fan-type shelf.
+    """
+    if zone.park_residual_edge_k is not None:
+        # Land at the deepest depth still proven to compress; undershooting
+        # further would give up real output for no reason.
+        return min(max(zone.park_residual_edge_k, PARK_MARGIN_K), PARK_MARGIN_MAX_K)
     preferred = _park_preferred(zone, state)
     return max(preferred - PARK_ENTRY_UNDERSHOOT_K, PARK_MARGIN_K)
 
@@ -342,6 +470,322 @@ def _window_would_help(
     return zone.occupied is None and house_occupied is True
 
 
+def _sibling_sustain_ok(state: ControllerState, rider_id: str, sibling_ids: list[str]) -> bool:
+    """No history yet -> permissive. Learned-poor pairs veto the physical estimate.
+
+    Never blocks purely for lack of data (asymmetric learning is fine, and a
+    fresh install must not be denied the model's own physical estimate); a
+    pair with enough samples showing the room does NOT actually stay in-band
+    overrides an over-optimistic instantaneous mixing calculation.
+    """
+    data = state.sibling_sustain.get(rider_id)
+    if not data:
+        return True
+    for sid in sibling_ids:
+        entry = data.get(sid)
+        if entry is None:
+            continue
+        ratio, samples = entry
+        if samples >= SIBLING_SUSTAIN_MIN_SAMPLES and ratio < SIBLING_SUSTAIN_MIN_RATIO:
+            return False
+    return True
+
+
+def _update_sibling_sustain(
+    state: ControllerState,
+    zones: list[ZoneSnapshot],
+    mode: str,
+    bands: dict[str, tuple[float, float]],
+    want_on: dict[str, bool],
+) -> None:
+    """Observe (never force) whether a free-riding zone stays in-band.
+
+    Ordered and asymmetric by construction: only zones that are already off
+    and not wanted on are observed against zones that are actively
+    conditioning right now. No reverse-direction probing is ever triggered.
+    """
+    if mode not in (MODE_HEAT, MODE_COOL):
+        return
+    conditioning = [z.zone_id for z in zones if z.is_on]
+    if not conditioning:
+        return
+    for zone in zones:
+        zid = zone.zone_id
+        if zone.is_on or want_on.get(zid) or zone.temp is None:
+            continue
+        lo, hi = bands.get(zid, (None, None))
+        if lo is None or hi is None:
+            continue
+        in_band = lo <= zone.temp <= hi
+        for sib in conditioning:
+            if sib == zid:
+                continue
+            entry = state.sibling_sustain.setdefault(zid, {})
+            ratio, samples = entry.get(sib, (1.0 if in_band else 0.0, 0))
+            ratio += SIBLING_SUSTAIN_ALPHA * ((1.0 if in_band else 0.0) - ratio)
+            entry[sib] = (ratio, samples + 1)
+
+
+def _mixing_assist_covers_hold(zone: ZoneSnapshot, mode: str) -> bool:
+    """True when instantaneous mixing flux covers hold (standing) load."""
+    if zone.mixing_gain_w is None or zone.standing_load_w is None:
+        return False
+    if mode == MODE_COOL:
+        assist_w = max(0.0, -zone.mixing_gain_w)
+    elif mode == MODE_HEAT:
+        assist_w = max(0.0, zone.mixing_gain_w)
+    else:
+        return False
+    per_room_load = zone.standing_load_w / max(1, zone.n_rooms)
+    return assist_w >= PARK_LOAD_COVER_FRACTION * per_room_load
+
+
+def _mixing_will_condition(
+    zone: ZoneSnapshot, lo: float, hi: float, mode: str
+) -> bool:
+    """True when free-float enters the band on the conditioning side.
+
+    free_float already includes house-mixing from siblings (coordinator
+    builds t_house_hourly with on-siblings converging to their centres),
+    so this is the honest "will mixing pull this room into comfort?" test
+    — stronger than hold-load cover alone.
+    """
+    traj = list(zone.free_float) if zone.free_float else []
+    if not traj and zone.pred_60m is not None and zone.temp is not None:
+        traj = [zone.temp, zone.pred_60m]
+    # Skip hour 0 (current reading — already known OOB); score 1..horizon.
+    for t in traj[1 : FREE_RIDE_PULL_HORIZON_H + 1]:
+        if t is None:
+            continue
+        if mode == MODE_COOL and t <= hi:
+            return True
+        if mode == MODE_HEAT and t >= lo:
+            return True
+    return False
+
+
+def _mixing_transport_grace(
+    state: ControllerState, conditioning_sibling_ids: list[str], now: float
+) -> bool:
+    """True while a conditioning sibling is still within transport grace.
+
+    Far rooms lag the instantaneous mixing estimate: air has not arrived
+    yet, so the rider looks hotter/colder than it will once the plume
+    reaches it. Hold-cover during that window is enough to wait.
+    """
+    for sid in conditioning_sibling_ids:
+        if not state.zone_on.get(sid, False):
+            continue
+        since = state.zone_since.get(sid, 0.0)
+        if since > 0.0 and now - since < FREE_RIDE_TRANSPORT_GRACE_S:
+            return True
+    return False
+
+
+def _mixing_free_rider(
+    zone: ZoneSnapshot,
+    mode: str,
+    state: ControllerState,
+    conditioning_sibling_ids: list[str],
+    lo: float,
+    hi: float,
+    now: float,
+) -> bool:
+    """True when a conditioning sibling already covers this zone via mixing.
+
+    In-band (conditioning-side): hold-load cover is enough — the room does
+    not need pull-down. Out-of-band: mixing must *condition* (free-float
+    enters the band within FREE_RIDE_PULL_HORIZON_H) or we are still inside
+    FREE_RIDE_TRANSPORT_GRACE_S of a sibling start (air-travel leniency).
+    Sibling-sustain history can veto an over-optimistic physical estimate.
+    """
+    if not conditioning_sibling_ids:
+        return False
+    if not _mixing_assist_covers_hold(zone, mode):
+        return False
+    if not _sibling_sustain_ok(state, zone.zone_id, conditioning_sibling_ids):
+        return False
+    # Conditioning-side in-band: cool temp≤hi / heat temp≥lo — hold is enough.
+    if _park_ok_now(zone, lo, hi, mode):
+        return True
+    if _mixing_will_condition(zone, lo, hi, mode):
+        return True
+    if _mixing_transport_grace(state, conditioning_sibling_ids, now):
+        return True
+    return False
+
+
+def _all_zones_satisfied(zones: list[ZoneSnapshot], centers: dict[str, float], mode: str) -> bool:
+    """True when every enabled zone with a reading is at/past its own centre."""
+    for zone in zones:
+        if zone.temp is None or not zone.enabled:
+            continue
+        center = centers.get(zone.zone_id)
+        if center is None:
+            continue
+        if mode == MODE_COOL and zone.temp > center:
+            return False
+        if mode == MODE_HEAT and zone.temp < center:
+            return False
+    return True
+
+
+def _house_overserve_margin_k(
+    zones: list[ZoneSnapshot], bands: dict[str, tuple[float, float]], mode: str
+) -> float | None:
+    """Head-count-weighted predicted drift past the tightest band edge (K, >0
+    means the house is trending past comfort, i.e. the anchor is over-serving).
+    """
+    weighted = [(z.pred_60m, z.n_rooms) for z in zones if z.pred_60m is not None and z.enabled]
+    total_w = sum(w for _v, w in weighted)
+    if not weighted or total_w <= 0 or not bands:
+        return None
+    avg_pred = sum(v * w for v, w in weighted) / total_w
+    if mode == MODE_COOL:
+        return min(lo for lo, _hi in bands.values()) - avg_pred
+    if mode == MODE_HEAT:
+        return avg_pred - max(hi for _lo, hi in bands.values())
+    return None
+
+
+def _anchor_should_release(
+    state: ControllerState,
+    zones: list[ZoneSnapshot],
+    centers: dict[str, float],
+    bands: dict[str, tuple[float, float]],
+    mode: str,
+    want_on: dict[str, bool],
+    now: float,
+) -> tuple[bool, float | None]:
+    anchor = next((z for z in zones if z.zone_id == state.anchor_zone), None)
+    if anchor is None:
+        return True, None
+    lo, hi = bands.get(state.anchor_zone, (None, None))
+    if anchor.temp is not None and lo is not None and hi is not None:
+        if mode == MODE_COOL and anchor.temp <= lo - PARK_OVERCOOL_BUFFER_K:
+            return True, None
+        if mode == MODE_HEAT and anchor.temp >= hi + PARK_OVERCOOL_BUFFER_K:
+            return True, None
+    margin = _house_overserve_margin_k(zones, bands, mode)
+    # Handoff: another zone is (or will be) conditioning and house mixing
+    # already covers this zone's standing load — residual park on the
+    # anchor would add compressor load for free. Prefer_continuous only
+    # needs *someone* loaded; shift the working head to the demand zone.
+    sibs = sorted(
+        {
+            z.zone_id
+            for z in zones
+            if z.zone_id != state.anchor_zone
+            and (want_on.get(z.zone_id) or z.is_on)
+        }
+    )
+    if (
+        sibs
+        and lo is not None
+        and hi is not None
+        and _mixing_free_rider(anchor, mode, state, sibs, lo, hi, now)
+    ):
+        return True, margin
+    if not _all_zones_satisfied(zones, centers, mode):
+        return False, margin
+    return (margin is not None and margin > 0.0), margin
+
+
+def _select_anchor(zones: list[ZoneSnapshot], mode: str, shed: dict) -> str | None:
+    """Elect the anchor from already-loaded heads: best load coverage with
+    least excess, tie-broken by head count (mirrored zones commit every head)
+    then mixing centrality. Never recruits an idle zone just to be the anchor.
+    """
+    candidates = [
+        z
+        for z in zones
+        if z.is_on
+        and z.enabled
+        and z.zone_id not in shed
+        and (z.head_mode == mode or z.head_mode is None)
+    ]
+    if not candidates:
+        return None
+    total_load = sum(z.standing_load_w or 0.0 for z in zones if z.enabled)
+
+    def score(z: ZoneSnapshot) -> tuple:
+        coverage = (z.park_extraction_w or 0.0) * z.n_rooms
+        covers = coverage >= total_load
+        return (
+            0 if covers else 1,
+            (coverage - total_load) if covers else -coverage,
+            -z.n_rooms,
+            -(z.mixing_coupling_w_per_k or 0.0),
+        )
+
+    return min(candidates, key=score).zone_id
+
+
+def _update_anchor(
+    state: ControllerState,
+    snap: HouseSnapshot,
+    zones: list[ZoneSnapshot],
+    mode: str,
+    centers: dict[str, float],
+    bands: dict[str, tuple[float, float]],
+    want_on: dict[str, bool],
+) -> float | None:
+    """prefer_continuous: keep ≥1 head loaded (demand or residual park).
+
+    Elects one already-on head as anchor so it may park instead of turning
+    off when the house is satisfied. Does *not* force demand setpoints —
+    parking is allowed. Releases when overserving, overcorrected, or when
+    a sibling's conditioning already covers the anchor via mixing (handoff).
+
+    Returns the current over-serve margin (K) for diagnostics, or None.
+    """
+    s = snap.settings
+    eligible = (
+        s.prefer_continuous
+        and s.park_learning
+        and s.multisplit
+        and s.preset != PRESET_MANUAL
+        and mode in (MODE_HEAT, MODE_COOL)
+    )
+    if not eligible:
+        state.anchor_zone = None
+        state.anchor_since = 0.0
+        return None
+    zone_ids = {z.zone_id for z in zones}
+    if state.anchor_zone is not None and state.anchor_zone not in zone_ids:
+        state.anchor_zone = None
+        state.anchor_since = 0.0
+    if state.anchor_zone is not None:
+        should_release, margin = _anchor_should_release(
+            state, zones, centers, bands, mode, want_on, snap.now_ts
+        )
+        if should_release:
+            state.anchor_zone = None
+            state.anchor_since = 0.0
+            return None
+        return margin
+    candidate = _select_anchor(zones, mode, state.shed)
+    if candidate is not None:
+        state.anchor_zone = candidate
+        state.anchor_since = snap.now_ts
+    return None
+
+
+def _anchor_active(state: ControllerState, s, mode: str, zid: str) -> bool:
+    """True while `zid` is the elected prefer_continuous anchor and nothing
+    that outranks it (manual, shed, hub off, non-conditioning mode) applies.
+    """
+    return (
+        s.prefer_continuous
+        and s.park_learning
+        and s.multisplit
+        and s.preset != PRESET_MANUAL
+        and mode in (MODE_HEAT, MODE_COOL)
+        and state.anchor_zone == zid
+        and zid not in state.shed
+    )
+
+
 def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     s = snap.settings
     now = snap.now_ts
@@ -380,18 +824,46 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         diag["cold_deficit_kh"] = round(decision.cold_deficit_kh, 2)
     diag["mode"] = mode
 
+    # Plant compression clock (min_on keys off this, not zone_since).
+    _update_plant_compress(state, snap)
+    plant_min_on = _plant_min_on_active(state, snap, s)
+    diag["plant_min_on"] = plant_min_on
+    diag["plant_compress_since"] = state.plant_compress_since
+
     # 3. Demand and helper sets.
     demand = (
-        [z for z in zones if _wants_conditioning(z, *bands[z.zone_id], mode)]
+        [
+            z
+            for z in zones
+            if _wants_conditioning(z, *bands[z.zone_id], mode, s.min_on_min)
+        ]
         if mode in (MODE_HEAT, MODE_COOL)
         else []
     )
+    # Mixing free-ride: drop zones a conditioning sibling already covers
+    # via house mixing — hold when in-band, pull-down when free-float
+    # shows the band is reachable (with transport grace for air lag).
+    conditioning_sibs = [z.zone_id for z in zones if z.is_on]
+    free_riders: list[str] = []
+    if mode in (MODE_HEAT, MODE_COOL) and conditioning_sibs:
+        kept: list[ZoneSnapshot] = []
+        for zone in demand:
+            sibs = [sid for sid in conditioning_sibs if sid != zone.zone_id]
+            lo_b, hi_b = bands[zone.zone_id]
+            if sibs and _mixing_free_rider(zone, mode, state, sibs, lo_b, hi_b, now):
+                free_riders.append(zone.zone_id)
+            else:
+                kept.append(zone)
+        demand = kept
+    diag["free_riders"] = sorted(free_riders)
     demand_ids = {z.zone_id for z in demand}
 
     helpers: list[ZoneSnapshot] = []
     if demand and s.coordination and snap.settings.hvac_mode in (MODE_AUTO, mode):
         for zone in zones:
             if zone.zone_id in demand_ids:
+                continue
+            if zone.zone_id in free_riders:
                 continue
             if zone.occupied is False:
                 continue
@@ -427,9 +899,45 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     diag["helpers"] = sorted(helper_ids)
 
     want_on = {z.zone_id: (z in demand or z in helpers) for z in zones}
+    for zid in free_riders:
+        want_on[zid] = False
+
+    # Plant min_on handoff: while the compressor still owes runtime, a zone
+    # that is satisfied may recruit another head only when that zone's
+    # predicted out-of-band duration covers ≥ half min_on (no spurious starts).
+    if plant_min_on and mode in (MODE_HEAT, MODE_COOL):
+        half_min_s = 0.5 * s.min_on_min * 60.0
+        any_wanted = any(want_on.values())
+        if not any_wanted:
+            for zone in zones:
+                if zone.zone_id in state.shed or not zone.enabled:
+                    continue
+                lo_b, hi_b = bands[zone.zone_id]
+                if _predicted_oob_duration_s(zone, lo_b, hi_b, mode) >= half_min_s:
+                    want_on[zone.zone_id] = True
+                    diag.setdefault("plant_handoff", []).append(zone.zone_id)
+                    break
+
+    _update_sibling_sustain(state, zones, mode, bands, want_on)
+    # Anchor election after want_on is known so handoff can see demand sibs.
+    # Do NOT force want_on[anchor]=True: that would block park entry
+    # (park requires not desired_on). Anchor stay-loaded is via the park
+    # branch's _anchor_active waiver, not tracked demand setpoints.
+    oversve_margin = _update_anchor(state, snap, zones, mode, centers, bands, want_on)
+    diag["anchor_zone"] = state.anchor_zone
+    diag["anchor_overserve_margin_k"] = oversve_margin
+
     diag["want"] = {
         z.zone_id: (
-            "demand" if z.zone_id in demand_ids else "helper" if z.zone_id in helper_ids else "off"
+            "demand"
+            if z.zone_id in demand_ids
+            else "helper"
+            if z.zone_id in helper_ids
+            else "anchor"
+            if state.anchor_zone == z.zone_id
+            else "free_ride"
+            if z.zone_id in free_riders
+            else "off"
         )
         for z in zones
     }
@@ -581,7 +1089,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         # A zone leaving demand/helpers would normally turn off. If park
         # learning is enabled, the compressor stays alive for siblings, and
         # either (a) behavior is unclassified and a probe is due, or (b) the
-        # head is a known trickler whose output can carry the standing load,
+        # head is a known residual head whose output can carry the standing load,
         # we park instead: setpoint offset from the internal reading, mode
         # kept. Session margin starts at the learned preferred depth and
         # escalates while the room keeps moving in the conditioning direction.
@@ -598,10 +1106,25 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 or _transition_allowed(state, zid, now, False, s)
             )
             sibling_alive = any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones)
-            dwell_ok = now - parked_since >= PARK_MIN_DWELL_S
-            probing = zone.park_trickles is None
-            probe_done = probing and now - parked_since >= PARK_PROBE_S
+            # Sibling conditioning + mixing already covers this zone's hold
+            # load → residual park is pure extra compressor work; release.
+            covering_sibs = [
+                z.zone_id
+                for z in zones
+                if z.zone_id != zid and (want_on.get(z.zone_id) or z.is_on)
+            ]
             lo_b, hi_b = bands[zid]
+            ride_mode = mode if mode in (MODE_HEAT, MODE_COOL) else (pmode or "")
+            mixing_covered = (
+                bool(covering_sibs)
+                and ride_mode in (MODE_HEAT, MODE_COOL)
+                and _mixing_free_rider(
+                    zone, ride_mode, state, covering_sibs, lo_b, hi_b, now
+                )
+            )
+            dwell_ok = now - parked_since >= PARK_MIN_DWELL_S
+            probing = zone.park_residuals is None
+            probe_done = probing and now - parked_since >= PARK_PROBE_S
             out_of_band = zone.temp is not None and (
                 pmode is not None and (zone.temp > hi_b if pmode == MODE_COOL else zone.temp < lo_b)
             )
@@ -615,6 +1138,17 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     if pmode == MODE_COOL
                     else zone.temp >= hi_b + PARK_OVERCOOL_BUFFER_K
                 )
+            )
+            # A fan-type live session still blows air across the coil; inside
+            # the coil-dry window that re-evaporates condensate exactly like
+            # fan_assist mixing would, so it is released to true off (best)
+            # rather than held as a park. Residual sessions are conditioning
+            # and are exempt — there is no coil-dry subsystem specific to park.
+            last_cool = state.zone_last_cool.get(zid)
+            coil_wet_fan_type = (
+                zone.park_current_is_fan_type is True
+                and last_cool is not None
+                and now - last_cool < COIL_DRY_S
             )
 
             # Margin escalation: if the room keeps moving in the conditioning
@@ -645,7 +1179,15 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                         # Drifting back toward the load side: the head eased
                         # off (or idles); relax toward the base margin. A clean
                         # exit then settles preferred toward this lower depth.
-                        new_margin = max(margin - PARK_MARGIN_STEP_K, PARK_MARGIN_K)
+                        # Bound the relax by the learned residual-hold edge
+                        # (not the bare PARK_MARGIN_K floor) so it cannot walk
+                        # down into full-conditioning depths a shallow bin
+                        # would otherwise offer (e.g. 1.5 K at duty 1.0 is not
+                        # a park — it is just tracked demand with a park label).
+                        relax_floor = PARK_MARGIN_K
+                        if zone.park_residual_edge_k is not None:
+                            relax_floor = max(relax_floor, zone.park_residual_edge_k)
+                        new_margin = max(margin - PARK_MARGIN_STEP_K, relax_floor)
                         if new_margin != margin:
                             margin = new_margin
                             state.zone_park_margin[zid] = margin
@@ -672,6 +1214,12 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 _clear_park_session(state, zid, zone, now)
                 diag.setdefault("park_overcorrected", []).append(zid)
                 desired_on = False
+            elif coil_wet_fan_type and off_allowed:
+                # Fan-type hold, coil still wet: true off beats a park that
+                # is doing no useful work while re-evaporating condensate.
+                _clear_park_session(state, zid, zone, now)
+                diag.setdefault("park_coil_wet_released", []).append(zid)
+                desired_on = False
             elif out_of_band and (
                 dwell_ok
                 or (
@@ -686,29 +1234,37 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     )
                 )
             ):
-                # Load beat the parked output: fall through to normal
-                # demand handling below (zone re-enters as wanting on).
-                _settle_park_preferred(state, zid, margin)
+                # Load beat the parked output: fall through to normal demand
+                # handling below (zone re-enters as wanting on). This margin
+                # was an overshoot/escalation depth, not a proven
+                # residual-hold — do not blend preferred toward it.
                 _clear_park_session(state, zid, zone, now)
             elif zid in state.shed or (
                 dwell_ok
                 and off_allowed
+                and not plant_min_on
                 and (
-                    probe_done
-                    or zone.park_trickles is False
+                    mixing_covered
                     or (
-                        regime != "continuous"
-                        and (not _park_exploit_ok(zone, pmode) or not sibling_alive)
+                        not _anchor_active(state, s, mode, zid)
+                        and (
+                            probe_done
+                            or zone.park_residuals is False
+                            or (
+                                regime != "continuous"
+                                and (not _park_exploit_ok(zone, pmode) or not sibling_alive)
+                            )
+                            or pmode is None
+                        )
                     )
-                    or pmode is None
                 )
             ):
-                # Probe finished, head classified as idler, or exploitation
-                # no longer justified: release to normal off handling.
-                # Settle even when the house mode is already idle (run-out parks).
-                # In 'continuous' regime, sibling requirement and exploit check
-                # are waived — the load feeds the compressor floor, so holding
-                # parked is cheaper than controller-imposed off/restart cycles.
+                # Probe finished, head classified as idler, exploitation no
+                # longer justified, or sibling mixing already covers hold load
+                # (handoff — residual park would add compressor work for free).
+                # continuous / plant min_on / prefer_continuous anchor waive
+                # sibling+exploit release so residual park can finish the run;
+                # mixing_covered still wins (even for the anchor).
                 if zid not in state.shed:
                     _settle_park_preferred(state, zid, margin)
                 _clear_park_session(state, zid, zone, now)
@@ -733,17 +1289,23 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             and _park_ok_now(zone, *bands[zid], mode)
             and (
                 regime == "continuous"
+                or plant_min_on
+                or _anchor_active(state, s, mode, zid)
                 or any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones)
             )
             and _transition_allowed(state, zid, now, False, s)
         ):
             probe_due = (
-                zone.park_trickles is None
+                zone.park_residuals is None
                 and now - state.zone_last_park_probe.get(zid, 0.0) >= PARK_PROBE_SPACING_S
                 and now - state.zone_last_park_abort.get(zid, 0.0) >= PARK_PROBE_RETRY_S
             )
-            exploit = zone.park_trickles is True and _park_exploit_ok(zone, mode)
-            if probe_due or exploit:
+            # Plant min_on / anchor: residual park serves the compressor run
+            # even before the head is classified (observations are free —
+            # do not charge the probe budget). Exploit or spaced probe otherwise.
+            plant_hold = plant_min_on or _anchor_active(state, s, mode, zid)
+            exploit = zone.park_residuals is True and _park_exploit_ok(zone, mode)
+            if plant_hold or probe_due or exploit:
                 preferred = _park_preferred(zone, state)
                 entry = _park_entry_margin(zone, state)
                 state.zone_park_preferred[zid] = preferred
@@ -751,7 +1313,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 state.zone_park_margin[zid] = entry
                 if zone.temp is not None:
                     state.zone_park_ref[zid] = zone.temp
-                if probe_due:
+                if probe_due and not plant_hold:
                     state.zone_park_probe_entry[zid] = zone.park_samples
                 commands.append(Command(zid, mode, None, "park", park=True, park_margin=entry))
                 state.zone_last_cmd[zid] = now
@@ -796,7 +1358,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             # Zone is running out its minimum runtime while the house has
             # gone idle. Do not leave the head at a stale (possibly deep)
             # tracked setpoint: ease it to minimum tracking depth in its own
-            # physical direction so it trickles instead of cooling hard into
+            # physical direction so it modulates gently instead of cooling hard into
             # a room nobody asked to condition further.
             if (
                 s.tracking

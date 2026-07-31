@@ -28,9 +28,9 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
 | Path | What lives there |
 |---|---|
 | `core/controller.py` | Pure decision engine: one tick from `HouseSnapshot` → `Decision` (mode arbitration, demand/helper selection, min-on/off guards, tracking-delta adaptation, shedding, fan assist, window suggestions). All tunable constants at the top. |
-| `core/thermal.py` | Per-zone 1R1C `ThermalModel`: RLS fits of k_out / k_mix per door regime, effective capacitance, diurnal disturbance, sensible power, COP estimation. Outdoor anchoring via the air-exchange hypothesis (moisture k → absolute UA). |
+| `core/thermal.py` | Per-zone 1R1C `ThermalModel`: RLS fits of k_out / k_mix per door regime, effective capacitance, diurnal disturbance, sensible power, COP estimation. Power is fit-consistent (`UA = c_eff·k`, `Q_ac = c_eff·(dT/dt − free_float_rate)`); outdoor *volume* flow for moisture stays `k_out·V`. |
 | `core/power.py` | Load composition (grid + battery − known loads), time-of-day `BaselineModel`, step-delta AC estimation, per-zone power allocation, shedding math, `outdoor_band()` for COP bookkeeping. |
-| `core/park.py` | Learned above-setpoint ("parked") head behavior: EWMA of extraction while parked + idle/trickle classification. Fed by the runtime from the thermal model's sensible power while the controller holds a zone parked. |
+| `core/park.py` | Learned above-setpoint ("parked") head behavior. Two axes: (1) thermal class from extraction EWMA — `idle` ≤25 W heat removed, `residual` ≥60 W residual cooling, else `unknown` (not fan electrical watts); (2) electrical fan floor / duty — `p_ac` below `fan_floor_w(N)` is fan-type park (no compression). Fed by the runtime from the thermal model's sensible power while parked. |
 | `core/drift.py` | Per-head, per-operating-state internal-sensor offset learning (internal vs external reference). Used to correct readings and as *fallback* setpoint translation. |
 | `core/comfort.py` | Comfort band, presets (`effective_preset`), demand setpoints (center vs Away/vacant band-hold), and model mode arbitration (`demand_integrals` over an 8 h free-float horizon with asymmetric exit). |
 | `core/types.py` | All dataclasses: `Settings`, `ZoneSnapshot`, `HouseSnapshot`, `Command`, `ControllerState` (+ its persistence round-trip). |
@@ -47,8 +47,10 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   `coordinator.py` command execution — either dynamically (tracking control: command
   `internal − delta`, re-anchored every `COMMAND_SPACING_S`) or statically via
   `DriftEstimator.offset(state)` as fallback. Never translate anywhere else.
-- **`sensible_power_w` is signed**: negative while cooling. It includes the storage term
-  `C·dT/dt`, which is why transient COP samples are valid.
+- **`sensible_power_w` is signed**: negative while cooling. It is
+  `c_eff · (dT/dt − free_float_rate)` — same rates `predict_free` integrates —
+  so standing load / COP / park extraction agree with the temperature model.
+  Transient COP samples are valid because the storage term is inside that excess.
 - **Multi-split constraint**: all heads share one compressor mode. Opposite-demand zones can
   only get `fan_only` (fan assist), and only after `COIL_DRY_S` — running a fan over a wet
   coil re-evaporates condensate and undoes latent work already paid for.
@@ -69,13 +71,13 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   multi-split (siblings keeping the compressor alive) may be *parked* — setpoint
   `internal ± preferred_margin` (cool/heat), mode kept — instead of turned off: bounded
   probes (`PARK_PROBE_S`, spaced `PARK_PROBE_SPACING_S`) while behavior is unclassified,
-  exploitation once a head is a known trickler whose learned output covers the zone's
+  exploitation once a head is a known residual head whose learned output covers the zone's
   `standing_load_w`. Park entry requires the zone already in-band on the conditioning side
   (`_park_ok_now`: cool `temp ≤ hi`); unfinished pull-down stays on a tracked setpoint.
   Session margin starts one step below `preferred_margin_k` (floored at `PARK_MARGIN_K` so
   the setpoint stays on the park side of the internal reading), escalates while the room
   keeps moving in the conditioning direction (up to `PARK_MARGIN_MAX_K`), and settles the
-  preferred depth on a clean exit. Devices differ (thermo-off vs keep-temperature trickle)
+  preferred depth on a clean exit. Devices differ (thermo-off vs keep-temperature residual)
   and the estimator learns which; nothing hardcodes either answer. Shed zones never park.
   Helper selection outranks parking. The overcorrection release sits `PARK_OVERCOOL_BUFFER_K`
   *below* the band floor (cool; above the ceiling in heat) — zones exit demand AT the floor,
@@ -86,7 +88,7 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   forces it to run is parked immediately if already in-band — no sibling requirement, no
   probe budget — because the compressor is alive regardless: observations are free, and an
   idling head saves energy versus tracked run-out. Out-of-band run-out keeps tracking
-  (unfinished pull-down must not park-coast). Parked releases honor `min_on`; continued
+  (unfinished pull-down must not fan-type park). Parked releases honor `min_on`; continued
   exploitation beyond it requires a live sibling (`want_on`); park direction follows
   `head_mode` when the house's dominant mode goes idle; overcorrected-but-unstoppable zones
   hold at `PARK_MARGIN_MAX_K` rather than being released into a forbidden off. Tracked
@@ -108,7 +110,9 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   `sensible_w` only when freshly fitted after park entry (`sensible_ts`). Never infer
   compression from `hvac_action`. Duty samples run on the 60 s control tick (not the 5 min
   thermal fit), with `PowerDebounce` / `PARK_DUTY_DEBOUNCE_S`. The per-margin `margin_bins`
-  map charts hysteresis; `coast_margin_k()` gives the cheapest coasting depth;
+  map charts hysteresis: `fan_type_min_margin_k()` (shallowest fan-type shelf),
+  `residual_max_margin_k()` (deepest still-compressing), `residual_edge_k()` (entry
+  target between them), `current_is_fan_type(margin)` (live session class);
   `cop_table_state` buckets house COP by control state to audit park-hold economics.
 - **Power-react vs 60 s tick.** Meter/known-load changes run `_async_power_react`: head-state
   scan + `_sample_power` + demand finalize + `notify`. Full `controller.tick` runs on that
@@ -123,8 +127,9 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   `auto_regime` off restores pre-regime semantics exactly. Heat shares the `continuous` path
   when load can feed the floor; `ventilate` remains cool-only. Opt-in `night_ventilate`
   (22:00–08:00) widens the ventilate margin to 0 K and suppresses continuous when outdoor
-  is within `NIGHT_SKIP_CONT_K` of the coolest target. Park entry prefers `coast_margin_k()`
-  once the hysteresis map has found a coasting depth. `t_out_synthetic` (climatology after a
+  is within `NIGHT_SKIP_CONT_K` of the coolest target. Park entry prefers
+  `residual_edge_k()` (between residual max and fan-type min) once the map has evidence —
+  not the fan-type shelf. `t_out_synthetic` (climatology after a
   configured outdoor dropout) blocks ventilate entry and window suggestions; virgin installs
   without an outdoor entity may still use climatology. Window grace clocks survive brief
   disqualification and re-arm only after `WINDOW_GRACE_S` continuously out of the pool.
@@ -188,7 +193,7 @@ ruff check . && ruff format .
 - The house may have zones with multiple mirrored heads and a single sensor
   (`n_rooms > 1`): per-head power is `allocated_w / n_rooms`, and thermal totals multiply
   back by `n_rooms`. Keep the two consistent. Park learning stays in the per-head
-  frame (`park_extraction_w`, trickle thresholds); `standing_load_w` is zone-total, so
+  frame (`park_extraction_w`, residual thresholds); `standing_load_w` is zone-total, so
   exploit compares extraction to `standing_load_w / n_rooms`. Solo-park electrical
   gating uses `fan_floor_w(n_rooms)` (`20 + fan_floor_per_head_w × N`) so multi-head
   fan draw is not mistaken for compression. `StartCounter` uses the same floor.

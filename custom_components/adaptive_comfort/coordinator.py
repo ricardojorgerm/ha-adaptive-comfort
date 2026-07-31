@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import time
 from datetime import timedelta
 from typing import Any
@@ -53,6 +54,7 @@ from .const import (
 from .core import comfort, controller, park, power, psychro
 from .core.drift import DriftEstimator
 from .core.power import BaselineModel, DrawEstimator
+from .core.predictor import HORIZONS_MIN, PredictorScorer
 from .core.series import TimeSeries
 from .core.thermal import DiurnalModel, ThermalModel, house_other_temperature
 from .core.types import (
@@ -78,7 +80,7 @@ from .core.types import (
     ZoneSnapshot,
 )
 from .fans import fan_entities_on
-from .presence import house_presence, presence_state
+from .presence import OccupancyDebounce, house_presence, presence_state
 from .storage import AdaptiveComfortStore
 
 _LOGGER = logging.getLogger(__name__)
@@ -175,6 +177,7 @@ class ZoneRuntime:
         self.indoor_fans_on = False
         self.outdoor_exhaust_on = False
         self.occupied: bool | None = None
+        self.occupancy = OccupancyDebounce()
         self.free_float: tuple[float, ...] = ()
         self.pred_60m: float | None = None
         self.allocated_w = 0.0
@@ -193,6 +196,7 @@ class ZoneRuntime:
             "park": self.park.to_dict(),
             "thermal": self.model.to_dict(),
             "drift": {h: d.to_dict() for h, d in self.drift.items()},
+            "occupancy": self.occupancy.to_dict(),
             "moisture_sources_kg_h": self.moisture_sources_kg_h,
             "moisture_schema": MOISTURE_SCHEMA,
         }
@@ -210,6 +214,8 @@ class ZoneRuntime:
             self.moisture_sources_kg_h = float(data.get("moisture_sources_kg_h", 0.0))
         else:
             self.moisture_sources_kg_h = 0.0
+        if "occupancy" in data:
+            self.occupancy = OccupancyDebounce.from_dict(data["occupancy"])
 
 
 class AdaptiveComfortRuntime:
@@ -272,7 +278,11 @@ class AdaptiveComfortRuntime:
         self.starts = power.StartCounter()
         self._last_state_key: str | None = None
         self.house_cop: float | None = None
-        self.free_float_bias: float | None = None
+        # Mean predicted-vs-band deviation across zones (K); NOT a prediction
+        # error metric -- see `_update_free_float_deviation`. Real
+        # predicted-vs-actual error lives in `predictor_scorer` below.
+        self.free_float_deviation: float | None = None
+        self.predictor_scorer = PredictorScorer()
         self.warm_excess_kh: float | None = None
         self.cold_deficit_kh: float | None = None
         self.window_suggestions: list[str] = []
@@ -516,6 +526,7 @@ class AdaptiveComfortRuntime:
             "park_learning",
             "auto_regime",
             "night_ventilate",
+            "prefer_continuous",
             "window_suggest",
         ):
             if key in settings:
@@ -583,6 +594,8 @@ class AdaptiveComfortRuntime:
                 zone.model.cop_samples = 0
         if "starts" in data:
             self.starts = power.StartCounter.from_dict(data["starts"])
+        if "predictor_scorer" in data:
+            self.predictor_scorer = PredictorScorer.from_dict(data["predictor_scorer"])
 
     def _persist(self) -> dict:
         s = self.settings
@@ -605,6 +618,7 @@ class AdaptiveComfortRuntime:
                 "park_learning": s.park_learning,
                 "auto_regime": s.auto_regime,
                 "night_ventilate": s.night_ventilate,
+                "prefer_continuous": s.prefer_continuous,
                 "fan_floor_per_head_w": s.fan_floor_per_head_w,
                 "window_suggest": s.window_suggest,
                 "hvac_mode": s.hvac_mode,
@@ -625,6 +639,7 @@ class AdaptiveComfortRuntime:
             "cop_table_banded": {k: [v[0], v[1]] for k, v in self.cop_table_banded.items()},
             "cop_table_state": {k: [v[0], v[1]] for k, v in self.cop_table_state.items()},
             "starts": self.starts.to_dict(),
+            "predictor_scorer": self.predictor_scorer.to_dict(),
         }
 
     async def _async_save(self, _now=None) -> None:
@@ -712,7 +727,7 @@ class AdaptiveComfortRuntime:
 
         The free-float side of sensible_power_w (dT/dt = 0, no AC term) at
         current conditions: what a parked/off zone gains per second. Used to
-        judge whether learned trickle output can carry a satisfied zone.
+        judge whether learned residual output can carry a satisfied zone.
         """
         if zone.temp is None or self.t_out is None:
             return None
@@ -733,6 +748,71 @@ class AdaptiveComfortRuntime:
         return house_other_temperature(
             zone_id, self._volume_readings(), self._aux_volume_readings()
         )
+
+    def _house_other_hourly(self, zone_id: str, hours: int) -> list[float] | None:
+        """Hourly house-other trajectory for predict_free's mixing term.
+
+        Counterfactual: *this* zone's heads are off (what predict_free
+        models for the zone being predicted) while siblings keep being
+        controlled as usual -- "my heads off, siblings as usual", not the
+        house-wide no-AC counterfactual `comfort.demand_integrals` builds
+        zone-by-zone from each zone's own predict_free output. Using a
+        constant "frozen at right now" house-other reading for a 24 h
+        integration silently assumes a sibling stays wherever it happens to
+        be this instant even if it is mid-cycle; since siblings under active
+        control are pulled toward their own comfort band, a sibling that is
+        currently on is modelled converging toward its band centre (what
+        control keeps it near) while a sibling that is off is held at its
+        last reading (no better forward model without recursing into a full
+        multi-zone simulation, which is out of scope here). Volume-weighted
+        like the instantaneous `house_other_temperature()`.
+        """
+        others: list[tuple[float, float, float]] = []  # (now_t, target_t, volume)
+        for other_zid, other in self.zones.items():
+            if other_zid == zone_id or other.temp is None:
+                continue
+            vol = other.config.total_volume_m3
+            if vol <= 0:
+                continue
+            if other.is_on:
+                target = comfort.band_center(
+                    self.settings, self.t_rm, self.settings.zone_offsets.get(other_zid, 0.0)
+                )
+            else:
+                target = other.temp
+            others.append((other.temp, target, vol))
+        for temp, vol in self._aux_volume_readings():
+            others.append((temp, temp, vol))
+        if not others:
+            return None
+        # ~90 min time constant to approach the controlled target -- fast
+        # enough to matter within the scoring horizons, slow enough not to
+        # pretend a sibling snaps to setpoint instantly.
+        tau_h = 1.5
+        trajectory: list[float] = []
+        for h in range(hours):
+            frac = 1.0 - math.exp(-(h + 1) / tau_h)
+            total = 0.0
+            weight = 0.0
+            for now_t, target_t, vol in others:
+                total += vol * (now_t + frac * (target_t - now_t))
+                weight += vol
+            trajectory.append(total / weight if weight > 0 else 0.0)
+        return trajectory
+
+    @staticmethod
+    def _coeffs_snapshot(zone: ZoneRuntime) -> dict:
+        """Model coefficients in effect for one zone right now (predictor audit)."""
+        model = zone.model
+        door = zone.door_open
+        return {
+            "k_out_h": round(model.k(door), 5),
+            "k_mix_h": round(model.k_mix(door), 5),
+            "door_open": door,
+            "fit_samples": model.fit_samples(door),
+            "fit_stage": model.fit_stage(door),
+            "q": model.q_coeffs(door),
+        }
 
     def _zone_temp(self, zone: ZoneRuntime) -> float | None:
         """Corrected zone temperature: external sensor, else drift-corrected head."""
@@ -966,7 +1046,8 @@ class AdaptiveComfortRuntime:
             zone.door_open = door is not None and door.state == STATE_ON
             zone.indoor_fans_on = fan_entities_on(self.hass, cfg.indoor_fan_entities)
             zone.outdoor_exhaust_on = fan_entities_on(self.hass, cfg.outdoor_exhaust_fan_entities)
-            zone.occupied = presence_state(self.hass, cfg.presence_sensor)
+            raw_occ = presence_state(self.hass, cfg.presence_sensor)
+            zone.occupied = zone.occupancy.update(raw_occ, now_ts)
 
             internals: list[float] = []
             setpoints: list[float] = []
@@ -1217,7 +1298,7 @@ class AdaptiveComfortRuntime:
     def _update_park_learners(self, now_ts: float, local_hour: float) -> None:
         """Feed parked-zone learners once per control tick.
 
-        Activity (compression vs coast) is judged electrically with a
+        Activity (compression vs fan-type park) is judged electrically with a
         PARK_DUTY_DEBOUNCE_S settle so brief meter blips do not flip duty.
         Extraction magnitude reuses the latest thermal sensible_w (updated on
         the 5 min fit); stale values from before park entry are skipped so
@@ -1348,9 +1429,10 @@ class AdaptiveComfortRuntime:
         for zone in self.zones.values():
             free_float: tuple[float, ...] = ()
             pred_60m = None
+            zid = zone.config.zone_id
+            t_house = house_other_temperature(zid, volume_readings, aux_readings)
             if zone.temp is not None and forecast:
-                zid = zone.config.zone_id
-                t_house = house_other_temperature(zid, volume_readings, aux_readings)
+                t_house_hourly = self._house_other_hourly(zid, FORECAST_HOURS)
                 trajectory = zone.model.predict_free(
                     zone.temp,
                     forecast,
@@ -1358,15 +1440,29 @@ class AdaptiveComfortRuntime:
                     hours=FORECAST_HOURS,
                     door_open=zone.door_open,
                     t_house_other=t_house,
+                    t_house_hourly=t_house_hourly,
                     indoor_fans_on=zone.indoor_fans_on,
                     outdoor_exhaust_on=zone.outdoor_exhaust_on,
                 )
                 free_float = tuple(trajectory)
                 if len(trajectory) > 1:
                     pred_60m = trajectory[1]
+                self._record_predictions(
+                    now_ts, zone, forecast, t_house, t_house_hourly, local_hour
+                )
             zone.free_float = free_float
             zone.pred_60m = pred_60m
             zone.standing_load_w = self._standing_load_w(zone)
+            mixing_gain_w = None
+            mixing_coupling = None
+            if zone.temp is not None and t_house is not None:
+                _k_out, k_mix = zone.model._scaled_k(
+                    zone.door_open,
+                    indoor_fans_on=zone.indoor_fans_on,
+                    outdoor_exhaust_on=zone.outdoor_exhaust_on,
+                )
+                mixing_coupling = zone.model.c_eff_wh_per_k * k_mix
+                mixing_gain_w = mixing_coupling * (t_house - zone.temp)
             mode = MODE_HEAT if zone.head_state == STATE_HEATING else MODE_COOL
             zone_snaps.append(
                 ZoneSnapshot(
@@ -1384,10 +1480,15 @@ class AdaptiveComfortRuntime:
                     confidence=zone.model.confidence(zone.door_open),
                     draw_w=self.draws.draw_w(zone.config.zone_id, mode),
                     enabled=self.settings.zone_enabled.get(zone.config.zone_id, True),
-                    park_trickles=zone.park.trickles,
+                    park_residuals=zone.park.residuals,
                     park_extraction_w=zone.park.extraction_w,
                     park_preferred_margin_k=zone.park.preferred_margin_k,
-                    park_coast_margin_k=zone.park.coast_margin_k(),
+                    park_fan_type_min_margin_k=zone.park.fan_type_min_margin_k(),
+                    park_residual_max_margin_k=zone.park.residual_max_margin_k(),
+                    park_residual_edge_k=zone.park.residual_edge_k(),
+                    park_current_is_fan_type=zone.park.current_is_fan_type(
+                        self.controller_state.zone_park_margin.get(zone.config.zone_id)
+                    ),
                     park_samples=zone.park.samples,
                     head_mode=(
                         MODE_HEAT
@@ -1397,6 +1498,8 @@ class AdaptiveComfortRuntime:
                         else None
                     ),
                     standing_load_w=zone.standing_load_w,
+                    mixing_gain_w=mixing_gain_w,
+                    mixing_coupling_w_per_k=mixing_coupling,
                 )
             )
         cop_hints = {
@@ -1428,7 +1531,73 @@ class AdaptiveComfortRuntime:
             forecast_hours=tuple(forecast),
             cop_by_head_count=cop_hints,
             aux_indoor=tuple(aux_indoor),
+            p_ac=self.p_ac,
+            compression_floor_w=self._compression_floor_w(
+                [z for z in self.zones.values() if z.is_on],
+                {
+                    zid
+                    for zid, since in self.controller_state.zone_parked_since.items()
+                    if since
+                },
+            ),
         )
+
+    def _record_predictions(
+        self,
+        now_ts: float,
+        zone: ZoneRuntime,
+        forecast: list[float],
+        t_house: float | None,
+        t_house_hourly: list[float] | None,
+        local_hour: float,
+    ) -> None:
+        """Log a predicted-vs-actual sample at each scoring horizon.
+
+        Uses the finer `predict_horizons` integrator (not the hourly
+        `predict_free` trajectory) so 15/30-minute predictions land on the
+        actual target time instead of the nearest hour.
+        """
+        preds = zone.model.predict_horizons(
+            zone.temp,
+            forecast,
+            local_hour,
+            HORIZONS_MIN,
+            door_open=zone.door_open,
+            t_house_other=t_house,
+            t_house_hourly=t_house_hourly,
+            indoor_fans_on=zone.indoor_fans_on,
+            outdoor_exhaust_on=zone.outdoor_exhaust_on,
+        )
+        if not preds:
+            return
+        coeffs = self._coeffs_snapshot(zone)
+        for horizon_min, predicted_t in preds.items():
+            due_h = horizon_min / 60.0
+            forecast_t_out = None
+            if forecast:
+                idx = min(int(due_h), len(forecast) - 1)
+                frac = min(due_h - idx, 1.0)
+                nxt = min(idx + 1, len(forecast) - 1)
+                forecast_t_out = forecast[idx] * (1 - frac) + forecast[nxt] * frac
+            self.predictor_scorer.record(
+                now_ts,
+                zone.config.zone_id,
+                horizon_min,
+                predicted_t,
+                coeffs,
+                forecast_t_out,
+                t_house_used=t_house,
+            )
+
+    def _score_predictions(self, now_ts: float) -> None:
+        """Resolve pending predictions whose horizon has elapsed (tick-rate is fine)."""
+        zone_off_since = {zid: z.all_off_since for zid, z in self.zones.items()}
+        actual_temp = {zid: z.temp for zid, z in self.zones.items() if z.temp is not None}
+        self.predictor_scorer.score_due(now_ts, zone_off_since, actual_temp, self.t_out)
+
+    def predictor_stats(self, zone_id: str) -> dict[int, dict]:
+        """Per-horizon {bias_k, mae_k, n} for one zone (diagnostics/sensors)."""
+        return self.predictor_scorer.all_stats(zone_id)
 
     def reset_track_deltas(self) -> None:
         """Clear sticky tracking depth (Manual enter / house vacant→occupied)."""
@@ -1521,7 +1690,8 @@ class AdaptiveComfortRuntime:
             zone = self.zones.get(command.zone_id)
             if zone is not None:
                 zone.last_control_reason = command.reason
-        self._update_free_float_bias(snapshot)
+        self._update_free_float_deviation(snapshot)
+        self._score_predictions(now_ts)
         if self.manual_control:
             # Still force children off when hub HVAC is Off; otherwise hands-off.
             if self.settings.hvac_mode == MODE_OFF:
@@ -1578,17 +1748,32 @@ class AdaptiveComfortRuntime:
             attrs["park_active_ratio"] = (
                 None if zone.park.active_ratio is None else round(zone.park.active_ratio, 3)
             )
-            attrs["park_coast_margin_k"] = zone.park.coast_margin_k()
+            attrs["park_fan_only_ratio"] = (
+                None if zone.park.fan_only_ratio is None else round(zone.park.fan_only_ratio, 3)
+            )
+            attrs["park_fan_type_min_margin_k"] = zone.park.fan_type_min_margin_k()
+            attrs["park_residual_max_margin_k"] = zone.park.residual_max_margin_k()
+            attrs["park_residual_edge_k"] = zone.park.residual_edge_k()
+            attrs["park_current_is_fan_type"] = zone.park.current_is_fan_type(
+                st.zone_park_margin.get(zid)
+            )
         return attrs
 
-    def _update_free_float_bias(self, snapshot: HouseSnapshot) -> None:
+    def _update_free_float_deviation(self, snapshot: HouseSnapshot) -> None:
+        """Mean (predicted no-AC trajectory - band centre) across zones, K.
+
+        This is a *demand* indicator (how far the house wants to drift from
+        target if left alone) -- distance-to-setpoint, not prediction error.
+        It must never be read as model accuracy; for real predicted-vs-actual
+        error see `predictor_scorer` / `predictor_stats()`.
+        """
+        deviations = []
         center = comfort.band_center(self.settings, self.t_rm)
-        biases = []
         for zone in snapshot.zones:
             if zone.free_float:
                 mean_traj = sum(zone.free_float) / len(zone.free_float)
-                biases.append(mean_traj - center)
-        self.free_float_bias = sum(biases) / len(biases) if biases else None
+                deviations.append(mean_traj - center)
+        self.free_float_deviation = sum(deviations) / len(deviations) if deviations else None
 
     async def _async_execute(self, command) -> None:
         zone = self.zones.get(command.zone_id)
@@ -1630,7 +1815,7 @@ class AdaptiveComfortRuntime:
                     margin = command.park_margin or controller.PARK_MARGIN_K
                     # Park: ride just above the internal reading, keeping the
                     # compressor mode, so the device's own above-setpoint
-                    # policy (idle vs keep-temperature trickle) expresses
+                    # policy (idle vs keep-temperature residual) expresses
                     # itself and can be measured. Never used for shed zones.
                     raw = (
                         float(internal) + margin
@@ -1725,6 +1910,7 @@ class AdaptiveComfortRuntime:
             "shed_urgent": self.shed_urgent,
             "p_load": self.p_load,
             "p_ac": self.p_ac,
+            "baseline_coverage": self.baseline.coverage(),
             "forecast": self.forecast,
             "cop_table": {str(k): v for k, v in self.cop_table.items()},
             "cop_table_banded": dict(self.cop_table_banded),
@@ -1744,7 +1930,16 @@ class AdaptiveComfortRuntime:
                     "c_eff_wh_per_k": z.model.c_eff_wh_per_k,
                     "furniture_factor": z.model.furniture_factor,
                     "cop": z.model.cop,
-                    "park": z.park.to_dict() | {"classification": z.park.classification},
+                    "park": z.park.to_dict()
+                    | {
+                        "classification": z.park.classification,
+                        "park_fan_type_min_margin_k": z.park.fan_type_min_margin_k(),
+                        "park_residual_max_margin_k": z.park.residual_max_margin_k(),
+                        "park_residual_edge_k": z.park.residual_edge_k(),
+                        "park_current_is_fan_type": z.park.current_is_fan_type(
+                            self.controller_state.zone_park_margin.get(zid)
+                        ),
+                    },
                     "confidence": z.model.confidence(z.door_open),
                     "drift": {h: d.to_dict() for h, d in z.drift.items()},
                     "sensible_w": z.sensible_w,
@@ -1753,9 +1948,11 @@ class AdaptiveComfortRuntime:
                     "standing_load_w": (
                         None if z.standing_load_w is None else round(z.standing_load_w, 1)
                     ),
-                    "disturbance": z.model.disturbance_diag(
-                        self._local_hour(), z.door_open
-                    ),
+                    "disturbance": z.model.disturbance_diag(self._local_hour(), z.door_open),
+                    "predictor": {
+                        "stats_by_horizon_min": self.predictor_stats(zid),
+                        "pending": self.predictor_scorer.pending_count(zid),
+                    },
                 }
                 for zid, z in self.zones.items()
             },

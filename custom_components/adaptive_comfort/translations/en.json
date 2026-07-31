@@ -198,7 +198,7 @@
           "manual": "Manual"
         }
       },
-      "free_float_bias": { "name": "Free-float bias" },
+      "free_float_deviation": { "name": "Free-float deviation" },
       "warm_excess": { "name": "Predicted warm excess" },
       "cold_deficit": { "name": "Predicted cold deficit" },
       "total_sensible": { "name": "Total sensible power" },
@@ -217,6 +217,7 @@
       "compressor_starts_per_hour": { "name": "Compressor starts per hour" },
       "zone_temperature": { "name": "Temperature (corrected)" },
       "predicted_60m": { "name": "Predicted temperature +60 min" },
+      "predictor_error": { "name": "Predictor error (MAE, 30 min)" },
       "k_exchange": { "name": "Outdoor exchange constant k" },
       "k_mix": { "name": "House mixing constant k" },
       "ach": { "name": "Air changes per hour (total)" },
@@ -253,7 +254,7 @@
       "track_delta": { "name": "Tracking depth" },
       "park_classification": {
         "name": "Park classification",
-        "state": { "unknown": "Unknown", "idle": "Idle", "trickle": "Trickle" }
+        "state": { "unknown": "Unknown", "idle": "Idle", "residual": "Residual" }
       },
       "park_margin": { "name": "Park margin" },
       "park_extraction": { "name": "Park extraction" }
@@ -287,6 +288,7 @@
       "park_learning": { "name": "Park-behavior learning" },
       "auto_regime": { "name": "Automatic regime (ventilate / continuous / cycling)" },
       "night_ventilate": { "name": "Night outdoor gating (prefer free cooling overnight)" },
+      "prefer_continuous": { "name": "Prefer continuous (anchor head carries house load)" },
       "window_suggest": { "name": "Wait for manual ventilation" },
       "manual_control": { "name": "Manual control (pause adaptive)" },
       "zone_enabled": { "name": "Zone enabled" }

@@ -37,8 +37,10 @@ def test_anchoring_chain():
     assert abs(model.k_mix(False) - 0.0) < 1e-9
     assert abs(model.ach - 0.5) < 1e-9
     assert abs(model.airflow_m3h - 15.0) < 1e-9
-    assert abs(model.ua_w_per_k - 0.34 * 15.0) < 1e-9
+    # UA is fit-consistent: C_eff · k (default furniture_factor = 4).
     assert abs(model.c_air_wh_per_k - 0.34 * 30.0) < 1e-9
+    assert abs(model.ua_w_per_k - model.c_eff_wh_per_k * 0.5) < 1e-9
+    assert abs(model.ua_w_per_k - 0.34 * 15.0 * model.furniture_factor) < 1e-9
 
 
 def test_passive_cooling_from_house_mixing():
@@ -133,7 +135,7 @@ def test_cop_estimation_quasi_steady():
     t_in, t_out, p_head = 23.0, 33.0, 500.0
     for _ in range(100):
         model.update_cop(p_head, t_in, t_out, local_hour=15.0)
-    # Q = UA * 10 K = 0.34*0.4*30*10 = 40.8 W -> tiny COP, rejected (out of bounds)
+    # Steady hold: Q = C_eff · k · ΔT = 40.8·0.4·10 ≈ 163 W → COP ~0.33, rejected.
     assert model.cop is None or model.cop >= 0.5
 
 
@@ -191,7 +193,47 @@ def test_update_cop_includes_latent():
     latent-inclusive sample lands in the plausible band."""
     a = _cool_capable_model()
     b = _cool_capable_model()
-    a.update_cop(400.0, 24.0, 30.0, 12.0, dtdt_per_h=-3.0)
-    b.update_cop(400.0, 24.0, 30.0, 12.0, dtdt_per_h=-3.0, latent_w=200.0)
-    assert a.cop is None  # sensible-only: 147 W / 400 W -> below COP_MIN
+    # |Q_sens| ≈ C_eff·|−3 − 0.4·6| ≈ 220 W; at 500 W electric → COP ~0.44 < COP_MIN.
+    a.update_cop(500.0, 24.0, 30.0, 12.0, dtdt_per_h=-3.0)
+    b.update_cop(500.0, 24.0, 30.0, 12.0, dtdt_per_h=-3.0, latent_w=200.0)
+    assert a.cop is None  # sensible-only below COP_MIN
     assert b.cop is not None and b.cop > 0.8  # latent counted as delivered heat
+
+
+def test_sensible_power_matches_c_eff_times_excess_rate():
+    """Watt side must agree with the rate model predict_free integrates."""
+    model = _cool_capable_model()
+    model.furniture_factor = 4.0
+    t_in, t_out, t_house, hour = 24.0, 30.0, 22.0, 12.0
+    model.fits[False].theta[1] = 0.3  # k_mix
+    dtdt = -1.5
+    ff = model.free_float_rate(t_in, t_out, hour, t_house_other=t_house)
+    q = model.sensible_power_w(t_in, t_out, dtdt, hour, t_house_other=t_house)
+    assert abs(q - model.c_eff_wh_per_k * (dtdt - ff)) < 1e-9
+    # Standing load (dtdt=0): AC must cancel free-float warming.
+    stand = -model.sensible_power_w(t_in, t_out, 0.0, hour, t_house_other=t_house)
+    assert abs(stand - model.c_eff_wh_per_k * ff) < 1e-9
+    assert abs(model.ua_mix_w_per_k - model.c_eff_wh_per_k * 0.3) < 1e-9
+
+
+def test_update_c_eff_recovers_furniture_from_excess_rate():
+    """Furniture learning uses Q / excess_rate — not circular UA(=C·k)."""
+    model = ThermalModel(volume_m3=30.0)
+    model.fits[False].theta[0] = 0.3
+    model.fits[False].theta[1] = 0.0
+    model.fits[False].samples = 1000
+    model.furniture_factor = 2.0
+    model.cop = 3.0
+    model.cop_samples = 20
+    # True C_eff = 0.34*30*5 = 51; cool with known Q and matching dtdt.
+    true_ff = 5.0  # furniture
+    c_air = 0.34 * 30.0
+    c_true = c_air * true_ff
+    q_hvac = -3.0 * 600.0  # COP*P, cooling
+    # q_hvac = C * (dtdt - ff_rate); ff_rate = k*ΔT = 0.3*10 = 3 at these temps
+    t_in, t_out = 23.0, 33.0
+    ff_rate = 0.3 * (t_out - t_in)
+    dtdt = q_hvac / c_true + ff_rate
+    for _ in range(80):
+        model.update_c_eff(600.0, False, t_in, t_out, dtdt, 12.0)
+    assert abs(model.furniture_factor - true_ff) < 0.35

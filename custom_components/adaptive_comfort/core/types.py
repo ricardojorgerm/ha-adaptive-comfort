@@ -125,8 +125,9 @@ class Settings:
     tracking: bool = True
     # Characterize and exploit above-setpoint head behavior instead of
     # assuming it: bounded probes measure whether parked heads idle or
-    # trickle, then parking replaces hard-off when trickle output can
-    # carry a satisfied zone's standing load (multi-split, siblings on).
+    # hold residual compression, then parking replaces hard-off when
+    # residual output can carry a satisfied zone's standing load
+    # (multi-split, siblings on).
     park_learning: bool = True
     # Regime policy: per-tick choice among 'ventilate' (outdoor beats the
     # compressor: gate cooling demand), 'continuous' (load can feed the
@@ -137,6 +138,13 @@ class Settings:
     # ventilate / cycling path instead of continuous park-holds (opt-in;
     # field data showed ~280 W overnight compression against cool outdoor air).
     night_ventilate: bool = False
+    # Opt-in: keep exactly one already-loaded "anchor" head parked instead of
+    # released to off, so the compressor keeps running continuously for the
+    # house's aggregate standing load even when every zone is individually
+    # satisfied. Other zones cycle/off normally - this is not the per-zone
+    # 'continuous' regime (which parks whichever zones justify it on their
+    # own load), it is a single elected anchor. See controller._update_anchor.
+    prefer_continuous: bool = False
     # Per-open-head electrical fan floor (W). Gate = 20 + this * heads.
     fan_floor_per_head_w: float = 55.0
     # Hold mechanical conditioning briefly while the user is expected to ventilate manually.
@@ -171,7 +179,7 @@ class ZoneSnapshot:
     draw_w: float | None = None  # learned total electrical draw of the zone
     enabled: bool = True
     # Park-behavior knowledge (from ParkEstimator): None until classified.
-    park_trickles: bool | None = None
+    park_residuals: bool | None = None
     # Parked observations accumulated so far (probe bookkeeping: a probe
     # only counts against the probe budget if it produced observations).
     park_samples: int = 0
@@ -183,12 +191,29 @@ class ZoneSnapshot:
     park_extraction_w: float | None = None  # sensed-room / per-head parked output (W)
     # Learned park depth (K) to start from on the next park entry.
     park_preferred_margin_k: float | None = None
-    # Cheapest margin bin whose compression duty is low (from ParkEstimator).
-    park_coast_margin_k: float | None = None
+    # Shallowest (min) fan-type shelf — mode on, no compression (diagnostics).
+    park_fan_type_min_margin_k: float | None = None
+    # Deepest (max) still-compressing residual bin (diagnostics).
+    park_residual_max_margin_k: float | None = None
+    # Entry target: residual↔fan-type edge (bisect of max residual and min
+    # fan-type, finer than the 0.5 K grid).
+    park_residual_edge_k: float | None = None
+    # Is the *current* session margin fan-type? (live electrical class).
+    park_current_is_fan_type: bool | None = None
     # Estimated standing heat load of the *zone* at current conditions
     # (W, >=0, sensed-room inflow x n_rooms). Park extraction is per-head;
     # exploit compares extraction to standing_load_w / n_rooms.
     standing_load_w: float | None = None
+    # Signed house-mixing heat flow into the sensed room at current
+    # conditions: c_eff * k_mix * (T_house_other - T_zone), sensed-room /
+    # per-head frame (W). Positive = heat flowing from the house into this
+    # zone. Used to judge whether a sibling's conditioning already covers
+    # this zone's own standing load via mixing alone (free-ride policy).
+    mixing_gain_w: float | None = None
+    # Raw mixing coupling strength c_eff * k_mix (W/K), independent of the
+    # instantaneous ΔT - a "how thermally central is this room to the rest
+    # of the house" proxy (used as an anchor-selection tie-break).
+    mixing_coupling_w_per_k: float | None = None
 
 
 @dataclass
@@ -215,6 +240,10 @@ class HouseSnapshot:
     # Temperatures from unconditioned rooms as (temp, weight) pairs; weak
     # extra indoor evidence for cold-start mode arbitration.
     aux_indoor: tuple[tuple[float, float], ...] = ()
+    # Electrical AC residual (W) and the live fan-floor used as the compression
+    # threshold — plant-level min_on keys off these, not per-zone timers.
+    p_ac: float | None = None
+    compression_floor_w: float = 75.0
 
 
 @dataclass
@@ -279,6 +308,22 @@ class ControllerState:
     zone_park_preferred: dict[str, float] = field(default_factory=dict)
     shed: dict[str, float] = field(default_factory=dict)  # zone_id -> shed ts
     last_shed_action: float = 0.0
+    # prefer_continuous: the single elected anchor zone (None when the
+    # policy is off or no zone currently qualifies).
+    anchor_zone: str | None = None
+    anchor_since: float = 0.0
+    # sibling-sustain: observed, ORDERED (rider_zone -> lead_zone -> [ewma
+    # in-band ratio, samples]) evidence that a zone stays in-band via house
+    # mixing while a specific sibling conditions. Opportunistic-only: never
+    # forces a reverse-direction probe, purely accumulates from ticks where
+    # the rider was already off/free-riding.
+    sibling_sustain: dict[str, dict[str, tuple[float, int]]] = field(default_factory=dict)
+    # Plant compression run clock (epoch s). Set on rising edge of
+    # p_ac >= compression_floor; cleared after START_DEBOUNCE_S below the
+    # floor (brief inverter dips do not reset min_on). Enforced against
+    # this clock, not per-zone zone_since.
+    plant_compress_since: float = 0.0
+    plant_below_since: float = 0.0  # first sub-floor sample while run live
 
     def to_dict(self) -> dict:
         return {
@@ -301,6 +346,14 @@ class ControllerState:
             "window_suggest_out_since": dict(self.window_suggest_out_since),
             "regime": self.regime,
             "regime_since": self.regime_since,
+            "anchor_zone": self.anchor_zone,
+            "anchor_since": self.anchor_since,
+            "plant_compress_since": self.plant_compress_since,
+            "plant_below_since": self.plant_below_since,
+            "sibling_sustain": {
+                rider: {sib: [ratio, samples] for sib, (ratio, samples) in subs.items()}
+                for rider, subs in self.sibling_sustain.items()
+            },
         }
 
     @classmethod
@@ -345,6 +398,19 @@ class ControllerState:
         }
         st.regime = str(data.get("regime", "cycling"))
         st.regime_since = float(data.get("regime_since", 0.0))
+        st.anchor_zone = data.get("anchor_zone")
+        st.anchor_since = float(data.get("anchor_since", 0.0))
+        st.plant_compress_since = float(data.get("plant_compress_since", 0.0))
+        st.plant_below_since = float(data.get("plant_below_since", 0.0))
+        for rider, subs in data.get("sibling_sustain", {}).items():
+            entry: dict[str, tuple[float, int]] = {}
+            for sib, value in subs.items():
+                try:
+                    entry[str(sib)] = (float(value[0]), int(value[1]))
+                except (TypeError, ValueError, IndexError):
+                    continue
+            if entry:
+                st.sibling_sustain[str(rider)] = entry
         return st
 
 

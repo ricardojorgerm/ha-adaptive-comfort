@@ -271,7 +271,7 @@ def test_park_learners_solo_stale_sensible_still_duty_samples():
     rt.controller_state.zone_park_margin["z"] = 1.0
     rt.controller_state.mode = MODE_COOL
     rt.zones = {"z": zone}
-    # Below fan floor → coast: must still observe (extraction 0), not skip.
+    # Below fan floor → fan-type park: must still observe (extraction 0), not skip.
     rt.p_load = 50.0
     rt.baseline = power.BaselineModel()
     rt.baseline.update(12.0, 40.0)

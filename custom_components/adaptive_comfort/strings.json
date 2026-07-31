@@ -187,8 +187,8 @@
           "cool": "Cool"
         }
       },
-      "free_float_bias": {
-        "name": "Free-float bias"
+      "free_float_deviation": {
+        "name": "Free-float deviation"
       },
       "warm_excess": {
         "name": "Predicted warm excess"
@@ -227,6 +227,9 @@
       },
       "predicted_60m": {
         "name": "Predicted temperature +60 min"
+      },
+      "predictor_error": {
+        "name": "Predictor error (MAE, 30 min)"
       },
       "k_exchange": {
         "name": "Outdoor exchange constant k"
@@ -295,7 +298,7 @@
         "state": {
           "unknown": "Unknown",
           "idle": "Idle",
-          "trickle": "Trickle"
+          "residual": "Residual"
         }
       },
       "park_margin": {
@@ -399,6 +402,9 @@
       },
       "night_ventilate": {
         "name": "Night outdoor gating (prefer free cooling overnight)"
+      },
+      "prefer_continuous": {
+        "name": "Prefer continuous (anchor head carries house load)"
       },
       "window_suggest": {
         "name": "Wait for manual ventilation"

@@ -198,7 +198,7 @@
           "manual": "Manual"
         }
       },
-      "free_float_bias": { "name": "Desvio em flutuação livre" },
+      "free_float_deviation": { "name": "Desvio em flutuação livre" },
       "warm_excess": { "name": "Excesso térmico previsto" },
       "cold_deficit": { "name": "Défice térmico previsto" },
       "total_sensible": { "name": "Potência sensível total" },
@@ -217,6 +217,7 @@
       "compressor_starts_per_hour": { "name": "Arranques do compressor por hora" },
       "zone_temperature": { "name": "Temperatura (corrigida)" },
       "predicted_60m": { "name": "Temperatura prevista +60 min" },
+      "predictor_error": { "name": "Erro do previsor (MAE, 30 min)" },
       "k_exchange": { "name": "Constante de troca exterior k" },
       "k_mix": { "name": "Constante de mistura interior k" },
       "ach": { "name": "Renovações de ar por hora (total)" },
@@ -253,7 +254,7 @@
       "track_delta": { "name": "Profundidade de tracking" },
       "park_classification": {
         "name": "Classificação de park",
-        "state": { "unknown": "Desconhecido", "idle": "Idle", "trickle": "Trickle" }
+        "state": { "unknown": "Desconhecido", "idle": "Idle", "residual": "Residual" }
       },
       "park_margin": { "name": "Margem de park" },
       "park_extraction": { "name": "Extração em park" }
@@ -287,6 +288,7 @@
       "park_learning": { "name": "Aprendizagem de comportamento em park" },
       "auto_regime": { "name": "Regime automático (ventilar / contínuo / ciclos)" },
       "night_ventilate": { "name": "Prioridade à ventilação noturna (ar exterior fresco)" },
+      "prefer_continuous": { "name": "Preferir contínuo (cabeça âncora carrega a casa)" },
       "window_suggest": { "name": "Aguardar ventilação manual" },
       "manual_control": { "name": "Controlo manual (pausar adaptativo)" },
       "zone_enabled": { "name": "Zona ativa" }

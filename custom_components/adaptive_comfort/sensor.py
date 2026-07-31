@@ -109,12 +109,12 @@ HOUSE_SENSORS: tuple[HouseSensorDescription, ...] = (
         },
     ),
     HouseSensorDescription(
-        key="free_float_bias",
-        translation_key="free_float_bias",
+        key="free_float_deviation",
+        translation_key="free_float_deviation",
         native_unit_of_measurement="K",
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda r: _round(r.free_float_bias, 2),
+        value_fn=lambda r: _round(r.free_float_deviation, 2),
     ),
     HouseSensorDescription(
         key="warm_excess",
@@ -193,6 +193,10 @@ HOUSE_SENSORS: tuple[HouseSensorDescription, ...] = (
             "since": r.controller_state.regime_since,
             "auto_regime": r.settings.auto_regime,
             "night_ventilate": r.settings.night_ventilate,
+            "prefer_continuous": r.settings.prefer_continuous,
+            "anchor_zone": r.controller_state.anchor_zone,
+            "anchor_since": r.controller_state.anchor_since,
+            "plant_compress_since": r.controller_state.plant_compress_since,
         },
     ),
     HouseSensorDescription(
@@ -231,6 +235,19 @@ def _drift_attrs(zone: ZoneRuntime, _r: AdaptiveComfortRuntime) -> dict:
     }
 
 
+def _predictor_attrs(zone: ZoneRuntime, r: AdaptiveComfortRuntime) -> dict:
+    stats = r.predictor_stats(zone.config.zone_id)
+    attrs: dict[str, Any] = {f"{horizon}m": values for horizon, values in stats.items()}
+    attrs["pending"] = r.predictor_scorer.pending_count(zone.config.zone_id)
+    return attrs
+
+
+def _predictor_mae_30m(zone: ZoneRuntime, r: AdaptiveComfortRuntime) -> float | None:
+    stats = r.predictor_stats(zone.config.zone_id)
+    stat = stats.get(30)
+    return None if stat is None else stat["mae_k"]
+
+
 ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
     ZoneSensorDescription(
         key="temperature",
@@ -248,6 +265,15 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z, r: _round(z.pred_60m, 2),
+    ),
+    ZoneSensorDescription(
+        key="predictor_error",
+        translation_key="predictor_error",
+        native_unit_of_measurement="K",
+        state_class=SensorStateClass.MEASUREMENT,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        value_fn=_predictor_mae_30m,
+        attr_fn=_predictor_attrs,
     ),
     ZoneSensorDescription(
         key="k_exchange",
@@ -438,20 +464,27 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         key="park_classification",
         translation_key="park_classification",
         device_class=SensorDeviceClass.ENUM,
-        options=["unknown", "idle", "trickle"],
+        options=["unknown", "idle", "residual"],
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z, r: z.park.classification,
         attr_fn=lambda z, r: {
-            "samples": z.park.samples,
-            "preferred_margin_k": r.controller_state.zone_park_preferred.get(
+            "park_samples": z.park.samples,
+            "park_preferred_margin_k": r.controller_state.zone_park_preferred.get(
                 z.config.zone_id, z.park.preferred_margin_k
             ),
-            "active_ratio": None if z.park.active_ratio is None else round(z.park.active_ratio, 3),
-            "fan_only_ratio": None
-            if z.park.fan_only_ratio is None
-            else round(z.park.fan_only_ratio, 3),
-            "coast_margin_k": z.park.coast_margin_k(),
-            "margin_bins": z.park.margin_bins,
+            "park_active_ratio": (
+                None if z.park.active_ratio is None else round(z.park.active_ratio, 3)
+            ),
+            "park_fan_only_ratio": (
+                None if z.park.fan_only_ratio is None else round(z.park.fan_only_ratio, 3)
+            ),
+            "park_fan_type_min_margin_k": z.park.fan_type_min_margin_k(),
+            "park_residual_max_margin_k": z.park.residual_max_margin_k(),
+            "park_residual_edge_k": z.park.residual_edge_k(),
+            "park_current_is_fan_type": z.park.current_is_fan_type(
+                r.controller_state.zone_park_margin.get(z.config.zone_id)
+            ),
+            "park_margin_bins": z.park.margin_bins,
         },
     ),
     ZoneSensorDescription(
@@ -461,6 +494,17 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z, r: _round(r.controller_state.zone_park_margin.get(z.config.zone_id), 2),
+        attr_fn=lambda z, r: {
+            "park_preferred_margin_k": r.controller_state.zone_park_preferred.get(
+                z.config.zone_id, z.park.preferred_margin_k
+            ),
+            "park_fan_type_min_margin_k": z.park.fan_type_min_margin_k(),
+            "park_residual_max_margin_k": z.park.residual_max_margin_k(),
+            "park_residual_edge_k": z.park.residual_edge_k(),
+            "park_current_is_fan_type": z.park.current_is_fan_type(
+                r.controller_state.zone_park_margin.get(z.config.zone_id)
+            ),
+        },
     ),
     ZoneSensorDescription(
         key="park_extraction",

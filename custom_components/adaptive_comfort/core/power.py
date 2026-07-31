@@ -45,7 +45,7 @@ class StartCounter:
     A start is a rising edge of (ac_power > floor) after the draw has been
     below the floor for at least START_DEBOUNCE_S — brief dips from modulation
     do not re-arm. Pass the same fan_floor_w(open_heads) used for park gating
-    so multi-head coasts are not counted as compression restarts. Events carry
+    so multi-head fan-type parks are not counted as compression restarts. Events carry
     the control-state key so inner-loop (park hysteresis) restarts are
     separable from outer-loop (controller cycling) restarts.
     """
@@ -85,6 +85,19 @@ class StartCounter:
     def per_hour(self, now: float, window_s: float = START_WINDOW_S) -> float:
         n = sum(1 for ts, _ in self.events if ts >= now - window_s)
         return n / (window_s / 3600.0)
+
+    def current_run_started_at(self) -> float | None:
+        """Start timestamp of the compressor run in progress (None if idle).
+
+        The plant-level minimum-run-time policy needs "how long has the
+        compressor been continuously above the floor", not per-zone
+        `zone_since`: this is that answer straight from the electrical edge
+        detector, no separate bookkeeping required (the last recorded start
+        event *is* the current run's start while `_above` holds).
+        """
+        if not self._above or not self.events:
+            return None
+        return self.events[-1][0]
 
     def by_state(self, now: float, window_s: float = START_WINDOW_S) -> dict[str, int]:
         out: dict[str, int] = {}
@@ -180,6 +193,19 @@ class BaselineModel:
             return None
         known = [s for s in self.slots if s is not None]
         return median(known) if known else None
+
+    def coverage(self) -> dict[str, float | int]:
+        """How many of the 48 half-hour slots have a learned (non-fallback) value.
+
+        Hot days barely clear the all-heads-off gate, so before/after kWh
+        comparisons need this visible — a sparse baseline invents phantom AC.
+        """
+        filled = sum(1 for s in self.slots if s is not None)
+        return {
+            "slots_filled": filled,
+            "slots_total": BASELINE_SLOTS,
+            "fraction": filled / BASELINE_SLOTS if BASELINE_SLOTS else 0.0,
+        }
 
     def to_dict(self) -> dict:
         return {"slots": list(self.slots)}

@@ -75,6 +75,13 @@ HOUSE_SWITCHES: tuple[SettingSwitchDescription, ...] = (
         set_fn=lambda s, v: setattr(s, "night_ventilate", v),
     ),
     SettingSwitchDescription(
+        key="prefer_continuous",
+        translation_key="prefer_continuous",
+        entity_category=EntityCategory.CONFIG,
+        get_fn=lambda s: s.prefer_continuous,
+        set_fn=lambda s, v: setattr(s, "prefer_continuous", v),
+    ),
+    SettingSwitchDescription(
         key="fan_assist",
         translation_key="fan_assist",
         entity_category=EntityCategory.CONFIG,

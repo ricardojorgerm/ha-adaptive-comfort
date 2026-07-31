@@ -113,7 +113,7 @@ def test_start_counter_debounce_and_rate():
     assert c.update(t + 60, 40.0, "conditioning") is False
     # Brief dip (< debounce) then rise again: not a new start.
     assert c.update(t + 120, 400.0, "conditioning") is False
-    # Long coast then rise: a real restart, tagged with its state.
+    # Long fan-type draw then rise: a real restart, tagged with its state.
     assert c.update(t + 200, 40.0, "park") is False
     assert c.update(t + 200 + power.START_DEBOUNCE_S + 1, 400.0, "park") is True
     assert c.per_hour(t + 600, window_s=3600.0) == 2.0
@@ -186,16 +186,18 @@ def test_night_ventilate_skips_continuous_near_cool():
     assert d.diag["regime"] == "cycling"
 
 
-def test_coast_aware_park_entry():
+def test_residual_hold_margin_aware_park_entry():
+    """Entry targets the learned residual-hold edge, not the fan-type shelf."""
     zones = [
         make_zone(
             "sat",
             23.0,
             is_on=True,
             standing_load_w=100.0,
-            park_trickles=True,
+            park_residuals=True,
             park_extraction_w=200.0,
-            park_coast_margin_k=2.5,
+            park_fan_type_min_margin_k=3.0,
+            park_residual_edge_k=2.5,
         ),
         make_zone("hot", 26.0, is_on=True, standing_load_w=200.0),
     ]

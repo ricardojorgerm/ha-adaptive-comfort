@@ -9,14 +9,21 @@ T_house is the volume-weighted mean temperature of *other* conditioned zones
 and optional unconditioned-room sensors (leave-one-out for the zone being fit).
 
 Fitted online with RLS (forgetting 0.998) while the zone's heads are fully off.
-Outdoor anchoring via the air-exchange hypothesis:
+`predict_free` integrates that rate model directly.
 
-    V_dot_out = k_out*V  [m3/h],  UA_out = 0.34*k_out*V  [W/K]
+Power uses the same rates on effective capacitance C_eff = furniture · 0.34 · V:
 
-Mixing uses the same volumetric heat capacity with k_mix. Total ACH ≈ k_out + k_mix.
+    UA = C_eff * k   [W/K]
+    Q_ac = C_eff * (dT/dt - k_out*ΔT_out - k_mix*ΔT_house - q)   [W]
 
-The effective capacitance is C_air scaled by a learned furniture factor,
-closed against disaggregated AC power (coordinate descent with COP).
+(Do not use air-only UA = 0.34·k·V for the energy balance — that understates
+coupling by furniture_factor and disagrees with the rate model prediction uses.)
+
+Outdoor *volume* flow for moisture stays the air-exchange hypothesis:
+
+    V_dot_out = k_out * V  [m³/h]   (house-mixing must not couple to outdoor w)
+
+Total ACH ≈ k_out + k_mix. C_eff is closed against disaggregated AC power.
 """
 
 from __future__ import annotations
@@ -291,12 +298,22 @@ class ThermalModel:
         return k_out * self.volume_m3
 
     @property
+    def c_air_wh_per_k(self) -> float:
+        return AIR_HEAT_WH_M3K * self.volume_m3
+
+    @property
+    def c_eff_wh_per_k(self) -> float:
+        return self.c_air_wh_per_k * self.furniture_factor
+
+    @property
     def ua_w_per_k(self) -> float:
-        return AIR_HEAT_WH_M3K * self.k(False) * self.volume_m3
+        """Effective outdoor UA (W/K): C_eff · k_out, fit-consistent."""
+        return self.c_eff_wh_per_k * self.k(False)
 
     @property
     def ua_mix_w_per_k(self) -> float:
-        return AIR_HEAT_WH_M3K * self.k_mix(False) * self.volume_m3
+        """Effective mixing UA (W/K): C_eff · k_mix, fit-consistent."""
+        return self.c_eff_wh_per_k * self.k_mix(False)
 
     def ua_out_w_per_k(
         self,
@@ -310,7 +327,7 @@ class ThermalModel:
             indoor_fans_on=indoor_fans_on,
             outdoor_exhaust_on=outdoor_exhaust_on,
         )
-        return AIR_HEAT_WH_M3K * k_out * self.volume_m3
+        return self.c_eff_wh_per_k * k_out
 
     def ua_mix_scaled_w_per_k(
         self,
@@ -324,15 +341,7 @@ class ThermalModel:
             indoor_fans_on=indoor_fans_on,
             outdoor_exhaust_on=outdoor_exhaust_on,
         )
-        return AIR_HEAT_WH_M3K * k_mix * self.volume_m3
-
-    @property
-    def c_air_wh_per_k(self) -> float:
-        return AIR_HEAT_WH_M3K * self.volume_m3
-
-    @property
-    def c_eff_wh_per_k(self) -> float:
-        return self.c_air_wh_per_k * self.furniture_factor
+        return self.c_eff_wh_per_k * k_mix
 
     def confidence(self, door_open: bool = False) -> float:
         fit = self._fit(door_open)
@@ -360,6 +369,26 @@ class ThermalModel:
             return "blending"
         return "fitted"
 
+    def free_float_rate(
+        self,
+        t_in: float,
+        t_out: float,
+        local_hour: float,
+        door_open: bool = False,
+        t_house_other: float | None = None,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
+    ) -> float:
+        """No-AC dT/dt [K/h] — same rate model `predict_free` integrates."""
+        k_out, k_mix = self._scaled_k(
+            door_open,
+            indoor_fans_on=indoor_fans_on,
+            outdoor_exhaust_on=outdoor_exhaust_on,
+        )
+        mix = k_mix * (t_house_other - t_in) if t_house_other is not None else 0.0
+        return k_out * (t_out - t_in) + mix + self.q_hat(local_hour, door_open)
+
     def sensible_power_w(
         self,
         t_in: float,
@@ -372,20 +401,22 @@ class ThermalModel:
         indoor_fans_on: bool = False,
         outdoor_exhaust_on: bool = False,
     ) -> float:
-        """Heat added by the AC (signed W; negative while cooling)."""
-        c = self.c_eff_wh_per_k
-        k_out, k_mix = self._scaled_k(
+        """Heat added by the AC (signed W; negative while cooling).
+
+        C_eff times the excess rate over free-float — identical physics to
+        `predict_free` / `free_float_rate`, so standing load and COP use the
+        same model the controller's predictions use.
+        """
+        excess = dtdt_per_h - self.free_float_rate(
+            t_in,
+            t_out,
+            local_hour,
             door_open,
+            t_house_other,
             indoor_fans_on=indoor_fans_on,
             outdoor_exhaust_on=outdoor_exhaust_on,
         )
-        mix_w = 0.0
-        if t_house_other is not None:
-            mix_w = AIR_HEAT_WH_M3K * k_mix * self.volume_m3 * (t_house_other - t_in)
-        ua_out = AIR_HEAT_WH_M3K * k_out * self.volume_m3
-        return (
-            c * dtdt_per_h - ua_out * (t_out - t_in) - mix_w - self.q_hat(local_hour, door_open) * c
-        )
+        return self.c_eff_wh_per_k * excess
 
     def update_cop(
         self,
@@ -434,22 +465,20 @@ class ThermalModel:
         if p_ac_w < 50.0:
             return
         q_hvac = self.cop_effective * p_ac_w * (1.0 if heating else -1.0)
-        denom = dtdt_per_h - self.q_hat(local_hour, door_open)
-        if abs(denom) < 0.1:
-            return
-        ua_out = self.ua_out_w_per_k(
+        # Q_ac = C_eff * (dT/dt - free_float_rate) → solve for C without
+        # using UA(=C·k), which would be circular in furniture_factor.
+        excess = dtdt_per_h - self.free_float_rate(
+            t_in,
+            t_out,
+            local_hour,
             door_open,
+            t_house_other,
             indoor_fans_on=indoor_fans_on,
             outdoor_exhaust_on=outdoor_exhaust_on,
         )
-        mix_w = 0.0
-        if t_house_other is not None:
-            mix_w = self.ua_mix_scaled_w_per_k(
-                door_open,
-                indoor_fans_on=indoor_fans_on,
-                outdoor_exhaust_on=outdoor_exhaust_on,
-            ) * (t_house_other - t_in)
-        c_est = (q_hvac + ua_out * (t_out - t_in) + mix_w) / denom
+        if abs(excess) < 0.1:
+            return
+        c_est = q_hvac / excess
         factor = c_est / self.c_air_wh_per_k
         if not (FURNITURE_MIN <= factor <= FURNITURE_MAX):
             return
@@ -512,6 +541,66 @@ class ThermalModel:
             t += step_h * (k_out * (t_out - t) + mix_term + self.q_hat(hour, door_open))
             elapsed += step_h
         return temps
+
+    def predict_horizons(
+        self,
+        t_in: float,
+        t_out_hourly: list[float],
+        start_hour: float,
+        horizons_min: tuple[int, ...],
+        door_open: bool = False,
+        t_house_other: float | None = None,
+        t_house_hourly: list[float] | None = None,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
+    ) -> dict[int, float]:
+        """Predicted temperature at each of `horizons_min` minutes ahead.
+
+        Same free-float physics as `predict_free` (identical k_out/k_mix/q(t)
+        integration), but stepped finely and landing exactly on each requested
+        horizon -- `predict_free`'s hourly sampling cadence is too coarse to
+        score against 15/30-minute-ahead actuals.
+        """
+        if not t_out_hourly or not horizons_min:
+            return {}
+        k_out, k_mix = self._scaled_k(
+            door_open,
+            indoor_fans_on=indoor_fans_on,
+            outdoor_exhaust_on=outdoor_exhaust_on,
+        )
+        if t_house_other is None and not t_house_hourly:
+            k_mix = 0.0
+        targets = sorted(set(h for h in horizons_min if h > 0))
+        if not targets:
+            return {}
+        out: dict[int, float] = {}
+        t = t_in
+        elapsed = 0.0
+        max_step_h = 1.0 / 60.0  # 1-minute integration step
+        target_i = 0
+        while target_i < len(targets):
+            target_h = targets[target_i] / 60.0
+            while elapsed < target_h - 1e-9:
+                idx = min(int(elapsed), len(t_out_hourly) - 1)
+                frac = min(elapsed - idx, 1.0)
+                nxt = min(idx + 1, len(t_out_hourly) - 1)
+                t_out = t_out_hourly[idx] * (1 - frac) + t_out_hourly[nxt] * frac
+                if t_house_hourly:
+                    hi = min(int(elapsed), len(t_house_hourly) - 1)
+                    hf = min(elapsed - hi, 1.0)
+                    hn = min(hi + 1, len(t_house_hourly) - 1)
+                    t_house = t_house_hourly[hi] * (1 - hf) + t_house_hourly[hn] * hf
+                else:
+                    t_house = t_house_other
+                hour = (start_hour + elapsed) % 24.0
+                mix_term = k_mix * (t_house - t) if t_house is not None else 0.0
+                step_h = min(max_step_h, target_h - elapsed)
+                t += step_h * (k_out * (t_out - t) + mix_term + self.q_hat(hour, door_open))
+                elapsed += step_h
+            out[targets[target_i]] = t
+            target_i += 1
+        return out
 
     def to_dict(self) -> dict:
         return {

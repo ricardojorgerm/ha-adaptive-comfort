@@ -71,10 +71,14 @@ def test_delta_deepens_out_of_band_and_relaxes_past_target():
     deepened = state.zone_track_delta["z1"]
 
     # Same zone now cooled past the room-frame setpoint: delta must shrink.
+    # Keep zone chatter blocking the off so the head stays in the tracking loop
+    # (plant-level min_on is separate; this is the in-run adaptation path).
     cold = make_zone("z1", 22.0, is_on=True)
+    later = NOW + 600.0
     state.zone_on["z1"] = True
-    state.zone_last_cmd["z1"] = NOW - 3600.0  # spacing satisfied
-    tick([cold], state, now=NOW + 600.0)
+    state.zone_since["z1"] = later - 60.0
+    state.zone_last_cmd["z1"] = later - 3600.0  # spacing satisfied
+    tick([cold], state, now=later)
     relaxed = state.zone_track_delta["z1"]
     assert relaxed < deepened
     assert relaxed >= controller.TRACK_DELTA_MIN_K

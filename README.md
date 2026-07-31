@@ -85,7 +85,7 @@ Corrected temperature, predicted +60 min, k, ACH, UA, COP, sensible/latent power
 
 ### Regime and parking (summary)
 
-With **auto regime** on, the controller picks `ventilate` / `continuous` / `cycling` from outdoor vs target and standing load. Parking holds a satisfied multi-split head above its internal sensor to learn idle vs trickle behavior (electrically gated); see AGENTS.md for the full semantics.
+With **auto regime** on, the controller picks `ventilate` / `continuous` / `cycling` from outdoor vs target and standing load. Parking holds a satisfied multi-split head above its internal sensor to learn idle vs residual behavior (electrically gated); see AGENTS.md for the full semantics.
 
 ### Manual preset
 

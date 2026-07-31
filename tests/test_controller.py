@@ -190,21 +190,79 @@ def test_min_off_blocks_restart():
     assert not any(c.zone_id == "bed" and c.hvac_mode == MODE_COOL for c in decision.commands)
 
 
-def test_min_on_blocks_early_stop():
-    # Head is actively cooling (wet coil), room already past the band.
-    zone = make_zone("bed", 21.0, is_on=True, head_state="cooling", free_float=[21.0] * 24)
-    settings = Settings(hvac_mode=MODE_COOL)
-    snap = make_snapshot([zone], settings)
+def test_plant_min_on_served_by_residual_park():
+    # Satisfied zone would turn off, but plant compression still owes min_on → park.
+    zone = make_zone(
+        "bed",
+        22.5,
+        is_on=True,
+        head_state="cooling",
+        free_float=[22.5] * 24,
+        park_residuals=True,
+        park_extraction_w=120.0,
+        standing_load_w=80.0,
+        park_residual_edge_k=2.5,
+    )
+    settings = Settings(hvac_mode=MODE_COOL, min_on_min=20.0, park_learning=True, multisplit=True)
+    snap = make_snapshot([zone], settings, p_ac=400.0, compression_floor_w=75.0)
     state = ControllerState()
     state.zone_on["bed"] = True
-    state.zone_since["bed"] = NOW - 300.0  # on for 5 min < 20 min minimum
+    state.zone_since["bed"] = NOW - 300.0  # zone chatter cleared; plant min_on has not
+    state.plant_compress_since = NOW - 300.0
     decision = controller.tick(snap, state)
     assert not any(c.hvac_mode == MODE_OFF for c in decision.commands)
-    # After the minimum runtime it may stop.
-    state.zone_since["bed"] = NOW - 1300.0
+    assert any(c.park for c in decision.commands) or "bed" in decision.state.zone_parked_since
+    # After plant min_on elapses, hard off is allowed.
+    state = decision.state
     state.zone_last_cmd["bed"] = 0.0
-    decision = controller.tick(snap, state)
+    state.plant_compress_since = NOW - 1300.0
+    snap2 = make_snapshot([zone], settings, p_ac=40.0, compression_floor_w=75.0)
+    # Clear park session to exercise the off path.
+    state.zone_parked_since.clear()
+    state.zone_park_margin.clear()
+    decision = controller.tick(snap2, state)
     assert any(c.hvac_mode == MODE_OFF for c in decision.commands)
+
+
+def test_prediction_cost_test_ignores_far_small_breach():
+    # Room well inside band; free-float barely grazes hi at hour 6 — not worth a run.
+    zone = make_zone(
+        "bed",
+        22.5,
+        free_float=[22.5, 22.6, 22.7, 22.8, 22.9, 23.0, 23.35] + [23.0] * 17,
+        pred_60m=22.6,
+    )
+    settings = Settings(hvac_mode=MODE_COOL, min_on_min=20.0)
+    # band hi ≈ 23.2 with defaults; peak breach at h=6 is ~0.15 < PREDICT_MARGIN after hi
+    snap = make_snapshot([zone], settings)
+    state = warmed_state([zone])
+    decision = controller.tick(snap, state)
+    assert decision.diag["want"]["bed"] == "off"
+
+
+def test_prediction_cost_test_fires_near_breach():
+    zone = make_zone(
+        "bed",
+        23.0,
+        free_float=[23.0, 23.5, 24.0] + [24.2] * 21,
+        pred_60m=23.5,
+    )
+    settings = Settings(hvac_mode=MODE_COOL, min_on_min=20.0)
+    snap = make_snapshot([zone], settings)
+    state = warmed_state([zone])
+    decision = controller.tick(snap, state)
+    assert decision.diag["want"]["bed"] == "demand"
+
+
+def test_plant_handoff_requires_half_min_on_predicted_need():
+    zone = make_zone("bed", 22.5, free_float=[22.5] * 24, pred_60m=22.5)
+    settings = Settings(hvac_mode=MODE_COOL, min_on_min=20.0)
+    snap = make_snapshot([zone], settings, p_ac=400.0, compression_floor_w=75.0)
+    state = warmed_state([zone])
+    state.plant_compress_since = NOW - 60.0
+    decision = controller.tick(snap, state)
+    assert "plant_handoff" not in decision.diag
+    assert decision.diag["want"]["bed"] == "off"
 
 
 def test_forced_off_ignores_min_on():
@@ -300,3 +358,189 @@ def test_heating_demand_in_winter():
     decision = controller.tick(snap, state)
     by_zone = {c.zone_id: c for c in decision.commands}
     assert by_zone["bed"].hvac_mode == MODE_HEAT
+
+
+def test_mixing_free_ride_in_band_hold():
+    # Rider on the cool side of the band but prediction-demanding: hold-cover
+    # is enough to free-ride (no pull-down needed yet).
+    lead = make_zone("east", 22.5, is_on=True, standing_load_w=100.0)
+    rider = make_zone(
+        "west",
+        23.0,
+        is_on=False,
+        standing_load_w=40.0,
+        mixing_gain_w=-80.0,
+        free_float=[23.0, 23.6, 24.0] + [24.2] * 21,
+        pred_60m=23.6,
+    )
+    settings = Settings(hvac_mode=MODE_COOL)
+    snap = make_snapshot([lead, rider], settings)
+    state = warmed_state([lead, rider])
+    state.zone_since["east"] = NOW - 3600.0
+    state.zone_on["east"] = True
+    decision = controller.tick(snap, state)
+    assert "west" in decision.diag.get("free_riders", [])
+    assert decision.diag["want"]["west"] == "free_ride"
+
+
+def test_mixing_free_ride_oob_needs_pull_down():
+    # OOB with flat free-float: hold-cover alone must NOT skip — room stays hot.
+    lead = make_zone("east", 23.5, is_on=True, standing_load_w=100.0)
+    rider = make_zone(
+        "west",
+        24.0,
+        is_on=False,
+        standing_load_w=40.0,
+        mixing_gain_w=-80.0,
+        free_float=[24.0] * 24,
+        pred_60m=24.2,
+    )
+    settings = Settings(hvac_mode=MODE_COOL)
+    snap = make_snapshot([lead, rider], settings)
+    state = warmed_state([lead, rider])
+    # Sibling on for hours — transport grace expired.
+    state.zone_since["east"] = NOW - 3600.0
+    state.zone_on["east"] = True
+    decision = controller.tick(snap, state)
+    assert "west" not in decision.diag.get("free_riders", [])
+    assert decision.diag["want"]["west"] == "demand"
+
+
+def test_mixing_free_ride_oob_when_float_enters_band():
+    # OOB now, but free-float enters band within the pull horizon → skip.
+    lead = make_zone("east", 22.5, is_on=True, standing_load_w=100.0)
+    rider = make_zone(
+        "west",
+        24.0,
+        is_on=False,
+        standing_load_w=40.0,
+        mixing_gain_w=-80.0,
+        free_float=[24.0, 23.5, 23.0, 22.8] + [22.5] * 20,
+        pred_60m=23.5,
+    )
+    settings = Settings(hvac_mode=MODE_COOL)
+    snap = make_snapshot([lead, rider], settings)
+    state = warmed_state([lead, rider])
+    state.zone_since["east"] = NOW - 3600.0
+    state.zone_on["east"] = True
+    decision = controller.tick(snap, state)
+    assert "west" in decision.diag.get("free_riders", [])
+    assert decision.diag["want"]["west"] == "free_ride"
+
+
+def test_mixing_free_ride_transport_grace():
+    # OOB, flat free-float, but sibling just started → wait for air to arrive.
+    lead = make_zone("east", 23.5, is_on=True, standing_load_w=100.0)
+    rider = make_zone(
+        "west",
+        24.0,
+        is_on=False,
+        standing_load_w=40.0,
+        mixing_gain_w=-80.0,
+        free_float=[24.0] * 24,
+        pred_60m=24.2,
+    )
+    settings = Settings(hvac_mode=MODE_COOL)
+    snap = make_snapshot([lead, rider], settings)
+    state = warmed_state([lead, rider])
+    state.zone_on["east"] = True
+    state.zone_since["east"] = NOW - 60.0  # inside FREE_RIDE_TRANSPORT_GRACE_S
+    decision = controller.tick(snap, state)
+    assert "west" in decision.diag.get("free_riders", [])
+    assert decision.diag["want"]["west"] == "free_ride"
+
+
+def test_prefer_continuous_elects_anchor_and_parks():
+    zone = make_zone(
+        "east",
+        22.5,
+        is_on=True,
+        head_state="cooling",
+        park_residuals=True,
+        park_extraction_w=150.0,
+        standing_load_w=80.0,
+        free_float=[22.5] * 24,
+    )
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        prefer_continuous=True,
+        park_learning=True,
+        multisplit=True,
+    )
+    snap = make_snapshot([zone], settings)
+    state = warmed_state([zone])
+    state.zone_on["east"] = True
+    decision = controller.tick(snap, state)
+    assert decision.state.anchor_zone == "east"
+    assert decision.diag["want"]["east"] == "anchor"
+    # Satisfied anchor must park (residual), not track a demand setpoint.
+    assert any(c.park for c in decision.commands) or "east" in decision.state.zone_parked_since
+    assert not any(
+        c.zone_id == "east" and not c.park and c.hvac_mode == MODE_COOL for c in decision.commands
+    )
+
+
+def test_prefer_continuous_handoff_when_sibling_covers():
+    # Parked west is anchor; east wants cooling and mixing already covers west
+    # → release west so residual park does not add compressor load.
+    west = make_zone(
+        "west",
+        22.5,
+        is_on=True,
+        head_state="cooling",
+        park_residuals=True,
+        park_extraction_w=100.0,
+        standing_load_w=40.0,
+        mixing_gain_w=-80.0,
+        free_float=[22.5] * 24,
+    )
+    east = make_zone(
+        "east",
+        25.0,
+        is_on=False,
+        standing_load_w=100.0,
+        free_float=[25.0] * 24,
+    )
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        prefer_continuous=True,
+        park_learning=True,
+        multisplit=True,
+    )
+    snap = make_snapshot([west, east], settings)
+    state = warmed_state([west, east])
+    state.zone_on["west"] = True
+    state.anchor_zone = "west"
+    state.anchor_since = NOW - 600.0
+    state.zone_parked_since["west"] = NOW - 600.0
+    state.zone_park_margin["west"] = 2.0
+    decision = controller.tick(snap, state)
+    assert decision.state.anchor_zone is None
+    assert "west" not in decision.state.zone_parked_since
+    # East should be wanted on as demand.
+    assert decision.diag["want"]["east"] == "demand"
+
+
+def test_plant_compress_debounce_survives_brief_dip():
+    from custom_components.adaptive_comfort.core import power
+
+    zone = make_zone("bed", 22.5, is_on=True, head_state="cooling", free_float=[22.5] * 24)
+    settings = Settings(hvac_mode=MODE_COOL, min_on_min=20.0, park_learning=True, multisplit=True)
+    state = warmed_state([zone])
+    state.zone_on["bed"] = True
+    state.plant_compress_since = NOW - 300.0
+    # One tick below the floor must not clear the run clock.
+    snap = make_snapshot([zone], settings, p_ac=40.0, compression_floor_w=75.0)
+    decision = controller.tick(snap, state)
+    assert decision.state.plant_compress_since == NOW - 300.0
+    assert decision.state.plant_below_since == NOW
+    # Still below after debounce → clear.
+    snap2 = make_snapshot(
+        [zone],
+        settings,
+        now=NOW + power.START_DEBOUNCE_S + 1,
+        p_ac=40.0,
+        compression_floor_w=75.0,
+    )
+    decision = controller.tick(snap2, decision.state)
+    assert decision.state.plant_compress_since == 0.0
