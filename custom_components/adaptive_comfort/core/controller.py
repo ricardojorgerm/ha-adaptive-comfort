@@ -71,10 +71,154 @@ NIGHT_START_H = 22.0
 NIGHT_END_H = 8.0
 NIGHT_VENT_MARGIN_K = 0.0  # at night, outdoor at/below coolest target is enough
 NIGHT_SKIP_CONT_K = 2.0  # outdoor within this of coolest → prefer cycling over continuous
+# COP-timed efficiency band (center fixed; half grows). Field cool priors
+# (Jul 29/30): mild ~2.4 / warm ~1.6 / hot ~1.1. Heat uses learned table only.
+COP_TIMING_LOOKAHEAD_H = 6
+COP_ADVANTAGE_ENTER = 1.3
+COP_ADVANTAGE_EXIT = 1.15
+COP_WIDEN_MAX_K = 0.7
+COP_ADVANCE_HORIZON_H = 4.0  # predictive entry may look this far when advancing
+COP_DEFER_HORIZON_H = 1.0  # defer: only near breaches fire predictively
+DEFAULT_BAND_COP_COOL = {"mild": 2.4, "warm": 1.6, "hot": 1.1}
+_BAND_RANK = {"mild": 0, "warm": 1, "hot": 2}
 
 
 def _is_night(local_hour: float) -> bool:
     return local_hour >= NIGHT_START_H or local_hour < NIGHT_END_H
+
+
+def _band_cop(snap: HouseSnapshot, band: str, mode: str) -> float | None:
+    """Learned COP for ``band`` in ``mode``; cool priors only as cool fallback.
+
+    ``snap.cop_by_band`` is filtered to the mode at snapshot build (prior
+    tick's controller mode). Use it only when that tag matches ``mode`` —
+    otherwise a cool↔heat flip this tick would arbitrage on the wrong
+    season's table and skip cool priors because keys exist.
+    """
+    if snap.cop_by_band_mode == mode and band in snap.cop_by_band:
+        return snap.cop_by_band[band]
+    if mode == MODE_COOL:
+        return DEFAULT_BAND_COP_COOL.get(band)
+    return None
+
+
+def _arbitrage_ratios(
+    snap: HouseSnapshot, mode: str, centers: dict[str, float]
+) -> tuple[float, float]:
+    """Return (advance_ratio, defer_ratio) from band COP vs forecast.
+
+    Either ratio is 0.0 when that direction has no signal. Callers pick a
+    winner for enter, but hold/exit must read the *latched* direction's
+    ratio so a brief flip of which side wins cannot snap the band narrow.
+    """
+    if mode not in (MODE_HEAT, MODE_COOL) or not snap.forecast_hours:
+        return 0.0, 0.0
+    if snap.t_out is None or snap.t_out_synthetic:
+        return 0.0, 0.0
+    band_now = power.outdoor_band(snap.t_out)
+    if band_now is None:
+        return 0.0, 0.0
+    # Free outdoor air: banking via widen is moot for cool.
+    if mode == MODE_COOL and centers and snap.t_out <= min(centers.values()) - REGIME_VENT_MARGIN_K:
+        return 0.0, 0.0
+
+    worst = band_now
+    best = band_now
+    for t in snap.forecast_hours[:COP_TIMING_LOOKAHEAD_H]:
+        b = power.outdoor_band(t)
+        if b is None:
+            continue
+        if _BAND_RANK[b] > _BAND_RANK[worst]:
+            worst = b
+        if _BAND_RANK[b] < _BAND_RANK[best]:
+            best = b
+
+    cop_now = _band_cop(snap, band_now, mode)
+    if cop_now is None or cop_now <= 0:
+        return 0.0, 0.0
+
+    advance_ratio = 0.0
+    defer_ratio = 0.0
+    if mode == MODE_COOL:
+        # Hotter outdoor → worse cool COP → advance when worse ahead.
+        if worst != band_now:
+            cop_w = _band_cop(snap, worst, mode)
+            if cop_w is not None and cop_w > 0:
+                advance_ratio = cop_now / cop_w
+        # Milder outdoor ahead → defer (wait for better COP).
+        if best != band_now:
+            cop_b = _band_cop(snap, best, mode)
+            if cop_b is not None and cop_b > 0:
+                defer_ratio = cop_b / cop_now
+    else:
+        # Heat: colder outdoor → worse COP. `best` is coldest band in window.
+        if _BAND_RANK[best] < _BAND_RANK[band_now]:
+            cop_c = _band_cop(snap, best, mode)
+            if cop_c is not None and cop_c > 0:
+                advance_ratio = cop_now / cop_c
+        # Warmer outdoor ahead → better heat COP later → defer.
+        if _BAND_RANK[worst] > _BAND_RANK[band_now]:
+            cop_w = _band_cop(snap, worst, mode)
+            if cop_w is not None and cop_w > 0:
+                defer_ratio = cop_w / cop_now
+    return advance_ratio, defer_ratio
+
+
+def _forecast_cop_arbitrage(
+    snap: HouseSnapshot, mode: str, centers: dict[str, float]
+) -> tuple[str, float]:
+    """Return ('advance'|'defer'|'none', advantage_ratio) from band COP vs forecast.
+
+    advance: current outdoor band beats a worse band arriving within the
+    lookahead (cool when hot ahead; heat when colder ahead).
+    defer: a better band arrives within the lookahead.
+    """
+    advance_ratio, defer_ratio = _arbitrage_ratios(snap, mode, centers)
+    if advance_ratio >= defer_ratio and advance_ratio > 0:
+        return "advance", advance_ratio
+    if defer_ratio > 0:
+        return "defer", defer_ratio
+    return "none", 0.0
+
+
+def _update_cop_widen(
+    state: ControllerState,
+    snap: HouseSnapshot,
+    mode: str,
+    centers: dict[str, float],
+) -> tuple[float, str]:
+    """Hysteretic efficiency-band widen. Returns (widen_k, timing).
+
+    Enter when either direction clears ENTER. Hold while the *latched*
+    direction's own ratio stays ≥ EXIT — not whichever side wins this tick
+    — so a brief advance/defer flip cannot snap the half-band narrow.
+    """
+    if mode not in (MODE_HEAT, MODE_COOL):
+        state.cop_widen_k = 0.0
+        state.cop_timing = "none"
+        return 0.0, "none"
+
+    advance_ratio, defer_ratio = _arbitrage_ratios(snap, mode, centers)
+    # Prefer advance on a tie (same rule as _forecast_cop_arbitrage).
+    if advance_ratio >= defer_ratio and advance_ratio >= COP_ADVANTAGE_ENTER:
+        state.cop_timing = "advance"
+        state.cop_widen_k = COP_WIDEN_MAX_K
+    elif defer_ratio > advance_ratio and defer_ratio >= COP_ADVANTAGE_ENTER:
+        state.cop_timing = "defer"
+        state.cop_widen_k = COP_WIDEN_MAX_K
+    elif state.cop_widen_k > 0.0:
+        if state.cop_timing == "advance":
+            hold_ratio = advance_ratio
+        elif state.cop_timing == "defer":
+            hold_ratio = defer_ratio
+        else:
+            hold_ratio = 0.0
+        if hold_ratio < COP_ADVANTAGE_EXIT:
+            state.cop_widen_k = 0.0
+            state.cop_timing = "none"
+    else:
+        state.cop_timing = "none"
+    return state.cop_widen_k, state.cop_timing
 
 
 def _select_regime(snap: HouseSnapshot, mode: str, centers: dict[str, float]) -> str:
@@ -217,23 +361,38 @@ def _predicted_breach(
 
 
 def _prediction_justifies_run(
-    zone: ZoneSnapshot, lo: float, hi: float, mode: str, min_on_min: float
+    zone: ZoneSnapshot,
+    lo: float,
+    hi: float,
+    mode: str,
+    min_on_min: float,
+    cop_timing: str = "none",
 ) -> bool:
     """True when predicted breach size and time-to-breach justify one plant min run.
 
     Uses the prediction — no floor/center deadband that ignores it. A small
     far-away breach fails naturally (ttb ≫ min_on or peak < PREDICT_MARGIN_K).
+    COP timing stretches (advance) or shortens (defer) the allowed horizon.
     """
     ttb_h, peak = _predicted_breach(zone, lo, hi, mode)
     if ttb_h is None or peak < PREDICT_MARGIN_K:
         return False
     min_on_h = max(min_on_min / 60.0, 1.0 / 60.0)
-    # Near, meaningful breaches fire; distant ones wait for a closer horizon.
-    return ttb_h <= max(1.0, 2.0 * min_on_h)
+    horizon = max(1.0, 2.0 * min_on_h)
+    if cop_timing == "advance":
+        horizon = max(horizon, COP_ADVANCE_HORIZON_H)
+    elif cop_timing == "defer":
+        horizon = min(horizon, max(min_on_h, COP_DEFER_HORIZON_H))
+    return ttb_h <= horizon
 
 
 def _wants_conditioning(
-    zone: ZoneSnapshot, lo: float, hi: float, mode: str, min_on_min: float = 20.0
+    zone: ZoneSnapshot,
+    lo: float,
+    hi: float,
+    mode: str,
+    min_on_min: float = 20.0,
+    cop_timing: str = "none",
 ) -> bool:
     """Demand: out of band now, or prediction justifies a plant-minimum run."""
     if zone.temp is None:
@@ -241,11 +400,11 @@ def _wants_conditioning(
     if mode == MODE_COOL:
         if zone.temp > hi:
             return True
-        return _prediction_justifies_run(zone, lo, hi, mode, min_on_min)
+        return _prediction_justifies_run(zone, lo, hi, mode, min_on_min, cop_timing)
     if mode == MODE_HEAT:
         if zone.temp < lo:
             return True
-        return _prediction_justifies_run(zone, lo, hi, mode, min_on_min)
+        return _prediction_justifies_run(zone, lo, hi, mode, min_on_min, cop_timing)
     return False
 
 
@@ -818,6 +977,22 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         diag["cold_deficit_kh"] = round(decision.cold_deficit_kh, 2)
     diag["mode"] = mode
 
+    # 2b. COP-timed efficiency band: widen half (center fixed) when outdoor
+    # band COP now differs from a band arriving in the forecast lookahead.
+    widen_k, cop_timing = _update_cop_widen(state, snap, mode, centers)
+    if widen_k > 0.0:
+        for zone in zones:
+            bands[zone.zone_id] = comfort.zone_band(
+                s,
+                centers[zone.zone_id],
+                zone.occupied,
+                snap.house_occupied,
+                extra_half_k=widen_k,
+            )
+        diag["bands"] = {z: bands[z] for z in bands}
+    diag["cop_band_widen_k"] = widen_k
+    diag["cop_timing"] = cop_timing
+
     # Plant compression clock (min_on keys off this, not zone_since).
     _update_plant_compress(state, snap)
     plant_min_on = _plant_min_on_active(state, snap, s)
@@ -826,7 +1001,11 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
     # 3. Demand and helper sets.
     demand = (
-        [z for z in zones if _wants_conditioning(z, *bands[z.zone_id], mode, s.min_on_min)]
+        [
+            z
+            for z in zones
+            if _wants_conditioning(z, *bands[z.zone_id], mode, s.min_on_min, cop_timing)
+        ]
         if mode in (MODE_HEAT, MODE_COOL)
         else []
     )

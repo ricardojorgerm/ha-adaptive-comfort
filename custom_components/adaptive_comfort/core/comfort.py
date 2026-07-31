@@ -98,8 +98,13 @@ def zone_band(
     center: float,
     zone_occupied: bool | None,
     house_occupied: bool | None,
+    extra_half_k: float = 0.0,
 ) -> tuple[float, float]:
-    """Comfort band (lower, upper) for a zone this tick."""
+    """Comfort band (lower, upper) for a zone this tick.
+
+    ``extra_half_k`` is COP-efficiency slack (center fixed): temporary widen
+    when outdoor-band COP says now and later differ — not a preset change.
+    """
     half = settings.band_k
     preset = effective_preset(settings, house_occupied)
     if preset == PRESET_ECO:
@@ -112,6 +117,7 @@ def zone_band(
     # Boost overrides vacant widen (same as it overrides presence-Away).
     if zone_occupied is False and preset != PRESET_BOOST:
         half += UNOCCUPIED_WIDEN_K
+    half += max(0.0, extra_half_k)
     return center - half, center + half
 
 

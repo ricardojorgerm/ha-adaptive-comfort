@@ -237,10 +237,14 @@ class HouseSnapshot:
     shed_urgent: bool = False  # immediate shed (critical overload or known-load spike)
     forecast_hours: tuple[float, ...] = ()  # hourly outdoor forecast, aligned with free_float
     cop_by_head_count: dict[int, float] = field(default_factory=dict)  # empirical COP hints
-    # Empirical COP by outdoor band ('mild'|'warm'|'hot') for the *active*
-    # HVAC mode, sample-gated and aggregated across head counts. Groundwork
-    # for COP-aware timing of predictive demand — not a center-shift precool.
+    # Empirical COP by outdoor band ('mild'|'warm'|'hot') for the mode in
+    # ``cop_by_band_mode`` (sample-gated, aggregated across head counts).
+    # COP-timed widen: advance/defer predictive demand with a bounded wider
+    # half-band (center fixed). Not a center-shift precool.
     cop_by_band: dict[str, float] = field(default_factory=dict)
+    # Mode the ``cop_by_band`` map was filtered for (None when empty / idle).
+    # Arbitrage must ignore the map when this disagrees with the tick's mode.
+    cop_by_band_mode: str | None = None
     # Temperatures from unconditioned rooms as (temp, weight) pairs; weak
     # extra indoor evidence for cold-start mode arbitration.
     aux_indoor: tuple[tuple[float, float], ...] = ()
@@ -328,6 +332,12 @@ class ControllerState:
     # this clock, not per-zone zone_since.
     plant_compress_since: float = 0.0
     plant_below_since: float = 0.0  # first sub-floor sample while run live
+    # COP-timed efficiency band: hysteretic half-band widen (K) and direction
+    # ('advance'|'defer'|'none'). Center stays fixed; withdraw only after the
+    # advantage falls below the exit threshold so the band cannot snap narrow
+    # under a room sitting on the widened edge.
+    cop_widen_k: float = 0.0
+    cop_timing: str = "none"
 
     def to_dict(self) -> dict:
         return {
@@ -354,6 +364,8 @@ class ControllerState:
             "anchor_since": self.anchor_since,
             "plant_compress_since": self.plant_compress_since,
             "plant_below_since": self.plant_below_since,
+            "cop_widen_k": self.cop_widen_k,
+            "cop_timing": self.cop_timing,
             "sibling_sustain": {
                 rider: {sib: [ratio, samples] for sib, (ratio, samples) in subs.items()}
                 for rider, subs in self.sibling_sustain.items()
@@ -406,6 +418,9 @@ class ControllerState:
         st.anchor_since = float(data.get("anchor_since", 0.0))
         st.plant_compress_since = float(data.get("plant_compress_since", 0.0))
         st.plant_below_since = float(data.get("plant_below_since", 0.0))
+        st.cop_widen_k = max(0.0, float(data.get("cop_widen_k", 0.0)))
+        timing = str(data.get("cop_timing", "none"))
+        st.cop_timing = timing if timing in ("advance", "defer", "none") else "none"
         for rider, subs in data.get("sibling_sustain", {}).items():
             entry: dict[str, tuple[float, int]] = {}
             for sib, value in subs.items():

@@ -143,15 +143,16 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   disqualification and re-arm only after `WINDOW_GRACE_S` continuously out of the pool.
 - **Latent moisture uses outdoor ACH only.** `outdoor_airflow_m3h` = `k_out × volume` (door/
   exhaust scaled); house-mixing must not couple to outdoor humidity ratio.
-- **`cop_by_band` is timing/widen groundwork, not precool.** Sample-gated means of
-  `cop_table_banded` for the *active mode* ride on `HouseSnapshot` each tick with
-  no behavior change yet. Intended consumer: COP-aware predictive demand for cool
-  and heat — when now beats the predicted-entry band, **advance and allow a
-  bounded wider half-band** (center fixed); when later is cheaper, defer within
-  that slack. Withdraw widen with hysteresis so the band never snaps narrow under
-  a room (the center-shift precool failure mode). Park *learning* ignores these
-  tables; park *audit* and park overcool edges must use the efficiency band when
-  widen is active. See plan `cop_timed_conditioning_8f3a1c2e`.
+- **`cop_by_band` drives COP-timed widen (not precool).** When the active mode's
+  outdoor-band COP now differs from a band in the forecast lookahead by
+  `COP_ADVANTAGE_ENTER`, the controller sets a hysteretic `cop_widen_k` (capped
+  at `COP_WIDEN_MAX_K`) and rebuilds zone bands with `extra_half_k` — **center
+  fixed**. Timing is `advance` (now cheaper) or `defer` (later cheaper);
+  predictive demand horizons stretch/shrink accordingly. Withdraw only after
+  the advantage falls below `COP_ADVANTAGE_EXIT` so the band cannot snap narrow
+  under a room. Cool priors fill gaps; heat requires learned `cop_by_band`.
+  Diag: `cop_band_widen_k`, `cop_timing`. Park overcool uses the efficiency
+  band. See plan `cop_timed_conditioning_8f3a1c2e`.
 - **Zone COP counts latent.** `update_cop` heat flow is sensible + latent; sensible-only
   samples in humid rooms undercount delivered cooling by 30–50% and can fall below
   `COP_MIN`, producing absurd or silently-rejected readings.
