@@ -99,11 +99,15 @@ def zone_band(
     zone_occupied: bool | None,
     house_occupied: bool | None,
     extra_half_k: float = 0.0,
+    extra_lo_k: float | None = None,
+    extra_hi_k: float | None = None,
 ) -> tuple[float, float]:
     """Comfort band (lower, upper) for a zone this tick.
 
-    ``extra_half_k`` is COP-efficiency slack (center fixed): temporary widen
-    when outdoor-band COP says now and later differ — not a preset change.
+    COP-efficiency slack (center fixed) via ``extra_lo_k`` / ``extra_hi_k``.
+    If those are omitted, ``extra_half_k`` widens both sides symmetrically.
+    Boost callers typically stretch only the conditioning side (cool: lo;
+    heat: hi) so the far reactive edge stays tight.
     """
     half = settings.band_k
     preset = effective_preset(settings, house_occupied)
@@ -117,8 +121,13 @@ def zone_band(
     # Boost overrides vacant widen (same as it overrides presence-Away).
     if zone_occupied is False and preset != PRESET_BOOST:
         half += UNOCCUPIED_WIDEN_K
-    half += max(0.0, extra_half_k)
-    return center - half, center + half
+    if extra_lo_k is None and extra_hi_k is None:
+        extra_lo_k = extra_half_k
+        extra_hi_k = extra_half_k
+    else:
+        extra_lo_k = 0.0 if extra_lo_k is None else extra_lo_k
+        extra_hi_k = 0.0 if extra_hi_k is None else extra_hi_k
+    return center - half - max(0.0, extra_lo_k), center + half + max(0.0, extra_hi_k)
 
 
 def demand_setpoint(

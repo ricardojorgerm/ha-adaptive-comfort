@@ -61,11 +61,12 @@ def test_no_arbitrage_in_ventilate_territory():
 
 
 def test_widen_engages_and_widens_bands():
+    # Non-Boost: symmetric widen both edges.
     s = snap(
         24.0,
         [33.0, 34.0],
         cop_by_band={"mild": 2.4, "hot": 1.0},
-        settings=Settings(hvac_mode=MODE_COOL, target=23.0, adaptive_blend=0.0, preset="boost"),
+        settings=Settings(hvac_mode=MODE_COOL, target=23.0, adaptive_blend=0.0),
     )
     st = ControllerState()
     st.zone_since["z1"] = NOW - 7200.0
@@ -79,8 +80,27 @@ def test_widen_engages_and_widens_bands():
     base_lo, base_hi = comfort.zone_band(s.settings, center, True, None)
     assert abs((base_lo - lo) - controller.COP_WIDEN_MAX_K) < 1e-6
     assert abs((hi - base_hi) - controller.COP_WIDEN_MAX_K) < 1e-6
-    # Center unchanged: midpoint of efficiency band equals base center.
     assert abs(((lo + hi) / 2.0) - center) < 1e-6
+
+
+def test_boost_widen_stretches_cool_lo_only():
+    s = snap(
+        24.0,
+        [33.0, 34.0],
+        cop_by_band={"mild": 2.4, "hot": 1.0},
+        settings=Settings(hvac_mode=MODE_COOL, target=23.0, adaptive_blend=0.0, preset="boost"),
+    )
+    st = ControllerState()
+    st.zone_since["z1"] = NOW - 7200.0
+    st.zone_on["z1"] = True
+    st.mode_since = NOW - 24 * 3600.0
+    d = controller.tick(s, st)
+    assert d.diag.get("cop_timing") == "advance"
+    lo, hi = d.diag["bands"]["z1"]
+    center = comfort.band_center(s.settings, None)
+    base_lo, base_hi = comfort.zone_band(s.settings, center, True, None)
+    assert abs((base_lo - lo) - controller.COP_WIDEN_MAX_K) < 1e-6
+    assert abs(hi - base_hi) < 1e-6  # Boost far edge stays tight
 
 
 def test_widen_hysteresis_holds_below_enter():

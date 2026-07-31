@@ -15,6 +15,7 @@ from .types import (
     MODE_FAN,
     MODE_HEAT,
     MODE_OFF,
+    PRESET_BOOST,
     PRESET_MANUAL,
     STATE_COOLING,
     STATE_FAN_ONLY,
@@ -979,15 +980,26 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
     # 2b. COP-timed efficiency band: widen half (center fixed) when outdoor
     # band COP now differs from a band arriving in the forecast lookahead.
+    # Boost: stretch only the conditioning-side edge (cool lo / heat hi) so
+    # the far reactive threshold stays Boost-tight — advance banks deeper;
+    # defer cannot float a boosted room above the tight hi.
     widen_k, cop_timing = _update_cop_widen(state, snap, mode, centers)
     if widen_k > 0.0:
+        boost = preset == PRESET_BOOST
+        if boost and mode == MODE_COOL:
+            extra_lo, extra_hi = widen_k, 0.0
+        elif boost and mode == MODE_HEAT:
+            extra_lo, extra_hi = 0.0, widen_k
+        else:
+            extra_lo = extra_hi = widen_k
         for zone in zones:
             bands[zone.zone_id] = comfort.zone_band(
                 s,
                 centers[zone.zone_id],
                 zone.occupied,
                 snap.house_occupied,
-                extra_half_k=widen_k,
+                extra_lo_k=extra_lo,
+                extra_hi_k=extra_hi,
             )
         diag["bands"] = {z: bands[z] for z in bands}
     diag["cop_band_widen_k"] = widen_k
