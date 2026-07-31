@@ -193,7 +193,7 @@ def test_update_cop_includes_latent():
     latent-inclusive sample lands in the plausible band."""
     a = _cool_capable_model()
     b = _cool_capable_model()
-    # |Q_sens| ≈ C_eff·|−3 − 0.4·6| ≈ 220 W; at 500 W electric → COP ~0.44 < COP_MIN.
+    # |Q_sens| ~ C_eff*|-3 - 0.4*6| ~ 220 W; at 500 W electric -> COP ~0.44 < COP_MIN.
     a.update_cop(500.0, 24.0, 30.0, 12.0, dtdt_per_h=-3.0)
     b.update_cop(500.0, 24.0, 30.0, 12.0, dtdt_per_h=-3.0, latent_w=200.0)
     assert a.cop is None  # sensible-only below COP_MIN

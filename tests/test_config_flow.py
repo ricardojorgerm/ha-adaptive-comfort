@@ -6,6 +6,17 @@ import pytest
 
 pytest.importorskip("homeassistant")
 
+# Subentry flows landed in recent HA cores; on older test harnesses the
+# integration's config_flow module cannot even import. Skip (not fail) so a
+# mismatched local environment reports honestly - CI pins a matching core.
+try:
+    from homeassistant.config_entries import ConfigSubentryFlow  # noqa: F401
+except ImportError:  # pragma: no cover - depends on installed HA version
+    pytest.skip(
+        "installed homeassistant core lacks ConfigSubentryFlow (subentry flows)",
+        allow_module_level=True,
+    )
+
 from homeassistant import config_entries
 from homeassistant.components.climate import HVACMode
 from homeassistant.components.sensor import SensorDeviceClass
@@ -151,9 +162,7 @@ async def test_zone_subentry_flow(hass: HomeAssistant) -> None:
     assert sub["title"] == "Bedroom"
     config_entry = hass.config_entries.async_get_entry(config_entry.entry_id)
     assert config_entry is not None
-    stored = next(
-        s for s in config_entry.subentries.values() if s.title == "Bedroom"
-    )
+    stored = next(s for s in config_entry.subentries.values() if s.title == "Bedroom")
     assert stored.data[CONF_AREAS] == [12.0]
 
 

@@ -352,9 +352,7 @@ def dominant_mode(
     # persistence alone must not drive cool/heat — in winter a sunlit room
     # 0.4 K over the band would otherwise cross MODE_DEADBAND_KH and the
     # seasonal guard cannot demote (max_hot_k > 0 by construction).
-    has_model = any(
-        z.confidence >= MIN_MODEL_CONFIDENCE and z.free_float for z in zones
-    )
+    has_model = any(z.confidence >= MIN_MODEL_CONFIDENCE and z.free_float for z in zones)
     if not has_model:
         dev = indoor_deviation(zones, bands, snap.aux_indoor)
         mode = fallback_mode(snap.t_rm, state.mode, dev, snap.settings.band_k)

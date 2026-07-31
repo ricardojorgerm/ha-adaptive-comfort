@@ -44,11 +44,7 @@ class OccupancyDebounce:
             return self._effective
         if raw is False:
             if self._effective is True:
-                idle = (
-                    0.0
-                    if self._last_true_ts is None
-                    else now - self._last_true_ts
-                )
+                idle = 0.0 if self._last_true_ts is None else now - self._last_true_ts
                 # Still inside sticky window after last True.
                 if idle < self.sticky_s:
                     return self._effective

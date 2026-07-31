@@ -34,6 +34,115 @@ def outdoor_band(t_out: float | None) -> str | None:
     return "hot"
 
 
+def cop_heads_key(mode: str, n_heads: int) -> str:
+    """Persist/lookup key for head-count COP: '{cool|heat}|{n}'."""
+    return f"{mode}|{int(n_heads)}"
+
+
+def cop_banded_key(mode: str, n_heads: int, band: str) -> str:
+    """Persist/lookup key for banded COP: '{cool|heat}|{n}|{mild|warm|hot}'."""
+    return f"{mode}|{int(n_heads)}|{band}"
+
+
+def cop_state_key(mode: str, state: str) -> str:
+    """Persist/lookup key for control-state COP: '{cool|heat}|{conditioning|park|mixed}'."""
+    return f"{mode}|{state}"
+
+
+def cop_sample_mode(
+    controller_mode: str,
+    *,
+    any_heating: bool,
+    any_cooling: bool,
+) -> str | None:
+    """Ledger mode for a house COP sample, or None to skip filing.
+
+    Snapshot hints filter by controller heat/cool. Samples must use that same
+    key — but only when at least one active head reports the matching
+    action, so a lagged ``hvac_action`` during a mode change cannot file
+    cool-physics watts under ``heat|…`` (or the reverse). Disagree → skip.
+    """
+    if controller_mode == "heat" and any_heating:
+        return "heat"
+    if controller_mode == "cool" and any_cooling:
+        return "cool"
+    return None
+
+
+def migrate_cop_table_keys(table: dict, *, kind: str) -> dict[str, tuple[float, int]]:
+    """Rewrite schema-2 (unprefixed) COP keys into mode-prefixed form.
+
+    Pre-split field data is cooling-dominated; unprefixed keys land under
+    ``cool|…``. Already-prefixed keys pass through. ``kind`` is
+    ``heads`` | ``banded`` | ``state``.
+    """
+    out: dict[str, tuple[float, int]] = {}
+    for raw_key, value in table.items():
+        try:
+            cop, n = float(value[0]), int(value[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        key = str(raw_key)
+        if key.startswith("cool|") or key.startswith("heat|"):
+            out[key] = (cop, n)
+            continue
+        if kind == "heads":
+            try:
+                out[cop_heads_key("cool", int(key))] = (cop, n)
+            except (TypeError, ValueError):
+                continue
+        elif kind == "banded":
+            # "{n}|{band}"
+            if "|" not in key:
+                continue
+            heads, _, band = key.partition("|")
+            try:
+                out[cop_banded_key("cool", int(heads), band)] = (cop, n)
+            except (TypeError, ValueError):
+                continue
+        elif kind == "state":
+            out[cop_state_key("cool", key)] = (cop, n)
+    return out
+
+
+def cop_by_head_count(
+    table: dict[str, tuple[float, int]], mode: str, min_samples: int
+) -> dict[int, float]:
+    """Sample-gated head-count COP map for one HVAC mode."""
+    prefix = f"{mode}|"
+    out: dict[int, float] = {}
+    for key, (cop, count) in table.items():
+        if count < min_samples or not key.startswith(prefix):
+            continue
+        rest = key[len(prefix) :]
+        if "|" in rest:
+            continue  # banded / other
+        try:
+            out[int(rest)] = cop
+        except ValueError:
+            continue
+    return out
+
+
+def cop_by_band(
+    table: dict[str, tuple[float, int]], mode: str, min_samples: int
+) -> dict[str, float]:
+    """Sample-gated outdoor-band COP (mean across head counts) for one mode."""
+    totals: dict[str, list[float]] = {}
+    prefix = f"{mode}|"
+    for key, (cop, count) in table.items():
+        if not key.startswith(prefix):
+            continue
+        parts = key.split("|")
+        if len(parts) != 3:
+            continue
+        band = parts[2]
+        acc = totals.setdefault(band, [0.0, 0])
+        acc[0] += cop * count
+        acc[1] += count
+    return {band: acc[0] / acc[1] for band, acc in totals.items() if acc[1] >= min_samples}
+
+
 COMPRESSION_FLOOR_W = 75.0  # default = fan_floor_w(1); callers pass live floor
 START_DEBOUNCE_S = 180.0  # power must stay below the floor this long to arm
 START_WINDOW_S = 24.0 * 3600.0

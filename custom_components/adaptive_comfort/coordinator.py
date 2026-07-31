@@ -109,9 +109,9 @@ OUTDOOR_LKG_S = 2.0 * 3600.0
 # Moisture baselines learned against (k_out+k_mix) are invalid after the
 # outdoor-only airflow fix; wipe on restore from older schema.
 MOISTURE_SCHEMA = 2
-# House/zone COP learned with inflated latent must be re-fit after outdoor-only
-# airflow; wipe tables and per-zone COP on restore from older schema.
-COP_SCHEMA = 2
+# House/zone COP: schema 2 wiped inflated-latent history; schema 3 splits
+# heat/cool ledgers (keys '{mode}|…') so seasons no longer mix.
+COP_SCHEMA = 3
 
 
 def _float_state(hass: HomeAssistant, entity_id: str | None) -> float | None:
@@ -270,10 +270,10 @@ class AdaptiveComfortRuntime:
         self._prev_zone_enabled: dict[str, bool] = {}
         # True only when at least one *conditioning* zone refreshed sensible this tick.
         self._conditioning_fit_refreshed: bool = False
-        self.cop_table: dict[int, tuple[float, int]] = {}  # heads -> (ewma cop, samples)
-        # (heads, outdoor band) -> (ewma cop, samples); diagnostics/analysis only for now.
+        self.cop_table: dict[str, tuple[float, int]] = {}  # "{mode}|{heads}" -> (ewma, n)
+        # "{mode}|{heads}|{mild|warm|hot}" -> (ewma, n) — weather vs head-count.
         self.cop_table_banded: dict[str, tuple[float, int]] = {}
-        # control state ('conditioning'|'park'|'mixed') -> (ewma cop, samples)
+        # "{mode}|{conditioning|park|mixed}" -> (ewma, n) — park-hold economics.
         self.cop_table_state: dict[str, tuple[float, int]] = {}
         self.starts = power.StartCounter()
         self._last_state_key: str | None = None
@@ -570,7 +570,7 @@ class AdaptiveComfortRuntime:
         if int(data.get("cop_schema", 0)) >= COP_SCHEMA:
             for key, value in data.get("cop_table", {}).items():
                 try:
-                    self.cop_table[int(key)] = (float(value[0]), int(value[1]))
+                    self.cop_table[str(key)] = (float(value[0]), int(value[1]))
                 except (TypeError, ValueError, IndexError):
                     continue
             for key, value in data.get("cop_table_banded", {}).items():
@@ -583,6 +583,16 @@ class AdaptiveComfortRuntime:
                     self.cop_table_state[str(key)] = (float(value[0]), int(value[1]))
                 except (TypeError, ValueError, IndexError):
                     continue
+        elif int(data.get("cop_schema", 0)) == 2:
+            # Schema 2 mixed heat/cool under bare keys; attribute to cool
+            # (field history is cooling-dominated) and start heat fresh.
+            self.cop_table = power.migrate_cop_table_keys(data.get("cop_table", {}), kind="heads")
+            self.cop_table_banded = power.migrate_cop_table_keys(
+                data.get("cop_table_banded", {}), kind="banded"
+            )
+            self.cop_table_state = power.migrate_cop_table_keys(
+                data.get("cop_table_state", {}), kind="state"
+            )
         else:
             # Inflated-latent COP history is not reusable.
             self.cop_table.clear()
@@ -635,7 +645,7 @@ class AdaptiveComfortRuntime:
             "controller": self.controller_state.to_dict(),
             "zones": {zid: zone.to_dict() for zid, zone in self.zones.items()},
             "cop_schema": COP_SCHEMA,
-            "cop_table": {str(k): [v[0], v[1]] for k, v in self.cop_table.items()},
+            "cop_table": {k: [v[0], v[1]] for k, v in self.cop_table.items()},
             "cop_table_banded": {k: [v[0], v[1]] for k, v in self.cop_table_banded.items()},
             "cop_table_state": {k: [v[0], v[1]] for k, v in self.cop_table_state.items()},
             "starts": self.starts.to_dict(),
@@ -1170,25 +1180,35 @@ class AdaptiveComfortRuntime:
                     self.house_cop = house_cop
                 else:
                     self.house_cop += HOUSE_COP_EMA_ALPHA * (house_cop - self.house_cop)
-                prev, count = self.cop_table.get(n_heads, (house_cop, 0))
-                self.cop_table[n_heads] = (prev + 0.05 * (house_cop - prev), count + 1)
-                band = power.outdoor_band(self.t_out)
-                if band is not None:
-                    key = f"{n_heads}|{band}"
-                    prev_b, count_b = self.cop_table_banded.get(key, (house_cop, 0))
-                    self.cop_table_banded[key] = (
-                        prev_b + 0.05 * (house_cop - prev_b),
-                        count_b + 1,
-                    )
-                # Per-control-state COP: are park-holds the cheapest or the
-                # most wasteful kWh in the system? Sampled house-wide.
-                skey = self._last_state_key
-                if skey is not None:
-                    prev_s, count_s = self.cop_table_state.get(skey, (house_cop, 0))
-                    self.cop_table_state[skey] = (
-                        prev_s + 0.05 * (house_cop - prev_s),
-                        count_s + 1,
-                    )
+                # Ledger key must match snapshot hint filtering (controller
+                # mode) and agree with live head_state — else skip the row.
+                mode = power.cop_sample_mode(
+                    self.controller_state.mode,
+                    any_heating=any(z.head_state == STATE_HEATING for z in active),
+                    any_cooling=any(z.head_state == STATE_COOLING for z in active),
+                )
+                if mode is not None:
+                    hkey = power.cop_heads_key(mode, n_heads)
+                    prev, count = self.cop_table.get(hkey, (house_cop, 0))
+                    self.cop_table[hkey] = (prev + 0.05 * (house_cop - prev), count + 1)
+                    band = power.outdoor_band(self.t_out)
+                    if band is not None:
+                        bkey = power.cop_banded_key(mode, n_heads, band)
+                        prev_b, count_b = self.cop_table_banded.get(bkey, (house_cop, 0))
+                        self.cop_table_banded[bkey] = (
+                            prev_b + 0.05 * (house_cop - prev_b),
+                            count_b + 1,
+                        )
+                    # Per-control-state COP (mode-split): are park-holds the
+                    # cheapest or the most wasteful kWh in this mode?
+                    skey = self._last_state_key
+                    if skey is not None:
+                        sk = power.cop_state_key(mode, skey)
+                        prev_s, count_s = self.cop_table_state.get(sk, (house_cop, 0))
+                        self.cop_table_state[sk] = (
+                            prev_s + 0.05 * (house_cop - prev_s),
+                            count_s + 1,
+                        )
 
     def _update_zone_estimators(self, zone: ZoneRuntime, now_ts: float, local_hour: float) -> None:
         if zone.temp is None:
@@ -1502,9 +1522,13 @@ class AdaptiveComfortRuntime:
                     mixing_coupling_w_per_k=mixing_coupling,
                 )
             )
-        cop_hints = {
-            n: cop for n, (cop, count) in self.cop_table.items() if count >= COP_TABLE_MIN_SAMPLES
-        }
+        mode_hint = self.controller_state.mode
+        if mode_hint in (MODE_HEAT, MODE_COOL):
+            cop_hints = power.cop_by_head_count(self.cop_table, mode_hint, COP_TABLE_MIN_SAMPLES)
+            cop_by_band = power.cop_by_band(self.cop_table_banded, mode_hint, COP_TABLE_MIN_SAMPLES)
+        else:
+            cop_hints = {}
+            cop_by_band = {}
         # Sensors in unconditioned rooms (e.g. a bathroom) give a fresh
         # install extra indoor evidence for cold-start mode arbitration.
         aux_indoor: list[tuple[float, float]] = []
@@ -1530,15 +1554,12 @@ class AdaptiveComfortRuntime:
             shed_urgent=self.shed_urgent,
             forecast_hours=tuple(forecast),
             cop_by_head_count=cop_hints,
+            cop_by_band=cop_by_band,
             aux_indoor=tuple(aux_indoor),
             p_ac=self.p_ac,
             compression_floor_w=self._compression_floor_w(
                 [z for z in self.zones.values() if z.is_on],
-                {
-                    zid
-                    for zid, since in self.controller_state.zone_parked_since.items()
-                    if since
-                },
+                {zid for zid, since in self.controller_state.zone_parked_since.items() if since},
             ),
         )
 
@@ -1912,7 +1933,7 @@ class AdaptiveComfortRuntime:
             "p_ac": self.p_ac,
             "baseline_coverage": self.baseline.coverage(),
             "forecast": self.forecast,
-            "cop_table": {str(k): v for k, v in self.cop_table.items()},
+            "cop_table": dict(self.cop_table),
             "cop_table_banded": dict(self.cop_table_banded),
             "cop_table_state": dict(self.cop_table_state),
             "compressor_starts_per_hour_24h": round(self.starts.per_hour(time.time()), 2),

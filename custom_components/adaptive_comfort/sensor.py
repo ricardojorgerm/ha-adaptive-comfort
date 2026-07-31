@@ -157,7 +157,9 @@ HOUSE_SENSORS: tuple[HouseSensorDescription, ...] = (
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda r: _round(r.house_cop, 2),
         attr_fn=lambda r: {
-            "by_active_heads": {str(k): round(v[0], 2) for k, v in r.cop_table.items()}
+            "by_mode_heads": {k: round(v[0], 2) for k, v in r.cop_table.items()},
+            "by_mode_band": {k: round(v[0], 2) for k, v in r.cop_table_banded.items()},
+            "by_mode_state": {k: round(v[0], 2) for k, v in r.cop_table_state.items()},
         },
     ),
     HouseSensorDescription(

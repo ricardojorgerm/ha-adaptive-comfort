@@ -58,10 +58,17 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   samples *reports the other regime's fit* (`_fit` fallback); `fit_is_fallback()` tells you
   whether you're looking at learned or borrowed numbers. Diagnostics expose this flag —
   keep it honest.
-- **COP tables**: `cop_table` is keyed by active head count; `cop_table_banded` by
-  `"{heads}|{band}"` with bands from `power.outdoor_band()` (mild/warm/hot). Head count and
-  weather are confounded in the field (3 heads ↔ hot afternoons), so never draw head-count
-  conclusions from the unbanded table alone.
+- **COP tables**: all three ledgers are **mode-split** (`cool|…` / `heat|…`) so
+  seasons never mix. `cop_table` keys `"{mode}|{heads}"`; `cop_table_banded`
+  `"{mode}|{heads}|{band}"` with bands from `power.outdoor_band()` (mild/warm/hot);
+  `cop_table_state` `"{mode}|{conditioning|park|mixed}"` audits park-hold economics
+  *per mode*. Snapshot hints (`cop_by_head_count`, `cop_by_band`) filter to the
+  active controller mode. Samples file under that same mode only when an active
+  head also reports the matching `hvac_action` (`cop_sample_mode`) — mode-change
+  lag skips the row rather than contaminating the other season. Head count and
+  weather stay confounded inside a mode (3 heads ↔ hot afternoons) — never draw
+  head-count conclusions from the unbanded table alone. Schema 2 bare keys
+  migrate into `cool|…` on restore.
 - **Persistence**: everything that must survive a restart goes through `coordinator._persist()`
   / restore and the `to_dict`/`from_dict` pairs. If you add controller state or a setting,
   wire all four places: dataclass, `to_dict`, `from_dict`, and the `_persist` settings dict
@@ -113,7 +120,8 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   map charts hysteresis: `fan_type_min_margin_k()` (shallowest fan-type shelf),
   `residual_max_margin_k()` (deepest still-compressing), `residual_edge_k()` (entry
   target between them), `current_is_fan_type(margin)` (live session class);
-  `cop_table_state` buckets house COP by control state to audit park-hold economics.
+  `cop_table_state` buckets house COP by control state **and mode** to audit
+  park-hold economics (park learning itself does not read COP tables).
 - **Power-react vs 60 s tick.** Meter/known-load changes run `_async_power_react`: head-state
   scan + `_sample_power` + demand finalize + `notify`. Full `controller.tick` runs on that
   path **only when shed engage/release flips** (tracking-delta and park-margin adapt per
@@ -135,6 +143,15 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   disqualification and re-arm only after `WINDOW_GRACE_S` continuously out of the pool.
 - **Latent moisture uses outdoor ACH only.** `outdoor_airflow_m3h` = `k_out × volume` (door/
   exhaust scaled); house-mixing must not couple to outdoor humidity ratio.
+- **`cop_by_band` is timing/widen groundwork, not precool.** Sample-gated means of
+  `cop_table_banded` for the *active mode* ride on `HouseSnapshot` each tick with
+  no behavior change yet. Intended consumer: COP-aware predictive demand for cool
+  and heat — when now beats the predicted-entry band, **advance and allow a
+  bounded wider half-band** (center fixed); when later is cheaper, defer within
+  that slack. Withdraw widen with hysteresis so the band never snaps narrow under
+  a room (the center-shift precool failure mode). Park *learning* ignores these
+  tables; park *audit* and park overcool edges must use the efficiency band when
+  widen is active. See plan `cop_timed_conditioning_8f3a1c2e`.
 - **Zone COP counts latent.** `update_cop` heat flow is sensible + latent; sensible-only
   samples in humid rooms undercount delivered cooling by 30–50% and can fall below
   `COP_MIN`, producing absurd or silently-rejected readings.

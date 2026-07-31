@@ -237,6 +237,10 @@ class HouseSnapshot:
     shed_urgent: bool = False  # immediate shed (critical overload or known-load spike)
     forecast_hours: tuple[float, ...] = ()  # hourly outdoor forecast, aligned with free_float
     cop_by_head_count: dict[int, float] = field(default_factory=dict)  # empirical COP hints
+    # Empirical COP by outdoor band ('mild'|'warm'|'hot') for the *active*
+    # HVAC mode, sample-gated and aggregated across head counts. Groundwork
+    # for COP-aware timing of predictive demand — not a center-shift precool.
+    cop_by_band: dict[str, float] = field(default_factory=dict)
     # Temperatures from unconditioned rooms as (temp, weight) pairs; weak
     # extra indoor evidence for cold-start mode arbitration.
     aux_indoor: tuple[tuple[float, float], ...] = ()

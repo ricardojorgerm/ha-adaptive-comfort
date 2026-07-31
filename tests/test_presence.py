@@ -53,7 +53,10 @@ def test_house_presence_fallback_all_zones_off():
             "binary_sensor.living": "off",
         }
     )
-    assert house_presence(hass, "person.ricardo", ["binary_sensor.bed", "binary_sensor.living"]) is False
+    assert (
+        house_presence(hass, "person.ricardo", ["binary_sensor.bed", "binary_sensor.living"])
+        is False
+    )
 
 
 def test_house_presence_no_sensors():

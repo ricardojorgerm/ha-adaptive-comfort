@@ -112,9 +112,7 @@ def test_cold_start_summer_day_controls_decently():
     for name, events in transitions.items():
         for (t1, on1), (t2, _on2) in itertools.pairwise(events):
             gap_min = (t2 - t1) / 60.0
-            minimum = (
-                settings.min_off_min if not on1 else controller.ZONE_CHATTER_S / 60.0
-            )
+            minimum = settings.min_off_min if not on1 else controller.ZONE_CHATTER_S / 60.0
             assert gap_min >= minimum - 1e-6, f"{name}: {gap_min:.1f} min violates guard"
 
 

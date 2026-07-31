@@ -249,9 +249,7 @@ def _wants_conditioning(
     return False
 
 
-def _predicted_oob_duration_s(
-    zone: ZoneSnapshot, lo: float, hi: float, mode: str
-) -> float:
+def _predicted_oob_duration_s(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> float:
     """Hours of free-float spent out of band, as seconds (handoff gate)."""
     hours = 0
     for t in list(zone.free_float)[:12]:
@@ -259,9 +257,12 @@ def _predicted_oob_duration_s(
             continue
         if (mode == MODE_COOL and t > hi) or (mode == MODE_HEAT and t < lo):
             hours += 1
-    if hours == 0 and zone.pred_60m is not None and (
-        (mode == MODE_COOL and zone.pred_60m > hi)
-        or (mode == MODE_HEAT and zone.pred_60m < lo)
+    if (
+        hours == 0
+        and zone.pred_60m is not None
+        and (
+            (mode == MODE_COOL and zone.pred_60m > hi) or (mode == MODE_HEAT and zone.pred_60m < lo)
+        )
     ):
         hours = 1
     return float(hours) * 3600.0
@@ -292,9 +293,7 @@ def _update_plant_compress(state: ControllerState, snap: HouseSnapshot) -> None:
     the run clock — otherwise plant min_on never completes. Same 180 s floor
     dwell as StartCounter before we treat compression as ended.
     """
-    compressing = (
-        snap.p_ac is not None and snap.p_ac >= snap.compression_floor_w
-    )
+    compressing = snap.p_ac is not None and snap.p_ac >= snap.compression_floor_w
     if compressing:
         if state.plant_compress_since <= 0.0:
             state.plant_compress_since = snap.now_ts
@@ -540,9 +539,7 @@ def _mixing_assist_covers_hold(zone: ZoneSnapshot, mode: str) -> bool:
     return assist_w >= PARK_LOAD_COVER_FRACTION * per_room_load
 
 
-def _mixing_will_condition(
-    zone: ZoneSnapshot, lo: float, hi: float, mode: str
-) -> bool:
+def _mixing_will_condition(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> bool:
     """True when free-float enters the band on the conditioning side.
 
     free_float already includes house-mixing from siblings (coordinator
@@ -610,9 +607,7 @@ def _mixing_free_rider(
         return True
     if _mixing_will_condition(zone, lo, hi, mode):
         return True
-    if _mixing_transport_grace(state, conditioning_sibling_ids, now):
-        return True
-    return False
+    return _mixing_transport_grace(state, conditioning_sibling_ids, now)
 
 
 def _all_zones_satisfied(zones: list[ZoneSnapshot], centers: dict[str, float], mode: str) -> bool:
@@ -675,8 +670,7 @@ def _anchor_should_release(
         {
             z.zone_id
             for z in zones
-            if z.zone_id != state.anchor_zone
-            and (want_on.get(z.zone_id) or z.is_on)
+            if z.zone_id != state.anchor_zone and (want_on.get(z.zone_id) or z.is_on)
         }
     )
     if (
@@ -832,11 +826,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
     # 3. Demand and helper sets.
     demand = (
-        [
-            z
-            for z in zones
-            if _wants_conditioning(z, *bands[z.zone_id], mode, s.min_on_min)
-        ]
+        [z for z in zones if _wants_conditioning(z, *bands[z.zone_id], mode, s.min_on_min)]
         if mode in (MODE_HEAT, MODE_COOL)
         else []
     )
@@ -1109,18 +1099,14 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             # Sibling conditioning + mixing already covers this zone's hold
             # load → residual park is pure extra compressor work; release.
             covering_sibs = [
-                z.zone_id
-                for z in zones
-                if z.zone_id != zid and (want_on.get(z.zone_id) or z.is_on)
+                z.zone_id for z in zones if z.zone_id != zid and (want_on.get(z.zone_id) or z.is_on)
             ]
             lo_b, hi_b = bands[zid]
             ride_mode = mode if mode in (MODE_HEAT, MODE_COOL) else (pmode or "")
             mixing_covered = (
                 bool(covering_sibs)
                 and ride_mode in (MODE_HEAT, MODE_COOL)
-                and _mixing_free_rider(
-                    zone, ride_mode, state, covering_sibs, lo_b, hi_b, now
-                )
+                and _mixing_free_rider(zone, ride_mode, state, covering_sibs, lo_b, hi_b, now)
             )
             dwell_ok = now - parked_since >= PARK_MIN_DWELL_S
             probing = zone.park_residuals is None
