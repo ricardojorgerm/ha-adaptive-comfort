@@ -8,7 +8,7 @@ device setpoints via the per-head drift offsets.
 from __future__ import annotations
 
 from . import comfort, power
-from .park import MARGIN_SETTLE_ALPHA
+from .park import LOAD_COVER_FRACTION, MARGIN_SETTLE_ALPHA, pick_depth_k
 from .types import (
     MODE_AUTO,
     MODE_COOL,
@@ -182,21 +182,61 @@ def _forecast_cop_arbitrage(
     return "none", 0.0
 
 
+def _outside_base_band_on_widen_side(
+    zones: list[ZoneSnapshot],
+    centers: dict[str, float],
+    snap: HouseSnapshot,
+    mode: str,
+    timing: str,
+) -> bool:
+    """True if any zone still sits outside the unwidened band on the widen side.
+
+    Cool advance banks below the tight lo; heat advance above the tight hi;
+    defer floats the far edge. Until every zone has crossed back inside that
+    base edge, withdrawing widen would reclassify the bank as the opposite
+    mode's demand (summer heat after a cool bank — the field failure).
+    """
+    if timing not in ("advance", "defer") or mode not in (MODE_HEAT, MODE_COOL):
+        return False
+    s = snap.settings
+    for zone in zones:
+        if zone.temp is None or zone.zone_id not in centers:
+            continue
+        lo, hi = comfort.zone_band(s, centers[zone.zone_id], zone.occupied, snap.house_occupied)
+        if mode == MODE_COOL and timing == "advance" and zone.temp < lo:
+            return True
+        if mode == MODE_HEAT and timing == "advance" and zone.temp > hi:
+            return True
+        if mode == MODE_COOL and timing == "defer" and zone.temp > hi:
+            return True
+        if mode == MODE_HEAT and timing == "defer" and zone.temp < lo:
+            return True
+    return False
+
+
+def _clear_cop_widen(state: ControllerState) -> None:
+    state.cop_widen_k = 0.0
+    state.cop_timing = "none"
+    state.cop_widen_mode = None
+
+
 def _update_cop_widen(
     state: ControllerState,
     snap: HouseSnapshot,
     mode: str,
     centers: dict[str, float],
+    zones: list[ZoneSnapshot],
 ) -> tuple[float, str]:
     """Hysteretic efficiency-band widen. Returns (widen_k, timing).
 
     Enter when either direction clears ENTER. Hold while the *latched*
     direction's own ratio stays ≥ EXIT — not whichever side wins this tick
     — so a brief advance/defer flip cannot snap the half-band narrow.
+    Even after COP advantage falls below EXIT, keep the widen until every
+    zone has crossed back inside the unwidened band on the widen side.
     """
     if mode not in (MODE_HEAT, MODE_COOL):
-        state.cop_widen_k = 0.0
-        state.cop_timing = "none"
+        _clear_cop_widen(state)
         return 0.0, "none"
 
     advance_ratio, defer_ratio = _arbitrage_ratios(snap, mode, centers)
@@ -204,22 +244,67 @@ def _update_cop_widen(
     if advance_ratio >= defer_ratio and advance_ratio >= COP_ADVANTAGE_ENTER:
         state.cop_timing = "advance"
         state.cop_widen_k = COP_WIDEN_MAX_K
+        state.cop_widen_mode = mode
     elif defer_ratio > advance_ratio and defer_ratio >= COP_ADVANTAGE_ENTER:
         state.cop_timing = "defer"
         state.cop_widen_k = COP_WIDEN_MAX_K
+        state.cop_widen_mode = mode
     elif state.cop_widen_k > 0.0:
+        hold_mode = state.cop_widen_mode or mode
         if state.cop_timing == "advance":
             hold_ratio = advance_ratio
         elif state.cop_timing == "defer":
             hold_ratio = defer_ratio
         else:
             hold_ratio = 0.0
+        # Recompute ratios for the latched widen mode when it differs from
+        # the caller mode (recovery after a false opposite-mode flip).
+        if hold_mode != mode:
+            advance_ratio, defer_ratio = _arbitrage_ratios(snap, hold_mode, centers)
+            if state.cop_timing == "advance":
+                hold_ratio = advance_ratio
+            elif state.cop_timing == "defer":
+                hold_ratio = defer_ratio
         if hold_ratio < COP_ADVANTAGE_EXIT:
-            state.cop_widen_k = 0.0
-            state.cop_timing = "none"
+            if _outside_base_band_on_widen_side(zones, centers, snap, hold_mode, state.cop_timing):
+                # Recovery latch: keep efficiency band until temps re-enter.
+                state.cop_widen_mode = hold_mode
+            else:
+                _clear_cop_widen(state)
     else:
-        state.cop_timing = "none"
+        _clear_cop_widen(state)
     return state.cop_widen_k, state.cop_timing
+
+
+def _apply_cop_widen_bands(
+    zones: list[ZoneSnapshot],
+    bands: dict[str, tuple[float, float]],
+    centers: dict[str, float],
+    snap: HouseSnapshot,
+    preset: str,
+    mode: str,
+    widen_k: float,
+) -> None:
+    """Mutate ``bands`` with the efficiency half-band stretch for ``mode``."""
+    if widen_k <= 0.0 or mode not in (MODE_HEAT, MODE_COOL):
+        return
+    s = snap.settings
+    boost = preset == PRESET_BOOST
+    if boost and mode == MODE_COOL:
+        extra_lo, extra_hi = widen_k, 0.0
+    elif boost and mode == MODE_HEAT:
+        extra_lo, extra_hi = 0.0, widen_k
+    else:
+        extra_lo = extra_hi = widen_k
+    for zone in zones:
+        bands[zone.zone_id] = comfort.zone_band(
+            s,
+            centers[zone.zone_id],
+            zone.occupied,
+            snap.house_occupied,
+            extra_lo_k=extra_lo,
+            extra_hi_k=extra_hi,
+        )
 
 
 def _select_regime(snap: HouseSnapshot, mode: str, centers: dict[str, float]) -> str:
@@ -277,7 +362,7 @@ PARK_PROBE_S = 900.0
 PARK_PROBE_SPACING_S = 6.0 * 3600.0
 # Residual output must plausibly carry the zone's standing load to justify
 # exploitation-parking instead of a plain off.
-PARK_LOAD_COVER_FRACTION = 0.6
+PARK_LOAD_COVER_FRACTION = LOAD_COVER_FRACTION
 COP_TABLE_ADVANTAGE = 1.05
 # Fan assist: a multi-split head cannot run opposite to the shared mode, but
 # fan-only mixing can nudge an out-of-band room using house air. Running the
@@ -395,16 +480,26 @@ def _wants_conditioning(
     min_on_min: float = 20.0,
     cop_timing: str = "none",
 ) -> bool:
-    """Demand: out of band now, or prediction justifies a plant-minimum run."""
+    """Demand: out of band now, or prediction justifies a plant-minimum run.
+
+    Predictive entry only while approaching the near edge. Past the far edge
+    (cool temp≤lo / heat temp≥hi), more of the same mode is overshoot —
+    advance horizons must not keep digging (Aug 3: West cooled to ~20.4°C
+    while still want=demand). Helpers already use ``_reached_far_edge``.
+    """
     if zone.temp is None:
         return False
     if mode == MODE_COOL:
         if zone.temp > hi:
             return True
+        if zone.temp <= lo:
+            return False
         return _prediction_justifies_run(zone, lo, hi, mode, min_on_min, cop_timing)
     if mode == MODE_HEAT:
         if zone.temp < lo:
             return True
+        if zone.temp >= hi:
+            return False
         return _prediction_justifies_run(zone, lo, hi, mode, min_on_min, cop_timing)
     return False
 
@@ -518,6 +613,35 @@ def _park_exploit_ok(zone: ZoneSnapshot, mode: str) -> bool:
         return True
     per_room_load = zone.standing_load_w / max(1, zone.n_rooms)
     return zone.park_extraction_w >= PARK_LOAD_COVER_FRACTION * per_room_load
+
+
+def _command_with_depth(
+    zid: str,
+    mode: str,
+    setpoint: float | None,
+    reason: str,
+    depth_k: float,
+) -> Command:
+    """Build a Command from signed head depth (cool: SP = internal + depth)."""
+    if depth_k > 0.0:
+        return Command(
+            zid,
+            mode,
+            setpoint,
+            reason,
+            park=True,
+            park_margin=depth_k,
+            head_depth_k=depth_k,
+        )
+    track = abs(depth_k) if depth_k < 0.0 else None
+    return Command(
+        zid,
+        mode,
+        setpoint,
+        reason,
+        track_delta=track,
+        head_depth_k=depth_k if track is not None else 0.0,
+    )
 
 
 def _park_preferred(zone: ZoneSnapshot, state: ControllerState) -> float:
@@ -959,11 +1083,45 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     diag["bands"] = {z: bands[z] for z in bands}
     diag["effective_preset"] = preset
 
-    # 2. Mode arbitration.
+    # 2. COP-timed efficiency band *before* mode arbitration. Mode must see
+    # the widened edges — otherwise a cool-advance bank below the tight lo
+    # looks like a cold deficit and auto flips to heat in summer. Use the
+    # latched widen mode (or last/forced conditioning mode) for stretch.
+    if s.hvac_mode in (MODE_HEAT, MODE_COOL):
+        widen_mode: str | None = s.hvac_mode
+    elif state.cop_widen_mode in (MODE_HEAT, MODE_COOL):
+        widen_mode = state.cop_widen_mode
+    elif state.mode in (MODE_HEAT, MODE_COOL):
+        widen_mode = state.mode
+    else:
+        widen_mode = None
+    if widen_mode is not None:
+        widen_k, cop_timing = _update_cop_widen(state, snap, widen_mode, centers, zones)
+        apply_mode = state.cop_widen_mode or widen_mode
+        _apply_cop_widen_bands(zones, bands, centers, snap, preset, apply_mode, widen_k)
+        if widen_k > 0.0:
+            diag["bands"] = {z: bands[z] for z in bands}
+    else:
+        _clear_cop_widen(state)
+        widen_k, cop_timing = 0.0, "none"
+    diag["cop_band_widen_k"] = widen_k
+    diag["cop_timing"] = cop_timing
+
+    # 3. Mode arbitration on the (possibly widened) bands.
     if s.hvac_mode == MODE_OFF:
         mode = MODE_OFF
         diag["mode_source"] = "forced"
         state.mode = MODE_OFF
+        _clear_cop_widen(state)
+        widen_k, cop_timing = 0.0, "none"
+        # Rebuild tight bands after clearing widen for an off hub.
+        for zone in zones:
+            bands[zone.zone_id] = comfort.zone_band(
+                s, centers[zone.zone_id], zone.occupied, snap.house_occupied
+            )
+        diag["bands"] = {z: bands[z] for z in bands}
+        diag["cop_band_widen_k"] = 0.0
+        diag["cop_timing"] = "none"
     elif s.hvac_mode in (MODE_HEAT, MODE_COOL):
         mode = s.hvac_mode
         diag["mode_source"] = "forced"
@@ -978,32 +1136,30 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         diag["cold_deficit_kh"] = round(decision.cold_deficit_kh, 2)
     diag["mode"] = mode
 
-    # 2b. COP-timed efficiency band: widen half (center fixed) when outdoor
-    # band COP now differs from a band arriving in the forecast lookahead.
-    # Boost: stretch only the conditioning-side edge (cool lo / heat hi) so
-    # the far reactive threshold stays Boost-tight — advance banks deeper;
-    # defer cannot float a boosted room above the tight hi.
-    widen_k, cop_timing = _update_cop_widen(state, snap, mode, centers)
-    if widen_k > 0.0:
-        boost = preset == PRESET_BOOST
-        if boost and mode == MODE_COOL:
-            extra_lo, extra_hi = widen_k, 0.0
-        elif boost and mode == MODE_HEAT:
-            extra_lo, extra_hi = 0.0, widen_k
-        else:
-            extra_lo = extra_hi = widen_k
+    # If auto settled on the opposite conditioning mode, refresh widen once
+    # so heat/cool stretch matches the live decision.
+    if (
+        s.hvac_mode == MODE_AUTO
+        and mode in (MODE_HEAT, MODE_COOL)
+        and state.cop_widen_mode is not None
+        and state.cop_widen_mode != mode
+        and not (
+            state.cop_widen_k > 0.0
+            and _outside_base_band_on_widen_side(
+                zones, centers, snap, state.cop_widen_mode, state.cop_timing
+            )
+        )
+    ):
+        # Only restretch when not mid recovery on the latched side.
         for zone in zones:
             bands[zone.zone_id] = comfort.zone_band(
-                s,
-                centers[zone.zone_id],
-                zone.occupied,
-                snap.house_occupied,
-                extra_lo_k=extra_lo,
-                extra_hi_k=extra_hi,
+                s, centers[zone.zone_id], zone.occupied, snap.house_occupied
             )
+        widen_k, cop_timing = _update_cop_widen(state, snap, mode, centers, zones)
+        _apply_cop_widen_bands(zones, bands, centers, snap, preset, mode, widen_k)
         diag["bands"] = {z: bands[z] for z in bands}
-    diag["cop_band_widen_k"] = widen_k
-    diag["cop_timing"] = cop_timing
+        diag["cop_band_widen_k"] = widen_k
+        diag["cop_timing"] = cop_timing
 
     # Plant compression clock (min_on keys off this, not zone_since).
     _update_plant_compress(state, snap)
@@ -1046,7 +1202,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 continue
             if zone.zone_id in free_riders:
                 continue
-            if zone.occupied is False:
+            if comfort.effective_zone_occupied(s, zone.occupied) is False:
                 continue
             # A helper must have margin in the mode direction: only trim
             # rooms sitting above center (cooling) / below center (heating).
@@ -1205,7 +1361,11 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     if s.multisplit and s.fan_assist and mode in (MODE_HEAT, MODE_COOL):
         for zone in zones:
             zid = zone.zone_id
-            if want_on.get(zid) or zone.occupied is False or zid in state.shed:
+            if (
+                want_on.get(zid)
+                or comfort.effective_zone_occupied(s, zone.occupied) is False
+                or zid in state.shed
+            ):
                 continue
             if _opposite_deviation(zone, *bands[zid], mode) < FAN_ASSIST_MIN_DEV_K:
                 continue
@@ -1277,7 +1437,58 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         if zid not in state.zone_park_preferred:
             state.zone_park_preferred[zid] = _park_preferred(zone, state)
         parked_since = state.zone_parked_since.get(zid)
-        if parked_since is not None:
+        if parked_since is not None and desired_on and mode in (MODE_HEAT, MODE_COOL):
+            # Demand-side hysteresis depth: same margin adapt / overcool
+            # guards as want-off park, but the zone still wants conditioning.
+            lo_b, hi_b = bands[zid]
+            if not _park_ok_now(zone, lo_b, hi_b, mode):
+                # Pull-down needed: drop positive depth and fall through.
+                _clear_park_session(state, zid, zone, now)
+            else:
+                preferred = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
+                margin = state.zone_park_margin.get(zid, preferred)
+                margin_changed = False
+                overcorrected = zone.temp is not None and (
+                    zone.temp <= lo_b - PARK_OVERCOOL_BUFFER_K
+                    if mode == MODE_COOL
+                    else zone.temp >= hi_b + PARK_OVERCOOL_BUFFER_K
+                )
+                if zone.temp is not None:
+                    ref = state.zone_park_ref.get(zid)
+                    if ref is None:
+                        state.zone_park_ref[zid] = zone.temp
+                    else:
+                        moved = ref - zone.temp if mode == MODE_COOL else zone.temp - ref
+                        if moved >= PARK_ADAPT_EPS_K:
+                            if margin < PARK_MARGIN_MAX_K:
+                                margin = min(margin + PARK_MARGIN_STEP_K, PARK_MARGIN_MAX_K)
+                                state.zone_park_margin[zid] = margin
+                                state.zone_park_ref[zid] = zone.temp
+                                _raise_park_preferred(state, zid, margin)
+                                margin_changed = True
+                        elif moved <= -PARK_ADAPT_EPS_K:
+                            relax_floor = PARK_MARGIN_K
+                            if zone.park_residual_edge_k is not None:
+                                relax_floor = max(relax_floor, zone.park_residual_edge_k)
+                            new_margin = max(margin - PARK_MARGIN_STEP_K, relax_floor)
+                            if new_margin != margin:
+                                margin = new_margin
+                                state.zone_park_margin[zid] = margin
+                                margin_changed = True
+                            state.zone_park_ref[zid] = zone.temp
+                if overcorrected:
+                    _clear_park_session(state, zid, zone, now)
+                    diag.setdefault("park_overcorrected", []).append(zid)
+                else:
+                    last_cmd = state.zone_last_cmd.get(zid, 0.0)
+                    if margin_changed or now - last_cmd >= COMMAND_SPACING_S:
+                        commands.append(
+                            _command_with_depth(zid, mode, None, "depth_residual", margin)
+                        )
+                        state.zone_last_cmd[zid] = now
+                    state.zone_fan[zid] = False
+                    continue
+        if parked_since is not None and zid in state.zone_parked_since:
             # Direction: dominant mode when conditioning, else the head's own
             # physical mode - run-out parks must survive the house going idle.
             pmode = mode if mode in (MODE_HEAT, MODE_COOL) else zone.head_mode
@@ -1381,7 +1592,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     and pmode is not None
                 ):
                     commands.append(
-                        Command(zid, pmode, None, "park", park=True, park_margin=PARK_MARGIN_MAX_K)
+                        _command_with_depth(zid, pmode, None, "park", PARK_MARGIN_MAX_K)
                     )
                     state.zone_last_cmd[zid] = now
                 continue
@@ -1451,9 +1662,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 # so the head sees the new depth immediately.
                 last_cmd = state.zone_last_cmd.get(zid, 0.0)
                 if (margin_changed or now - last_cmd >= COMMAND_SPACING_S) and pmode is not None:
-                    commands.append(
-                        Command(zid, pmode, None, "park", park=True, park_margin=margin)
-                    )
+                    commands.append(_command_with_depth(zid, pmode, None, "park", margin))
                     state.zone_last_cmd[zid] = now
                 continue
         elif (
@@ -1492,7 +1701,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     state.zone_park_ref[zid] = zone.temp
                 if probe_due and not plant_hold:
                     state.zone_park_probe_entry[zid] = zone.park_samples
-                commands.append(Command(zid, mode, None, "park", park=True, park_margin=entry))
+                commands.append(_command_with_depth(zid, mode, None, "park", entry))
                 state.zone_last_cmd[zid] = now
                 diag.setdefault("parked", []).append(zid)
                 continue
@@ -1523,9 +1732,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     state.zone_park_margin[zid] = entry
                     if zone.temp is not None:
                         state.zone_park_ref[zid] = zone.temp
-                    commands.append(
-                        Command(zid, zone.head_mode, None, "park", park=True, park_margin=entry)
-                    )
+                    commands.append(_command_with_depth(zid, zone.head_mode, None, "park", entry))
                     state.zone_last_cmd[zid] = now
                     diag.setdefault("parked", []).append(zid)
                     continue
@@ -1545,7 +1752,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             ):
                 state.zone_track_delta[zid] = TRACK_DELTA_MIN_K
                 commands.append(
-                    Command(zid, zone.head_mode, None, "runout", track_delta=TRACK_DELTA_MIN_K)
+                    _command_with_depth(zid, zone.head_mode, None, "runout", -TRACK_DELTA_MIN_K)
                 )
                 state.zone_last_cmd[zid] = now
             continue
@@ -1554,7 +1761,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             center = centers[zid]
             lo, hi = bands[zid]
             if zid in demand_ids:
-                setpoint = comfort.demand_setpoint(mode, center, lo, hi, zone.occupied, preset)
+                setpoint = comfort.demand_setpoint(mode, center, lo, hi, zone.occupied, preset, s)
                 reason = "demand"
             else:
                 # Helper zones trim gently toward the band edge.
@@ -1565,7 +1772,10 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
             # Tracking depth adaptation (room frame): deepen while the room is
             # not converging toward its target edge, relax once it is inside.
+            # Then pick signed head depth — residual bins may replace chase
+            # with a hysteresis hold when they cover standing load.
             track_delta = None
+            depth_k: float | None = None
             if s.tracking and mode in (MODE_HEAT, MODE_COOL):
                 delta = state.zone_track_delta.get(zid, TRACK_DELTA_DEFAULT_K)
                 if zone.temp is not None:
@@ -1580,16 +1790,48 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 delta = min(max(delta, TRACK_DELTA_MIN_K), TRACK_DELTA_MAX_K)
                 state.zone_track_delta[zid] = delta
                 track_delta = delta
+                depth_k, depth_tag = pick_depth_k(
+                    mode=mode,
+                    temp=zone.temp,
+                    lo=lo,
+                    hi=hi,
+                    standing_load_w=zone.standing_load_w,
+                    n_rooms=zone.n_rooms,
+                    park_residuals=zone.park_residuals,
+                    margin_bins=zone.park_margin_bins,
+                    residual_edge_k=zone.park_residual_edge_k,
+                    track_delta=delta,
+                    park_learning=s.park_learning,
+                )
+                if depth_k > 0.0:
+                    reason = depth_tag
+                    if zid not in state.zone_parked_since:
+                        state.zone_parked_since[zid] = now
+                        state.zone_park_margin[zid] = depth_k
+                        if zone.temp is not None:
+                            state.zone_park_ref[zid] = zone.temp
+                        state.zone_park_preferred.setdefault(zid, _park_preferred(zone, state))
+                        diag.setdefault("depth_residual", []).append(zid)
+                    else:
+                        depth_k = state.zone_park_margin.get(zid, depth_k)
+                elif zid in state.zone_parked_since:
+                    _clear_park_session(state, zid, zone, now)
 
             last_cmd = state.zone_last_cmd.get(zid, 0.0)
             last_sp = state.zone_last_setpoint.get(zid)
             setpoint_changed = last_sp is None or abs(setpoint - last_sp) >= SETPOINT_EPSILON_K
             spacing_ok = now - last_cmd >= COMMAND_SPACING_S
-            # Tracking control re-anchors to the moving internal reading, so
-            # refresh commands on every spacing interval while the zone runs.
-            refresh = track_delta is not None and zone.is_on and spacing_ok
+            # Re-anchor to the moving internal reading on every spacing interval.
+            refresh = (
+                (track_delta is not None or (depth_k is not None and depth_k != 0.0))
+                and zone.is_on
+                and spacing_ok
+            )
             if transitioned or not zone.is_on or (setpoint_changed and spacing_ok) or refresh:
-                commands.append(Command(zid, mode, setpoint, reason, track_delta=track_delta))
+                if depth_k is not None:
+                    commands.append(_command_with_depth(zid, mode, setpoint, reason, depth_k))
+                else:
+                    commands.append(Command(zid, mode, setpoint, reason, track_delta=track_delta))
                 state.zone_last_cmd[zid] = now
                 state.zone_last_setpoint[zid] = setpoint
             state.zone_fan[zid] = False

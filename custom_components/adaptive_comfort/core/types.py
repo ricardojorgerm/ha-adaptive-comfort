@@ -114,7 +114,12 @@ class Settings:
     shed_restore_pct: float = 0.75
     adaptive_blend: float = 0.3
     coordination: bool = True
+    # House-level: vacant house → Away preset; homecoming clears track deltas.
     presence_adaptation: bool = True
+    # Zone-level: vacant widen, vacant band-hold, skip vacant helpers / fan-assist,
+    # and down-weight vacant zones in mode integrals. Off → treat occupancy as
+    # unknown for those paths (sensors still update for diagnostics).
+    zone_presence_adaptation: bool = True
     shedding_enabled: bool = True
     multisplit: bool = True
     fan_assist: bool = True  # fan-only for opposite-demand zones on a multi-split
@@ -200,6 +205,8 @@ class ZoneSnapshot:
     park_residual_edge_k: float | None = None
     # Is the *current* session margin fan-type? (live electrical class).
     park_current_is_fan_type: bool | None = None
+    # Hysteresis map copy for depth selection: bin -> [ext_w, duty, n].
+    park_margin_bins: dict[str, list[float]] = field(default_factory=dict)
     # Estimated standing heat load of the *zone* at current conditions
     # (W, >=0, sensed-room inflow x n_rooms). Park extraction is per-head;
     # exploit compares extraction to standing_load_w / n_rooms.
@@ -274,6 +281,11 @@ class Command:
     # internal - margin (heat). Escalated by the controller while the room
     # keeps moving in the conditioning direction despite being parked.
     park_margin: float | None = None
+    # Signed head depth (K): cool SP = internal + head_depth_k, heat
+    # SP = internal - head_depth_k. Negative = chase track; positive =
+    # hysteresis residual hold. When set, the runtime prefers this over
+    # separate track_delta / park_margin translation.
+    head_depth_k: float | None = None
 
 
 @dataclass
@@ -333,11 +345,15 @@ class ControllerState:
     plant_compress_since: float = 0.0
     plant_below_since: float = 0.0  # first sub-floor sample while run live
     # COP-timed efficiency band: hysteretic half-band widen (K) and direction
-    # ('advance'|'defer'|'none'). Center stays fixed; withdraw only after the
-    # advantage falls below the exit threshold so the band cannot snap narrow
-    # under a room sitting on the widened edge.
+    # ('advance'|'defer'|'none'). Center stays fixed. Withdraw only after the
+    # COP advantage falls below EXIT *and* every zone has crossed back inside
+    # the unwidened band on the widen side — so a cool-advance bank cannot
+    # snap the floor up under a room and look like a heat demand.
     cop_widen_k: float = 0.0
     cop_timing: str = "none"
+    # Mode that engaged the widen (heat/cool); held across ticks so a false
+    # opposite-mode flip cannot restretch the wrong edge while recovering.
+    cop_widen_mode: str | None = None
 
     def to_dict(self) -> dict:
         return {
@@ -366,6 +382,7 @@ class ControllerState:
             "plant_below_since": self.plant_below_since,
             "cop_widen_k": self.cop_widen_k,
             "cop_timing": self.cop_timing,
+            "cop_widen_mode": self.cop_widen_mode,
             "sibling_sustain": {
                 rider: {sib: [ratio, samples] for sib, (ratio, samples) in subs.items()}
                 for rider, subs in self.sibling_sustain.items()
@@ -421,6 +438,10 @@ class ControllerState:
         st.cop_widen_k = max(0.0, float(data.get("cop_widen_k", 0.0)))
         timing = str(data.get("cop_timing", "none"))
         st.cop_timing = timing if timing in ("advance", "defer", "none") else "none"
+        wmode = data.get("cop_widen_mode")
+        st.cop_widen_mode = str(wmode) if wmode in (MODE_HEAT, MODE_COOL) else None
+        if st.cop_widen_k <= 0.0 or st.cop_timing == "none":
+            st.cop_widen_mode = None
         for rider, subs in data.get("sibling_sustain", {}).items():
             entry: dict[str, tuple[float, int]] = {}
             for sib, value in subs.items():

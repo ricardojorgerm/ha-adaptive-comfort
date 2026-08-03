@@ -104,20 +104,101 @@ def test_boost_widen_stretches_cool_lo_only():
 
 
 def test_widen_hysteresis_holds_below_enter():
-    s = snap(24.0, [33.0], cop_by_band={"mild": 2.4, "hot": 1.0})
+    s = snap(24.0, [33.0], cop_by_band={"mild": 2.4, "hot": 1.0}, temp=23.0)
     st = ControllerState()
     # Ratio 2.4/1.0 = 2.4 → engage
-    w, t = controller._update_cop_widen(st, s, MODE_COOL, {"z1": 23.0})
+    w, t = controller._update_cop_widen(st, s, MODE_COOL, {"z1": 23.0}, s.zones)
     assert w == controller.COP_WIDEN_MAX_K and t == "advance"
+    assert st.cop_widen_mode == MODE_COOL
     # Soften advantage to between EXIT and ENTER: still hold.
-    soft = snap(24.0, [33.0], cop_by_band={"mild": 1.25, "hot": 1.0})
+    soft = snap(24.0, [33.0], cop_by_band={"mild": 1.25, "hot": 1.0}, temp=23.0)
     # 1.25/1.0 = 1.25 >= EXIT 1.15, < ENTER 1.3
-    w2, t2 = controller._update_cop_widen(st, soft, MODE_COOL, {"z1": 23.0})
+    w2, t2 = controller._update_cop_widen(st, soft, MODE_COOL, {"z1": 23.0}, soft.zones)
     assert w2 == controller.COP_WIDEN_MAX_K and t2 == "advance"
-    # Drop below EXIT: withdraw.
-    weak = snap(24.0, [33.0], cop_by_band={"mild": 1.1, "hot": 1.0})
-    w3, t3 = controller._update_cop_widen(st, weak, MODE_COOL, {"z1": 23.0})
+    # Drop below EXIT with room back inside base band: withdraw.
+    weak = snap(24.0, [33.0], cop_by_band={"mild": 1.1, "hot": 1.0}, temp=23.0)
+    w3, t3 = controller._update_cop_widen(st, weak, MODE_COOL, {"z1": 23.0}, weak.zones)
     assert w3 == 0.0 and t3 == "none"
+    assert st.cop_widen_mode is None
+
+
+def test_widen_holds_until_room_crosses_base_lo():
+    """Cool-advance bank below tight lo must not snap band (→ false heat)."""
+    st = ControllerState()
+    engage = snap(24.0, [33.0], cop_by_band={"mild": 2.4, "hot": 1.0}, temp=23.0)
+    controller._update_cop_widen(st, engage, MODE_COOL, {"z1": 23.0}, engage.zones)
+    assert st.cop_timing == "advance"
+    # Advantage gone, but room still below base lo (center 23, half 0.7 → lo 22.3).
+    weak = snap(24.0, [33.0], cop_by_band={"mild": 1.1, "hot": 1.0}, temp=22.0)
+    w, t = controller._update_cop_widen(st, weak, MODE_COOL, {"z1": 23.0}, weak.zones)
+    assert w == controller.COP_WIDEN_MAX_K and t == "advance"
+    assert st.cop_widen_mode == MODE_COOL
+    # Cross back above base lo → may withdraw.
+    recovered = snap(24.0, [33.0], cop_by_band={"mild": 1.1, "hot": 1.0}, temp=22.5)
+    w2, t2 = controller._update_cop_widen(st, recovered, MODE_COOL, {"z1": 23.0}, recovered.zones)
+    assert w2 == 0.0 and t2 == "none"
+
+
+def test_auto_does_not_heat_while_cool_advance_banked():
+    """Room below tight lo but inside widened lo must stay cool in summer."""
+    settings = Settings(hvac_mode="auto", target=23.0, adaptive_blend=0.0, band_k=0.7)
+    # Banked below base lo (~22.3) but above widened lo (~21.6).
+    s = snap(
+        24.0,
+        [33.0, 34.0],
+        cop_by_band={"mild": 2.4, "hot": 1.0},
+        settings=settings,
+        temp=22.0,
+        mode=MODE_COOL,
+        t_rm=27.0,  # season_cool
+    )
+    st = ControllerState()
+    st.mode = MODE_COOL
+    st.mode_since = NOW - 24 * 3600.0
+    st.zone_since["z1"] = NOW - 7200.0
+    st.cop_widen_k = controller.COP_WIDEN_MAX_K
+    st.cop_timing = "advance"
+    st.cop_widen_mode = MODE_COOL
+    d = controller.tick(s, st)
+    assert d.diag.get("cop_timing") == "advance"
+    assert d.diag.get("mode") != MODE_HEAT
+    lo, _hi = d.diag["bands"]["z1"]
+    assert lo < 22.0  # still widened under the room
+
+
+def test_prediction_does_not_dig_past_far_edge():
+    """Cool-advance prediction must not keep demand once temp ≤ lo.
+
+    Field (Aug 3): free-float still foresaw a hi breach while West was already
+    below the (widened) floor — demand stayed on down to ~20.4°C.
+    """
+    # Trajectory claims a hi breach at hour 2; room is already below lo.
+    zone = make_zone(
+        "z1",
+        21.0,
+        free_float=(21.0, 22.0, 24.5, 25.0) + (25.0,) * 20,
+    )
+    assert not controller._wants_conditioning(
+        zone, 22.5, 23.9, MODE_COOL, 20.0, cop_timing="advance"
+    )
+    # Still in-band on the approach side: prediction may fire.
+    zone_in = make_zone(
+        "z1",
+        23.2,
+        free_float=(23.2, 23.5, 24.5, 25.0) + (25.0,) * 20,
+    )
+    assert controller._wants_conditioning(
+        zone_in, 22.5, 23.9, MODE_COOL, 20.0, cop_timing="advance"
+    )
+    # Heat symmetric: already above hi → no more heat from prediction.
+    zone_hot = make_zone(
+        "z1",
+        24.5,
+        free_float=(24.5, 23.0, 21.0, 20.0) + (20.0,) * 20,
+    )
+    assert not controller._wants_conditioning(
+        zone_hot, 22.0, 23.5, MODE_HEAT, 20.0, cop_timing="advance"
+    )
 
 
 def test_heat_advance_when_colder_band_ahead():
@@ -139,8 +220,8 @@ def test_widen_holds_latched_direction_when_other_wins():
     # Latched advance with ratio still ≥ EXIT; defer briefly outranks but
     # stays below ENTER — must not snap the band narrow.
     st = ControllerState()
-    engage = snap(24.0, [33.0], cop_by_band={"mild": 2.4, "hot": 1.0})
-    controller._update_cop_widen(st, engage, MODE_COOL, {"z1": 23.0})
+    engage = snap(24.0, [33.0], cop_by_band={"mild": 2.4, "hot": 1.0}, temp=23.0)
+    controller._update_cop_widen(st, engage, MODE_COOL, {"z1": 23.0}, engage.zones)
     assert st.cop_timing == "advance" and st.cop_widen_k > 0.0
     # Now: advance 1.20 (hold), defer 1.22 (wins winner pick, < ENTER).
     # Forecast has both hotter and milder so both ratios fire.
@@ -148,9 +229,10 @@ def test_widen_holds_latched_direction_when_other_wins():
         28.0,  # warm
         [33.0, 24.0],  # hot ahead + mild ahead
         cop_by_band={"mild": 1.22, "warm": 1.0, "hot": 1.0 / 1.20},
+        temp=23.0,
     )
     # warm/hot advance = 1.0 / (1/1.20) = 1.20; mild/warm defer = 1.22 / 1.0 = 1.22
-    w, t = controller._update_cop_widen(st, mixed, MODE_COOL, {"z1": 23.0})
+    w, t = controller._update_cop_widen(st, mixed, MODE_COOL, {"z1": 23.0}, mixed.zones)
     assert w == controller.COP_WIDEN_MAX_K and t == "advance"
 
 
@@ -171,6 +253,7 @@ def test_band_cop_ignores_wrong_mode_table():
 def test_prediction_horizon_stretches_on_advance():
     zone = make_zone("z1", 23.0, free_float=(23.0, 23.2, 23.5, 24.5, 25.0) + (25.0,) * 19)
     # Breach at hour 3; default horizon ~1h would miss; advance looks 4h.
+    # Temp 23.0 is in-band (lo=22 hi=23.5) so demand prediction is allowed.
     assert controller._prediction_justifies_run(
         zone, 22.0, 23.5, MODE_COOL, 20.0, cop_timing="advance"
     )

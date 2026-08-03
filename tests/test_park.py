@@ -1,13 +1,18 @@
 """Park behavior: estimator classification and controller park decisions."""
 
+from dataclasses import replace
+
 from custom_components.adaptive_comfort.core import controller
 from custom_components.adaptive_comfort.core.park import (
     CLASSIFY_MIN_SAMPLES,
     MARGIN_SETTLE_ALPHA,
     ParkEstimator,
+    pick_depth_k,
+    shallowest_covering_margin_k,
 )
 from custom_components.adaptive_comfort.core.types import (
     MODE_COOL,
+    MODE_HEAT,
     ControllerState,
     HouseSnapshot,
     Settings,
@@ -110,6 +115,170 @@ def test_park_preferred_state_round_trips():
     assert restored.zone_park_preferred == {"z1": 2.0}
     assert restored.zone_park_probe_entry == {"z1": 3}
     assert restored.zone_last_park_abort == {"z1": 123.0}
+
+
+def _residual_bins(**ext_by_margin):
+    """Build well-sampled residual-duty margin_bins for pick_depth tests."""
+    bins = {}
+    for m, ext in ext_by_margin.items():
+        bins[f"{float(m):.1f}"] = [float(ext), 1.0, CLASSIFY_MIN_SAMPLES]
+    return bins
+
+
+def test_shallowest_covering_margin():
+    bins = _residual_bins(**{"1.5": 50.0, "2.0": 120.0, "3.0": 280.0})
+    assert shallowest_covering_margin_k(bins, 100.0) == 2.0
+    assert shallowest_covering_margin_k(bins, 300.0) is None
+
+
+def test_pick_depth_pull_down_uses_chase():
+    bins = _residual_bins(**{"2.0": 200.0})
+    depth, tag = pick_depth_k(
+        mode=MODE_COOL,
+        temp=26.0,
+        lo=22.0,
+        hi=24.0,
+        standing_load_w=100.0,
+        n_rooms=1,
+        park_residuals=True,
+        margin_bins=bins,
+        residual_edge_k=2.0,
+        track_delta=0.7,
+    )
+    assert depth == -0.7 and tag == "depth_track"
+
+
+def test_pick_depth_residual_when_bins_cover():
+    bins = _residual_bins(**{"1.5": 97.0, "3.0": 289.0})
+    depth, tag = pick_depth_k(
+        mode=MODE_COOL,
+        temp=23.2,
+        lo=22.5,
+        hi=23.9,
+        standing_load_w=100.0,  # cover needs 60 W/head
+        n_rooms=1,
+        park_residuals=True,
+        margin_bins=bins,
+        residual_edge_k=3.0,
+        track_delta=0.7,
+    )
+    # Edge bin covers → prefer residual_edge.
+    assert depth == 3.0 and tag == "depth_residual"
+
+
+def test_pick_depth_shallowest_when_edge_does_not_cover():
+    bins = _residual_bins(**{"1.5": 100.0, "3.0": 40.0})
+    depth, tag = pick_depth_k(
+        mode=MODE_COOL,
+        temp=23.2,
+        lo=22.5,
+        hi=23.9,
+        standing_load_w=100.0,  # need 60 W
+        n_rooms=1,
+        park_residuals=True,
+        margin_bins=bins,
+        residual_edge_k=3.0,  # only 40 W — insufficient
+        track_delta=1.0,
+    )
+    assert depth == 1.5 and tag == "depth_residual"
+
+
+def test_pick_depth_heat_symmetry():
+    bins = _residual_bins(**{"2.0": 150.0})
+    depth, tag = pick_depth_k(
+        mode=MODE_HEAT,
+        temp=21.0,
+        lo=20.0,
+        hi=22.0,
+        standing_load_w=80.0,
+        n_rooms=1,
+        park_residuals=True,
+        margin_bins=bins,
+        residual_edge_k=2.0,
+        track_delta=0.5,
+    )
+    assert depth == 2.0 and tag == "depth_residual"
+    # Above hi → chase only.
+    depth2, tag2 = pick_depth_k(
+        mode=MODE_HEAT,
+        temp=22.5,
+        lo=20.0,
+        hi=22.0,
+        standing_load_w=80.0,
+        n_rooms=1,
+        park_residuals=True,
+        margin_bins=bins,
+        residual_edge_k=2.0,
+        track_delta=0.5,
+    )
+    assert depth2 == -0.5 and tag2 == "depth_track"
+
+
+def test_demand_uses_residual_depth_without_want_off():
+    """In-band demand with covering bins → positive head depth (not off-path park)."""
+    bins = _residual_bins(**{"2.0": 200.0})
+    zone = replace(
+        make_zone(
+            "z1",
+            23.5,
+            is_on=True,
+            park_residuals=True,
+            park_extraction_w=200.0,
+            park_residual_edge_k=2.0,
+            park_margin_bins=bins,
+            standing_load_w=100.0,
+        ),
+        free_float=tuple([24.5] * 24),  # prediction keeps cool demand
+    )
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        target=23.0,
+        adaptive_blend=0.0,
+        band_k=1.0,
+        tracking=True,
+        park_learning=True,
+        multisplit=True,
+    )
+    state = warmed_state([zone])
+    state.zone_on["z1"] = True
+    d = tick([zone], state, settings=settings)
+    assert "z1" in (d.diag.get("demand") or [])
+    cmd = find_cmd(d, "z1")
+    assert cmd is not None
+    assert cmd.park is True
+    assert cmd.head_depth_k == 2.0
+    assert cmd.reason == "depth_residual"
+    assert "z1" in state.zone_parked_since
+
+
+def test_demand_pull_down_stays_on_track_delta():
+    bins = _residual_bins(**{"2.0": 200.0})
+    zone = make_zone(
+        "z1",
+        26.0,
+        is_on=True,
+        park_residuals=True,
+        park_extraction_w=200.0,
+        park_residual_edge_k=2.0,
+        park_margin_bins=bins,
+        standing_load_w=100.0,
+    )
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        target=23.0,
+        adaptive_blend=0.0,
+        band_k=1.0,
+        tracking=True,
+        park_learning=True,
+    )
+    state = warmed_state([zone])
+    state.zone_on["z1"] = True
+    d = tick([zone], state, settings=settings)
+    cmd = find_cmd(d, "z1")
+    assert cmd is not None
+    assert cmd.park is False
+    assert cmd.head_depth_k is not None and cmd.head_depth_k < 0
+    assert cmd.track_delta is not None
 
 
 def test_park_exit_clears_session_margin():

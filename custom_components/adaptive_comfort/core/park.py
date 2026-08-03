@@ -1,11 +1,17 @@
-"""Learned above-setpoint ("parked") head behavior.
+"""Learned less-conditioned head depth (park / hysteresis hold).
 
-When a head is commanded with a setpoint above its internal reading while
-the compressor mode stays active, devices differ: some thermo-off cleanly,
-others hold a keep-temperature residual - modulating at minimal output in
-a hysteresis band around the setpoint. On a multi-split, a "satisfied"
-head's expansion valve may also pass residual refrigerant while sibling
-heads keep the compressor running.
+Positive head depth commands a setpoint on the satisfied side of the
+internal reading (cool: ``internal + margin``; heat: ``internal - margin``)
+while the compressor mode stays active. Devices differ: some thermo-off
+cleanly, others hold a keep-temperature residual — modulating at minimal
+output in a hysteresis band around the setpoint. On a multi-split, a
+"satisfied" head's expansion valve may also pass residual refrigerant
+while sibling heads keep the compressor running.
+
+``pick_depth_k`` is the shared selector: demand/helper may choose that
+positive depth when residual bins cover standing load (small-house COP
+advantage); want-off park / run-out still use the same table. Negative
+depth is ordinary tracking (``internal - |delta|`` in cool).
 
 Two axes — do not conflate them:
 
@@ -43,6 +49,8 @@ next park converges on what this head needs.
 """
 
 from __future__ import annotations
+
+from .types import MODE_COOL, MODE_HEAT
 
 # Thermal extraction thresholds for ParkEstimator.classification (W of heat
 # moved while parked — NOT meter watts / fan draw):
@@ -82,6 +90,10 @@ RESIDUAL_HOLD_DUTY_MIN = 0.3
 # between the deepest still-compressing bin and the shallowest fan-type bin
 # above it lands within this many K of the true device hysteresis edge.
 EDGE_STEP_K = 0.25
+# Fraction of per-head standing load a residual bin must cover to be
+# eligible as a hysteresis (positive) depth. Kept in sync with
+# controller.PARK_LOAD_COVER_FRACTION.
+LOAD_COVER_FRACTION = 0.6
 
 
 def fan_floor_w(
@@ -106,6 +118,87 @@ def margin_bin(margin_k: float | None) -> str | None:
     if margin_k is None:
         return None
     return f"{round(margin_k / MARGIN_BIN_K) * MARGIN_BIN_K:.1f}"
+
+
+def _bin_extraction_w(margin_bins: dict[str, list[float]], margin_k: float) -> float | None:
+    """EWMA extraction for the bin containing margin_k, if well sampled."""
+    b = margin_bin(margin_k)
+    if b is None:
+        return None
+    entry = margin_bins.get(b)
+    if entry is None or entry[2] < CLASSIFY_MIN_SAMPLES:
+        return None
+    if entry[1] < RESIDUAL_HOLD_DUTY_MIN:
+        return None
+    return float(entry[0])
+
+
+def shallowest_covering_margin_k(
+    margin_bins: dict[str, list[float]],
+    required_w: float,
+) -> float | None:
+    """Smallest residual-duty margin whose extraction covers ``required_w``."""
+    best: float | None = None
+    for bin_key, (ext, duty, n) in margin_bins.items():
+        if n < CLASSIFY_MIN_SAMPLES or duty < RESIDUAL_HOLD_DUTY_MIN:
+            continue
+        if float(ext) < required_w:
+            continue
+        m = float(bin_key)
+        if best is None or m < best:
+            best = m
+    return best
+
+
+def pick_depth_k(
+    *,
+    mode: str,
+    temp: float | None,
+    lo: float,
+    hi: float,
+    standing_load_w: float | None,
+    n_rooms: int,
+    park_residuals: bool | None,
+    margin_bins: dict[str, list[float]] | None,
+    residual_edge_k: float | None,
+    track_delta: float,
+    park_learning: bool = True,
+) -> tuple[float, str]:
+    """Signed head depth for cool ``SP = internal + depth`` / heat ``- depth``.
+
+    Negative depth is chase tracking; positive is hysteresis residual hold.
+    Pull-down (cool ``temp > hi`` / heat ``temp < lo``) and far-edge
+    overshoot never pick positive depth. Unknown / non-residual heads stay
+    on track until park probes classify them.
+    """
+    chase = -abs(track_delta)
+    if temp is None or mode not in (MODE_COOL, MODE_HEAT) or not park_learning:
+        return chase, "depth_track"
+    if (mode == MODE_COOL and temp > hi) or (mode == MODE_HEAT and temp < lo):
+        return chase, "depth_track"
+    # Past the far edge: demand must not keep coasting deeper.
+    if (mode == MODE_COOL and temp <= lo) or (mode == MODE_HEAT and temp >= hi):
+        return chase, "depth_track"
+    if park_residuals is not True:
+        return chase, "depth_track"
+    bins = margin_bins or {}
+    if standing_load_w is None:
+        required = 0.0
+    else:
+        required = LOAD_COVER_FRACTION * standing_load_w / max(1, int(n_rooms))
+    covering = shallowest_covering_margin_k(bins, required)
+    if covering is None:
+        return chase, "depth_track"
+    # Prefer residual_edge when that depth itself covers (entry target).
+    if residual_edge_k is not None:
+        edge_ext = _bin_extraction_w(bins, residual_edge_k)
+        if edge_ext is not None and edge_ext >= required:
+            covering = min(max(residual_edge_k, MARGIN_MIN_K), MARGIN_MAX_K)
+        else:
+            covering = min(max(covering, MARGIN_MIN_K), MARGIN_MAX_K)
+    else:
+        covering = min(max(covering, MARGIN_MIN_K), MARGIN_MAX_K)
+    return covering, "depth_residual"
 
 
 def gate_observation(

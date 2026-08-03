@@ -32,7 +32,7 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
 | `core/power.py` | Load composition (grid + battery − known loads), time-of-day `BaselineModel`, step-delta AC estimation, per-zone power allocation, shedding math, `outdoor_band()` for COP bookkeeping. |
 | `core/park.py` | Learned above-setpoint ("parked") head behavior. Two axes: (1) thermal class from extraction EWMA — `idle` ≤25 W heat removed, `residual` ≥60 W residual cooling, else `unknown` (not fan electrical watts); (2) electrical fan floor / duty — `p_ac` below `fan_floor_w(N)` is fan-type park (no compression). Fed by the runtime from the thermal model's sensible power while parked. |
 | `core/drift.py` | Per-head, per-operating-state internal-sensor offset learning (internal vs external reference). Used to correct readings and as *fallback* setpoint translation. |
-| `core/comfort.py` | Comfort band, presets (`effective_preset`), demand setpoints (center vs Away/vacant band-hold), and model mode arbitration (`demand_integrals` over an 8 h free-float horizon with asymmetric exit). |
+| `core/comfort.py` | Comfort band, presets (`effective_preset`), demand setpoints (center vs Away/vacant band-hold), `effective_zone_occupied` for zone presence gating, and model mode arbitration (`demand_integrals` over an 8 h free-float horizon with asymmetric exit). |
 | `core/types.py` | All dataclasses: `Settings`, `ZoneSnapshot`, `HouseSnapshot`, `Command`, `ControllerState` (+ its persistence round-trip). |
 | `core/rls.py`, `core/series.py`, `core/psychro.py`, `core/simulator.py` | Recursive least squares, time-series ring buffer, psychrometrics, and a small sim house used by tests. |
 | `coordinator.py` | Runtime: sensor ingestion, estimator updates (`_update_estimators`, `_update_zone_estimators`), COP tables, persistence (`_persist`/restore), command execution (incl. tracking translation), diagnostics dump. Power-react is a lean path (heads+power+demand; full `controller.tick` only on shed engage/release). |
@@ -74,23 +74,19 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   wire all four places: dataclass, `to_dict`, `from_dict`, and the `_persist` settings dict
   (+ restore key list) — and the switch/number entity if user-facing.
 
-- **Parking is measured, never assumed — and keep-temp only.** A zone leaving demand on a
-  multi-split (siblings keeping the compressor alive) may be *parked* — setpoint
-  `internal ± preferred_margin` (cool/heat), mode kept — instead of turned off: bounded
-  probes (`PARK_PROBE_S`, spaced `PARK_PROBE_SPACING_S`) while behavior is unclassified,
-  exploitation once a head is a known residual head whose learned output covers the zone's
-  `standing_load_w`. Park entry requires the zone already in-band on the conditioning side
-  (`_park_ok_now`: cool `temp ≤ hi`); unfinished pull-down stays on a tracked setpoint.
-  Session margin starts one step below `preferred_margin_k` (floored at `PARK_MARGIN_K` so
-  the setpoint stays on the park side of the internal reading), escalates while the room
-  keeps moving in the conditioning direction (up to `PARK_MARGIN_MAX_K`), and settles the
-  preferred depth on a clean exit. Devices differ (thermo-off vs keep-temperature residual)
-  and the estimator learns which; nothing hardcodes either answer. Shed zones never park.
-  Helper selection outranks parking. The overcorrection release sits `PARK_OVERCOOL_BUFFER_K`
-  *below* the band floor (cool; above the ceiling in heat) — zones exit demand AT the floor,
-  so a guard placed on the floor itself kills every park at entry (a real field failure).
-  Probe budget is charged at *release* and only when the probe produced observations;
-  stillborn probes get the short `PARK_PROBE_RETRY_S` clock instead of the 6 h spacing.
+- **Head depth is signed; parking is the positive half.** Cool device setpoint is
+  `internal + head_depth_k` (heat: `internal − depth`). Negative depth is chase
+  tracking (`track_delta`); positive depth is hysteresis residual hold (legacy
+  park margin). `park.pick_depth_k` chooses: pull-down / far-edge → chase; when
+  residual `margin_bins` cover `standing_load_w / n_rooms`, demand/helper may
+  hold positive depth (`depth_residual`) without leaving want=demand — small-house
+  field COPs often beat deep tracking. Want-off park / run-out still use the same
+  table (bounded probes while unclassified, exploit when residual covers load).
+  Park entry requires in-band keep-temp (`_park_ok_now`); unfinished pull-down
+  stays on track. Session margin escalates/settles as before; devices are measured,
+  never assumed. Shed zones never park. Overcorrection release sits
+  `PARK_OVERCOOL_BUFFER_K` below the floor (cool). Probe budget charged at release
+  only when the probe produced observations; stillborn → `PARK_PROBE_RETRY_S`.
 - **Run-out is the free probe window (when in-band).** A zone wanting off while `min_on`
   forces it to run is parked immediately if already in-band — no sibling requirement, no
   probe budget — because the compressor is alive regardless: observations are free, and an
@@ -152,9 +148,14 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   banks deeper without letting defer float a boosted room warmer/cooler past
   the tight threshold. Timing is `advance` / `defer`; predictive horizons
   stretch/shrink accordingly. Withdraw only after the advantage falls below
-  `COP_ADVANTAGE_EXIT`. Cool priors fill gaps; heat requires learned
-  `cop_by_band`. Diag: `cop_band_widen_k`, `cop_timing`. Park overcool uses the
-  efficiency band. See plan `cop_timed_conditioning_8f3a1c2e`.
+  `COP_ADVANTAGE_EXIT` **and** every zone has crossed back inside the unwidened
+  band on the widen side (cool-advance below tight `lo` must not snap the floor
+  up and look like heat). Mode arbitration runs on the efficiency bands.
+  Predictive demand stops at the far edge (cool `temp ≤ lo` / heat `temp ≥ hi`)
+  so advance horizons cannot keep digging past the floor — that overshoot was
+  what made a later heat flip look like the bug. Cool priors fill gaps; heat
+  requires learned `cop_by_band`. Diag: `cop_band_widen_k`, `cop_timing`. Park
+  overcool uses the efficiency band. See plan `cop_timed_conditioning_8f3a1c2e`.
 - **Zone COP counts latent.** `update_cop` heat flow is sensible + latent; sensible-only
   samples in humid rooms undercount delivered cooling by 30–50% and can fall below
   `COP_MIN`, producing absurd or silently-rejected readings.
@@ -162,8 +163,9 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   (`off`/`demand`/`helper`); `control_state` is action (`off`/`demand`/`helper`/`park`/
   `runout`/`manual`/…). Action attributes carry `last_reason`, park margins/classification,
   and track depth. Also chart `zone_occupied`, house `effective_preset` / `house_occupied`,
-  plus `head_internal_temp`, `track_delta`, `park_margin`, `park_extraction`,
-  `park_classification`, `parked_zones`, `operating_regime`, `compressor_starts_per_hour`.
+  plus `head_internal_temp`, `head_depth_k`, `track_delta`, `park_margin`,
+  `park_extraction`, `park_classification`, `parked_zones`, `operating_regime`,
+  `compressor_starts_per_hour`.
 - **Mode integrals include on zones.** `demand_integrals` uses no-AC free-float (including
   while conditioning — `predict_free` is the counterfactual) over `MODE_HORIZON_H` (~8 h),
   with temp persistence when confidence is low (for mixed houses). Enter cool/heat above
@@ -172,6 +174,12 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   `fallback_mode` (outdoor season + indoor deviation), not flat persistence alone — so a
   winter sunlit room cannot command house cooling. Boost beats presence-Away and skips
   vacant band widen; Away/vacant demand setpoints hold near the band edge (not center).
+  **House presence** (`presence_adaptation`): vacant house → Away preset; homecoming
+  clears track deltas; off disables auto-Away only. **Zone presence**
+  (`zone_presence_adaptation`, default on): vacant widen, vacant band-hold, skip
+  vacant helpers/fan-assist, and unoccupied weight in mode integrals; off treats
+  zone occupancy as unknown (`effective_zone_occupied` → `None`) for those paths
+  while sensors still update for diagnostics.
 
 ## Control-loop cheatsheet (what happens each 60 s tick)
 

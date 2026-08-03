@@ -40,6 +40,13 @@ HOUSE_SWITCHES: tuple[SettingSwitchDescription, ...] = (
         set_fn=lambda s, v: setattr(s, "presence_adaptation", v),
     ),
     SettingSwitchDescription(
+        key="zone_presence_adaptation",
+        translation_key="zone_presence_adaptation",
+        entity_category=EntityCategory.CONFIG,
+        get_fn=lambda s: s.zone_presence_adaptation,
+        set_fn=lambda s, v: setattr(s, "zone_presence_adaptation", v),
+    ),
+    SettingSwitchDescription(
         key="shedding_enabled",
         translation_key="shedding_enabled",
         entity_category=EntityCategory.CONFIG,

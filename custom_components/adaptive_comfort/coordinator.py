@@ -520,6 +520,7 @@ class AdaptiveComfortRuntime:
         for key in (
             "coordination",
             "presence_adaptation",
+            "zone_presence_adaptation",
             "shedding_enabled",
             "fan_assist",
             "tracking",
@@ -622,6 +623,7 @@ class AdaptiveComfortRuntime:
                 "adaptive_blend": s.adaptive_blend,
                 "coordination": s.coordination,
                 "presence_adaptation": s.presence_adaptation,
+                "zone_presence_adaptation": s.zone_presence_adaptation,
                 "shedding_enabled": s.shedding_enabled,
                 "fan_assist": s.fan_assist,
                 "tracking": s.tracking,
@@ -1509,6 +1511,7 @@ class AdaptiveComfortRuntime:
                     park_current_is_fan_type=zone.park.current_is_fan_type(
                         self.controller_state.zone_park_margin.get(zone.config.zone_id)
                     ),
+                    park_margin_bins={k: list(v) for k, v in zone.park.margin_bins.items()},
                     park_samples=zone.park.samples,
                     head_mode=(
                         MODE_HEAT
@@ -1755,10 +1758,19 @@ class AdaptiveComfortRuntime:
         zid = zone.config.zone_id
         st = self.controller_state
         parked = zid in st.zone_parked_since
+        depth = st.zone_park_margin.get(zid)
+        track = st.zone_track_delta.get(zid)
+        if parked and depth is not None:
+            head_depth = float(depth)
+        elif track is not None:
+            head_depth = -float(track)
+        else:
+            head_depth = None
         attrs: dict = {
             "last_reason": zone.last_control_reason or "none",
             "parked": parked,
-            "track_delta_k": st.zone_track_delta.get(zid),
+            "track_delta_k": track,
+            "head_depth_k": head_depth,
         }
         if parked:
             attrs["park_margin_k"] = st.zone_park_margin.get(zid)
@@ -1834,7 +1846,18 @@ class AdaptiveComfortRuntime:
                 minimum = state.attributes.get("min_temp", 16.0)
                 maximum = state.attributes.get("max_temp", 30.0)
                 internal = state.attributes.get("current_temperature")
-                if command.park and isinstance(internal, (int, float)):
+                # Signed head depth: cool SP = internal + depth, heat =
+                # internal - depth. Positive = hysteresis hold; negative = chase.
+                if command.head_depth_k is not None and isinstance(internal, (int, float)):
+                    if command.park or command.head_depth_k > 0.0:
+                        park_expressed = True
+                    depth = float(command.head_depth_k)
+                    raw = (
+                        float(internal) + depth
+                        if command.hvac_mode == MODE_COOL
+                        else float(internal) - depth
+                    )
+                elif command.park and isinstance(internal, (int, float)):
                     park_expressed = True
                     margin = command.park_margin or controller.PARK_MARGIN_K
                     # Park: ride just above the internal reading, keeping the

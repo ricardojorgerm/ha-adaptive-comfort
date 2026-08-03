@@ -281,7 +281,8 @@
     },
     "switch": {
       "coordination": { "name": "Coordenação multi-split" },
-      "presence_adaptation": { "name": "Adaptação à presença" },
+      "presence_adaptation": { "name": "Adaptação à presença da casa" },
+      "zone_presence_adaptation": { "name": "Adaptação à presença por zona" },
       "shedding_enabled": { "name": "Limitação de potência" },
       "fan_assist": { "name": "Ventilação auxiliar (zonas com pedido oposto)" },
       "tracking": { "name": "Setpoint dinâmico (tracking)" },

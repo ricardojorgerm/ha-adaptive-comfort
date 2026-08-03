@@ -383,7 +383,10 @@
         "name": "Multi-split coordination"
       },
       "presence_adaptation": {
-        "name": "Presence adaptation"
+        "name": "House presence adaptation"
+      },
+      "zone_presence_adaptation": {
+        "name": "Zone presence adaptation"
       },
       "shedding_enabled": {
         "name": "Power shedding"

@@ -76,6 +76,22 @@ def test_boost_skips_vacant_widen():
     assert abs((hi_n - lo_n) / 2 - 2.2) < 1e-9
 
 
+def test_zone_presence_adaptation_off_skips_vacant_paths():
+    from custom_components.adaptive_comfort.core.types import PRESET_NONE
+
+    s = Settings(band_k=0.7, zone_presence_adaptation=False)
+    assert comfort.effective_zone_occupied(s, False) is None
+    lo, hi = comfort.zone_band(s, 22.5, zone_occupied=False, house_occupied=True)
+    assert abs((hi - lo) / 2 - 0.7) < 1e-9  # no vacant widen
+    # Vacant band-hold gated; center-seek instead.
+    assert comfort.demand_setpoint(MODE_COOL, 22.5, 20.0, 25.0, False, PRESET_NONE, s) == 22.5
+    # House presence still independent.
+    s.presence_adaptation = True
+    assert comfort.effective_preset(s, house_occupied=False) == "away"
+    s.presence_adaptation = False
+    assert comfort.effective_preset(s, house_occupied=False) == "none"
+
+
 def test_demand_setpoint_band_hold_when_away():
     from custom_components.adaptive_comfort.core.types import PRESET_AWAY, PRESET_BOOST, PRESET_NONE
 
@@ -89,6 +105,15 @@ def test_demand_setpoint_band_hold_when_away():
     )
     # Boost center-seeks even when vacant.
     assert comfort.demand_setpoint(MODE_COOL, 22.5, 20.0, 25.0, False, PRESET_BOOST) == 22.5
+    # Vacant band-hold when zone adaptation on (default).
+    s = Settings(zone_presence_adaptation=True)
+    assert (
+        abs(
+            comfort.demand_setpoint(MODE_COOL, 22.5, 20.0, 25.0, False, PRESET_NONE, s)
+            - (25.0 - comfort.BAND_HOLD_MARGIN_K)
+        )
+        < 1e-9
+    )
 
 
 def test_running_mean_seed_and_update():

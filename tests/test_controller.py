@@ -157,6 +157,17 @@ def test_coordination_skips_unoccupied_helpers():
     assert "empty" not in by_zone
 
 
+def test_zone_presence_off_allows_vacant_helpers():
+    settings = Settings(hvac_mode=MODE_AUTO, zone_presence_adaptation=False)
+    hot = make_zone("hot", 25.0)
+    empty = make_zone("empty", 22.6, occupied=False)
+    snap = make_snapshot([hot, empty], settings)
+    state = warmed_state([hot, empty])
+    decision = controller.tick(snap, state)
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert "empty" in by_zone
+
+
 def test_coordination_disabled_runs_demand_only():
     settings = Settings(hvac_mode=MODE_AUTO, coordination=False)
     hot = make_zone("hot", 25.0)

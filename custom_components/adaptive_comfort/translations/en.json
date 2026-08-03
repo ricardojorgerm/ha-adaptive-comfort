@@ -281,7 +281,8 @@
     },
     "switch": {
       "coordination": { "name": "Multi-split coordination" },
-      "presence_adaptation": { "name": "Presence adaptation" },
+      "presence_adaptation": { "name": "House presence adaptation" },
+      "zone_presence_adaptation": { "name": "Zone presence adaptation" },
       "shedding_enabled": { "name": "Power shedding" },
       "fan_assist": { "name": "Fan assist (opposite-demand zones)" },
       "tracking": { "name": "Tracking setpoint control" },

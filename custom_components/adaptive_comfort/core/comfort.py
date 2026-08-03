@@ -63,6 +63,18 @@ UNOCCUPIED_WEIGHT = 0.3
 BAND_HOLD_MARGIN_K = 0.3
 
 
+def effective_zone_occupied(settings: Settings, occupied: bool | None) -> bool | None:
+    """Occupancy for vacant control paths.
+
+    When ``zone_presence_adaptation`` is off, returns ``None`` (unknown) so
+    vacant widen, band-hold, helper/fan skips, and integral down-weights do
+    not fire — while zone presence sensors still update for diagnostics.
+    """
+    if not settings.zone_presence_adaptation:
+        return None
+    return occupied
+
+
 def update_running_mean(t_rm: float | None, t_out: float, dt_h: float) -> float:
     """Exponential running mean of outdoor temperature (7-day time constant)."""
     if t_rm is None:
@@ -119,7 +131,7 @@ def zone_band(
         half = max(0.3, half * 0.5)
     # Manual uses the underlying band for diagnostics; it does not command.
     # Boost overrides vacant widen (same as it overrides presence-Away).
-    if zone_occupied is False and preset != PRESET_BOOST:
+    if effective_zone_occupied(settings, zone_occupied) is False and preset != PRESET_BOOST:
         half += UNOCCUPIED_WIDEN_K
     if extra_lo_k is None and extra_hi_k is None:
         extra_lo_k = extra_half_k
@@ -137,6 +149,7 @@ def demand_setpoint(
     hi: float,
     zone_occupied: bool | None,
     preset: str,
+    settings: Settings | None = None,
 ) -> float:
     """Room-frame demand target: center-seek, or band-hold when Away/vacant.
 
@@ -144,7 +157,12 @@ def demand_setpoint(
     """
     if preset == PRESET_BOOST:
         return center
-    band_hold = preset == PRESET_AWAY or zone_occupied is False
+    occ = (
+        effective_zone_occupied(settings, zone_occupied)
+        if settings is not None
+        else zone_occupied
+    )
+    band_hold = preset == PRESET_AWAY or occ is False
     if not band_hold:
         return center
     if mode == MODE_COOL:
@@ -259,6 +277,7 @@ def demand_integrals(
     zones: list[ZoneSnapshot],
     bands: dict[str, tuple[float, float]],
     horizon_h: int = MODE_HORIZON_H,
+    settings: Settings | None = None,
 ) -> tuple[float, float]:
     """Occupancy-weighted (warm excess, cold deficit) in K*h over the horizon.
 
@@ -274,7 +293,12 @@ def demand_integrals(
         if not trajectory:
             continue
         lo, hi = bands[zone.zone_id]
-        weight = UNOCCUPIED_WEIGHT if zone.occupied is False else 1.0
+        occ = (
+            effective_zone_occupied(settings, zone.occupied)
+            if settings is not None
+            else zone.occupied
+        )
+        weight = UNOCCUPIED_WEIGHT if occ is False else 1.0
         weight *= zone.n_rooms  # a mirrored zone is N rooms' worth of demand
         for temp in trajectory:
             warm += weight * max(0.0, temp - hi)  # 1 h per sample
@@ -376,7 +400,7 @@ def dominant_mode(
             state.mode_since = now
         return ModeDecision(mode, "fallback")
 
-    warm, cold = demand_integrals(zones, bands)
+    warm, cold = demand_integrals(zones, bands, settings=snap.settings)
     season_heat = snap.t_rm is not None and snap.t_rm < FALLBACK_HEAT_BELOW_C
     season_cool = snap.t_rm is not None and snap.t_rm > FALLBACK_COOL_ABOVE_C
     # Per-zone present excursion (not house-mean): a single hot room must not
