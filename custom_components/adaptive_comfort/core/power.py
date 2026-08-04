@@ -49,6 +49,12 @@ def cop_state_key(mode: str, state: str) -> str:
     return f"{mode}|{state}"
 
 
+def cop_depth_key(mode: str, depth_k: float) -> str:
+    """Persist/lookup key for depth-binned COP: '{cool|heat}|{±0.5}'."""
+    stepped = round(float(depth_k) * 2.0) / 2.0
+    return f"{mode}|{stepped:+.1f}"
+
+
 def cop_sample_mode(
     controller_mode: str,
     *,
@@ -244,7 +250,11 @@ class StartCounter:
 
 
 def control_state_key(any_conditioning: bool, any_parked: bool) -> str | None:
-    """House-wide control-state label for COP bookkeeping."""
+    """House-wide control-state label for COP bookkeeping.
+
+    ``any_conditioning`` = any active head at depth_k ≤ 0 (chase / zero hold).
+    ``any_parked`` = any active head at depth_k > 0 (hysteresis hold).
+    """
     if any_conditioning and any_parked:
         return "mixed"
     if any_conditioning:
@@ -252,6 +262,13 @@ def control_state_key(any_conditioning: bool, any_parked: bool) -> str | None:
     if any_parked:
         return "park"
     return None
+
+
+def zone_depth_is_park(depth_k: float | None, *, parked_fallback: bool = False) -> bool:
+    """True when signed head depth is a positive hysteresis hold."""
+    if depth_k is not None:
+        return float(depth_k) > 0.0
+    return parked_fallback
 
 
 def compose_load(

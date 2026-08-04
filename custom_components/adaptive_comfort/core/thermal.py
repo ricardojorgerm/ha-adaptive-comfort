@@ -360,6 +360,18 @@ class ThermalModel:
         regimes and imply both were learned independently)."""
         return self.fits[door_open].samples == 0 and self.fits[not door_open].samples > 0
 
+    def migrate_default_closed_to_open(self) -> bool:
+        """Move closed-regime learning into open when open is still empty.
+
+        Used for zones with no door sensor after the default flipped from
+        closed → open (assume inter-room mixing). Returns True if migrated.
+        """
+        if self.fits[True].samples > 0 or self.fits[False].samples == 0:
+            return False
+        self.fits[True] = self.fits[False]
+        self.fits[False] = RLS(N_PARAMS, self.fits[True].lam)
+        return True
+
     def fit_stage(self, door_open: bool = False) -> str:
         """How much the k values rely on learned data: prior | blending | fitted."""
         samples = self.fit_samples(door_open)

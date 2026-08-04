@@ -111,7 +111,7 @@ OUTDOOR_LKG_S = 2.0 * 3600.0
 MOISTURE_SCHEMA = 2
 # House/zone COP: schema 2 wiped inflated-latent history; schema 3 splits
 # heat/cool ledgers (keys '{mode}|…') so seasons no longer mix.
-COP_SCHEMA = 3
+COP_SCHEMA = 4  # depth-binned COP ledger (chase / zero / hysteresis)
 
 
 def _float_state(hass: HomeAssistant, entity_id: str | None) -> float | None:
@@ -173,7 +173,7 @@ class ZoneRuntime:
         self.moisture_sources_kg_h = 0.0
         self.temp: float | None = None
         self.rh: float | None = None
-        self.door_open = False
+        self.door_open = True  # no door sensor → assume open (inter-room mixing)
         self.indoor_fans_on = False
         self.outdoor_exhaust_on = False
         self.occupied: bool | None = None
@@ -206,6 +206,10 @@ class ZoneRuntime:
             self.park = park.ParkEstimator.from_dict(data["park"])
         if "thermal" in data:
             self.model = ThermalModel.from_dict(data["thermal"], self.config.sensed_room.volume_m3)
+            # No door sensor: history was learned under default-closed; move it
+            # to open so mixing-aware reads do not start from a blank regime.
+            if not self.config.door_sensor:
+                self.model.migrate_default_closed_to_open()
         for head, drift_data in data.get("drift", {}).items():
             if head in self.drift:
                 self.drift[head] = DriftEstimator.from_dict(drift_data)
@@ -275,6 +279,8 @@ class AdaptiveComfortRuntime:
         self.cop_table_banded: dict[str, tuple[float, int]] = {}
         # "{mode}|{conditioning|park|mixed}" -> (ewma, n) — park-hold economics.
         self.cop_table_state: dict[str, tuple[float, int]] = {}
+        # "{mode}|{±depth}" -> (ewma, n) — continuum depth economics (incl. ≤0).
+        self.cop_table_depth: dict[str, tuple[float, int]] = {}
         self.starts = power.StartCounter()
         self._last_state_key: str | None = None
         self.house_cop: float | None = None
@@ -568,7 +574,8 @@ class AdaptiveComfortRuntime:
             best = max(persisted, working) if working is not None else persisted
             self.controller_state.zone_park_preferred[zid] = best
             zone.park.preferred_margin_k = best
-        if int(data.get("cop_schema", 0)) >= COP_SCHEMA:
+        schema = int(data.get("cop_schema", 0))
+        if schema >= 3:
             for key, value in data.get("cop_table", {}).items():
                 try:
                     self.cop_table[str(key)] = (float(value[0]), int(value[1]))
@@ -584,7 +591,13 @@ class AdaptiveComfortRuntime:
                     self.cop_table_state[str(key)] = (float(value[0]), int(value[1]))
                 except (TypeError, ValueError, IndexError):
                     continue
-        elif int(data.get("cop_schema", 0)) == 2:
+            if schema >= 4:
+                for key, value in data.get("cop_table_depth", {}).items():
+                    try:
+                        self.cop_table_depth[str(key)] = (float(value[0]), int(value[1]))
+                    except (TypeError, ValueError, IndexError):
+                        continue
+        elif schema == 2:
             # Schema 2 mixed heat/cool under bare keys; attribute to cool
             # (field history is cooling-dominated) and start heat fresh.
             self.cop_table = power.migrate_cop_table_keys(data.get("cop_table", {}), kind="heads")
@@ -599,6 +612,7 @@ class AdaptiveComfortRuntime:
             self.cop_table.clear()
             self.cop_table_banded.clear()
             self.cop_table_state.clear()
+            self.cop_table_depth.clear()
             self.house_cop = None
             for zone in self.zones.values():
                 zone.model.cop = None
@@ -650,6 +664,7 @@ class AdaptiveComfortRuntime:
             "cop_table": {k: [v[0], v[1]] for k, v in self.cop_table.items()},
             "cop_table_banded": {k: [v[0], v[1]] for k, v in self.cop_table_banded.items()},
             "cop_table_state": {k: [v[0], v[1]] for k, v in self.cop_table_state.items()},
+            "cop_table_depth": {k: [v[0], v[1]] for k, v in self.cop_table_depth.items()},
             "starts": self.starts.to_dict(),
             "predictor_scorer": self.predictor_scorer.to_dict(),
         }
@@ -955,7 +970,15 @@ class AdaptiveComfortRuntime:
         if self.p_load is not None:
             # Median fallback OK for demand/shedding; park path uses learned slot.
             self.p_ac = power.estimate_ac_power(self.p_load, self.baseline.value(local_hour))
-        parked_ids = set(self.controller_state.zone_parked_since)
+        # Depth-aware control-state COP: depth_k ≤ 0 → conditioning, > 0 → park.
+        parked_ids = {
+            z.config.zone_id
+            for z in active
+            if power.zone_depth_is_park(
+                self._zone_head_depth_k(z.config.zone_id),
+                parked_fallback=z.config.zone_id in self.controller_state.zone_parked_since,
+            )
+        }
         self._last_state_key = power.control_state_key(
             any(z.config.zone_id not in parked_ids for z in active),
             any(z.config.zone_id in parked_ids for z in active),
@@ -1055,7 +1078,12 @@ class AdaptiveComfortRuntime:
             if zone.rh is not None and zone.temp is not None:
                 zone.w_series.append(now_ts, psychro.humidity_ratio(zone.temp, zone.rh))
             door = self.hass.states.get(cfg.door_sensor) if cfg.door_sensor else None
-            zone.door_open = door is not None and door.state == STATE_ON
+            # No door sensor: assume open so k_mix / house-coupling is the
+            # default regime (inter-room mixing is the common case).
+            if cfg.door_sensor:
+                zone.door_open = door is not None and door.state == STATE_ON
+            else:
+                zone.door_open = True
             zone.indoor_fans_on = fan_entities_on(self.hass, cfg.indoor_fan_entities)
             zone.outdoor_exhaust_on = fan_entities_on(self.hass, cfg.outdoor_exhaust_fan_entities)
             raw_occ = presence_state(self.hass, cfg.presence_sensor)
@@ -1211,6 +1239,28 @@ class AdaptiveComfortRuntime:
                             prev_s + 0.05 * (house_cop - prev_s),
                             count_s + 1,
                         )
+                    # Depth-binned COP (0.5 K grid), including chase / zero hold.
+                    for zone in active:
+                        depth = self._zone_head_depth_k(zone.config.zone_id)
+                        if depth is None:
+                            continue
+                        dkey = power.cop_depth_key(mode, depth)
+                        prev_d, count_d = self.cop_table_depth.get(dkey, (house_cop, 0))
+                        self.cop_table_depth[dkey] = (
+                            prev_d + 0.05 * (house_cop - prev_d),
+                            count_d + 1,
+                        )
+
+    def _zone_head_depth_k(self, zid: str) -> float | None:
+        """Live signed head depth, with park_margin / track_delta mirrors as fallback."""
+        st = self.controller_state
+        if zid in st.zone_head_depth_k:
+            return float(st.zone_head_depth_k[zid])
+        if zid in st.zone_park_margin:
+            return float(st.zone_park_margin[zid])
+        if zid in st.zone_track_delta:
+            return -float(st.zone_track_delta[zid])
+        return None
 
     def _update_zone_estimators(self, zone: ZoneRuntime, now_ts: float, local_hour: float) -> None:
         if zone.temp is None:
@@ -1964,6 +2014,7 @@ class AdaptiveComfortRuntime:
             "cop_table": dict(self.cop_table),
             "cop_table_banded": dict(self.cop_table_banded),
             "cop_table_state": dict(self.cop_table_state),
+            "cop_table_depth": dict(self.cop_table_depth),
             "compressor_starts_per_hour_24h": round(self.starts.per_hour(time.time()), 2),
             "compressor_starts_by_state_24h": self.starts.by_state(time.time()),
             "controller_diag": self.last_diag,

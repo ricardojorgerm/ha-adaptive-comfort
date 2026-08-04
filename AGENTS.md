@@ -60,18 +60,21 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
 - **Door regimes**: `ThermalModel.fits[door_open]` holds separate RLS fits. A regime with no
   samples *reports the other regime's fit* (`_fit` fallback); `fit_is_fallback()` tells you
   whether you're looking at learned or borrowed numbers. Diagnostics expose this flag —
-  keep it honest.
-- **COP tables**: all three ledgers are **mode-split** (`cool|…` / `heat|…`) so
+  keep it honest. **No door sensor → assume open** (inter-room mixing by default); on
+  restore, closed-fit history migrates into open when open is still empty.
+- **COP tables**: all ledgers are **mode-split** (`cool|…` / `heat|…`) so
   seasons never mix. `cop_table` keys `"{mode}|{heads}"`; `cop_table_banded`
   `"{mode}|{heads}|{band}"` with bands from `power.outdoor_band()` (mild/warm/hot);
-  `cop_table_state` `"{mode}|{conditioning|park|mixed}"` audits park-hold economics
-  *per mode*. Snapshot hints (`cop_by_head_count`, `cop_by_band`) filter to the
+  `cop_table_state` `"{mode}|{conditioning|park|mixed}"` from signed depth
+  (`depth_k ≤ 0` → conditioning, `> 0` → park); `cop_table_depth`
+  `"{mode}|{±0.5}"` learns chase / zero-hold / hysteresis COP on the continuum
+  grid. Snapshot hints (`cop_by_head_count`, `cop_by_band`) filter to the
   active controller mode. Samples file under that same mode only when an active
   head also reports the matching `hvac_action` (`cop_sample_mode`) — mode-change
   lag skips the row rather than contaminating the other season. Head count and
   weather stay confounded inside a mode (3 heads ↔ hot afternoons) — never draw
   head-count conclusions from the unbanded table alone. Schema 2 bare keys
-  migrate into `cool|…` on restore.
+  migrate into `cool|…` on restore; schema 4 adds the depth ledger.
 - **Persistence**: everything that must survive a restart goes through `coordinator._persist()`
   / restore and the `to_dict`/`from_dict` pairs. If you add controller state or a setting,
   wire all four places: dataclass, `to_dict`, `from_dict`, and the `_persist` settings dict

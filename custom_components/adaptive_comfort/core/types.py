@@ -174,7 +174,7 @@ class ZoneSnapshot:
     n_rooms: int
     temp: float | None  # corrected room temperature
     rh: float | None = None
-    door_open: bool = False
+    door_open: bool = True  # no door sensor → assume open (inter-room mixing)
     occupied: bool | None = None  # None = no presence sensor
     is_on: bool = False  # any head actively conditioning
     head_state: str = STATE_STANDBY

@@ -1071,12 +1071,20 @@ def test_margin_bin_edges():
 
 
 def test_control_state_key():
-    from custom_components.adaptive_comfort.core.power import control_state_key
+    from custom_components.adaptive_comfort.core.power import (
+        control_state_key,
+        zone_depth_is_park,
+    )
 
     assert control_state_key(True, False) == "conditioning"
     assert control_state_key(False, True) == "park"
     assert control_state_key(True, True) == "mixed"
     assert control_state_key(False, False) is None
+    assert zone_depth_is_park(-0.5) is False
+    assert zone_depth_is_park(0.0) is False
+    assert zone_depth_is_park(1.0) is True
+    assert zone_depth_is_park(None, parked_fallback=True) is True
+    assert zone_depth_is_park(None, parked_fallback=False) is False
 
 
 # --- residual-hold vs fan-type: entry target, live coil-dry, settle bounds -----

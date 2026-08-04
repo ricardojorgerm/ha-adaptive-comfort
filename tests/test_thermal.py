@@ -237,3 +237,25 @@ def test_update_c_eff_recovers_furniture_from_excess_rate():
     for _ in range(80):
         model.update_c_eff(600.0, False, t_in, t_out, dtdt, 12.0)
     assert abs(model.furniture_factor - true_ff) < 0.35
+
+
+def test_migrate_default_closed_to_open():
+    model = ThermalModel(volume_m3=30.0)
+    model.fits[False].theta[0] = 0.4
+    model.fits[False].theta[1] = 0.15
+    model.fits[False].samples = 50
+    assert model.migrate_default_closed_to_open() is True
+    assert model.fits[True].samples == 50
+    assert model.fits[True].theta[0] == 0.4
+    assert model.fits[False].samples == 0
+    # Open already populated: no-op.
+    model.fits[False].samples = 10
+    assert model.migrate_default_closed_to_open() is False
+    assert model.fits[True].samples == 50
+
+
+def test_zone_snapshot_defaults_door_open():
+    from custom_components.adaptive_comfort.core.types import ZoneSnapshot
+
+    z = ZoneSnapshot(zone_id="z", name="z", n_rooms=1, temp=23.0)
+    assert z.door_open is True

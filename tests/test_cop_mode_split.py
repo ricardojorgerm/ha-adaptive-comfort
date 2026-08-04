@@ -64,3 +64,10 @@ def test_cop_sample_mode_requires_controller_and_plant_agree():
     # Idle / auto controller → never file.
     assert power.cop_sample_mode("off", any_heating=False, any_cooling=True) is None
     assert power.cop_sample_mode("auto", any_heating=True, any_cooling=False) is None
+
+
+def test_cop_depth_key_half_grid():
+    assert power.cop_depth_key("cool", -0.5) == "cool|-0.5"
+    assert power.cop_depth_key("cool", 0.0) == "cool|+0.0"
+    assert power.cop_depth_key("heat", 1.26) == "heat|+1.5"
+    assert power.cop_depth_key("cool", -0.74) == "cool|-0.5"
