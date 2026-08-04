@@ -193,6 +193,9 @@ class ZoneSnapshot:
     # controller keep tracking a zone that is running out its minimum
     # runtime after the house has gone idle.
     head_mode: str | None = None
+    # Live head-frame readings (mean across mirrored heads) for depth re-anchor.
+    head_internal_temp: float | None = None
+    device_setpoint: float | None = None
     park_extraction_w: float | None = None  # sensed-room / per-head parked output (W)
     # Learned park depth (K) to start from on the next park entry.
     park_preferred_margin_k: float | None = None
@@ -326,6 +329,10 @@ class ControllerState:
     )  # room temp at last margin decision
     # Working copy of learned park depth; synced to ParkEstimator after each tick.
     zone_park_preferred: dict[str, float] = field(default_factory=dict)
+    # Signed head depth continuum (K): cool SP = internal + depth.
+    zone_head_depth_k: dict[str, float] = field(default_factory=dict)
+    # Deprecated: kept for persistence round-trip of older saves.
+    zone_force_chase_until: dict[str, float] = field(default_factory=dict)
     shed: dict[str, float] = field(default_factory=dict)  # zone_id -> shed ts
     last_shed_action: float = 0.0
     # prefer_continuous: the single elected anchor zone (None when the
@@ -369,6 +376,8 @@ class ControllerState:
             "zone_last_park_abort": dict(self.zone_last_park_abort),
             "zone_park_ref": dict(self.zone_park_ref),
             "zone_park_preferred": dict(self.zone_park_preferred),
+            "zone_head_depth_k": dict(self.zone_head_depth_k),
+            "zone_force_chase_until": dict(self.zone_force_chase_until),
             "zone_fan": dict(self.zone_fan),
             "zone_last_cool": dict(self.zone_last_cool),
             "zone_mode_changes": {k: list(v) for k, v in self.zone_mode_changes.items()},
@@ -417,6 +426,12 @@ class ControllerState:
         st.zone_park_ref = {str(k): float(v) for k, v in data.get("zone_park_ref", {}).items()}
         st.zone_park_preferred = {
             str(k): float(v) for k, v in data.get("zone_park_preferred", {}).items()
+        }
+        st.zone_head_depth_k = {
+            str(k): float(v) for k, v in data.get("zone_head_depth_k", {}).items()
+        }
+        st.zone_force_chase_until = {
+            str(k): float(v) for k, v in data.get("zone_force_chase_until", {}).items()
         }
         st.zone_fan = {str(k): bool(v) for k, v in data.get("zone_fan", {}).items()}
         st.zone_last_cool = {str(k): float(v) for k, v in data.get("zone_last_cool", {}).items()}

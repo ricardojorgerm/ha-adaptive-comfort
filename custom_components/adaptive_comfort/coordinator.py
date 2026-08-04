@@ -1520,6 +1520,8 @@ class AdaptiveComfortRuntime:
                         if zone.head_state == STATE_COOLING
                         else None
                     ),
+                    head_internal_temp=zone.head_internal_temp,
+                    device_setpoint=zone.device_setpoint,
                     standing_load_w=zone.standing_load_w,
                     mixing_gain_w=mixing_gain_w,
                     mixing_coupling_w_per_k=mixing_coupling,

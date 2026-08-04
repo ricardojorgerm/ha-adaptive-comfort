@@ -37,13 +37,24 @@ SHED_ACTION_SPACING_S = 30.0
 SHED_URGENT_SPACING_S = 3.0
 COMMAND_SPACING_S = 180.0
 SETPOINT_EPSILON_K = 0.25
+# Re-anchor head depth when live internal drifts vs the device setpoint.
+# Routine refresh stays at COMMAND_SPACING_S; drift may fire as often as one
+# control tick so a collapsing head sensor (27→24 after airflow) does not
+# leave SP stranded at the inflated entry for minutes.
+HEAD_REANCHOR_MIN_S = 60.0
+HEAD_REANCHOR_EPS_K = 0.5
 # Tracking setpoint control: the commanded device setpoint follows the head's
 # internal sensor at a small depth below it (cooling), keeping the inverter's
 # perceived error small and constant. The depth adapts to room-frame progress.
-TRACK_DELTA_MIN_K = 0.3
+TRACK_DELTA_MIN_K = 0.5  # aligned to half-degree depth grid (was 0.3)
 TRACK_DELTA_MAX_K = 2.5
 TRACK_DELTA_STEP_K = 0.5
-TRACK_DELTA_DEFAULT_K = 0.7
+TRACK_DELTA_DEFAULT_K = 0.5
+# Signed head-depth continuum (cool SP = internal + depth_k).
+# Absolute hard rails; live adapt clamps to chase-floor / COP-useful ceiling.
+DEPTH_STEP_K = 0.5
+DEPTH_MAX_K = 3.0  # = PARK_MARGIN_MAX_K
+DEPTH_MIN_K = -TRACK_DELTA_MAX_K
 # Parked-head characterization/exploitation: setpoint margin above the
 # internal reading, minimum dwell in/out of the parked state, probe length
 # and per-zone probe spacing while behavior is still unclassified.
@@ -623,25 +634,260 @@ def _command_with_depth(
     depth_k: float,
 ) -> Command:
     """Build a Command from signed head depth (cool: SP = internal + depth)."""
-    if depth_k > 0.0:
+    d = float(depth_k)
+    if d > 0.0:
         return Command(
             zid,
             mode,
             setpoint,
             reason,
             park=True,
-            park_margin=depth_k,
-            head_depth_k=depth_k,
+            park_margin=d,
+            head_depth_k=d,
         )
-    track = abs(depth_k) if depth_k < 0.0 else None
-    return Command(
-        zid,
-        mode,
-        setpoint,
-        reason,
-        track_delta=track,
-        head_depth_k=depth_k if track is not None else 0.0,
+    if d < 0.0:
+        return Command(
+            zid,
+            mode,
+            setpoint,
+            reason,
+            track_delta=-d,
+            head_depth_k=d,
+        )
+    return Command(zid, mode, setpoint, reason, head_depth_k=0.0)
+
+
+def _ideal_device_setpoint(internal: float, depth_k: float, mode: str) -> float:
+    """Device SP that realizes signed depth at the live internal reading."""
+    if mode == MODE_COOL:
+        return internal + depth_k
+    return internal - depth_k
+
+
+def _head_anchor_drifted(zone: ZoneSnapshot, depth_k: float, mode: str) -> bool:
+    """True when device SP no longer matches internal ± depth within epsilon."""
+    if mode not in (MODE_HEAT, MODE_COOL):
+        return False
+    internal = zone.head_internal_temp
+    device_sp = zone.device_setpoint
+    if internal is None or device_sp is None:
+        return False
+    ideal = _ideal_device_setpoint(float(internal), depth_k, mode)
+    return abs(float(device_sp) - ideal) >= HEAD_REANCHOR_EPS_K
+
+
+def _depth_command_due(
+    state: ControllerState,
+    zid: str,
+    now: float,
+    zone: ZoneSnapshot,
+    depth_k: float | None,
+    mode: str,
+    *,
+    force: bool = False,
+) -> bool:
+    """Emit a depth command on spacing, forced change, or head-anchor drift."""
+    if force:
+        return True
+    last = state.zone_last_cmd.get(zid, 0.0)
+    elapsed = now - last
+    if elapsed >= COMMAND_SPACING_S:
+        return True
+    return (
+        depth_k is not None
+        and mode in (MODE_HEAT, MODE_COOL)
+        and elapsed >= HEAD_REANCHOR_MIN_S
+        and _head_anchor_drifted(zone, depth_k, mode)
     )
+
+
+def _quantize_depth(depth_k: float) -> float:
+    return round(float(depth_k) / DEPTH_STEP_K) * DEPTH_STEP_K
+
+
+def _chase_floor_k(state: ControllerState, zid: str) -> float:
+    """Under-conditioning extreme: −tracking chase on the 0.5 K grid."""
+    chase = state.zone_track_delta.get(zid, TRACK_DELTA_DEFAULT_K)
+    chase = min(max(float(chase), TRACK_DELTA_MIN_K), TRACK_DELTA_MAX_K)
+    return -_quantize_depth(chase)
+
+
+def _hysteresis_ceiling_k(zone: ZoneSnapshot, state: ControllerState) -> float:
+    """Over-conditioning extreme: deepest still COP/residual-useful depth.
+
+    When the residual map has a proven max (or edge), that caps escalation —
+    deeper is COP-useless fan-type hold. While unclassified / unmapped,
+    allow full ``DEPTH_MAX_K`` so a session can still learn by probing up.
+    Preferred is an *entry* hint, not this ceiling.
+    """
+    _ = state  # reserved for future preferred-aware soft caps
+    if zone.park_residual_max_margin_k is not None:
+        return min(_quantize_depth(zone.park_residual_max_margin_k), DEPTH_MAX_K)
+    if zone.park_residual_edge_k is not None:
+        return min(_quantize_depth(zone.park_residual_edge_k), DEPTH_MAX_K)
+    return DEPTH_MAX_K
+
+
+def _clamp_depth(
+    depth_k: float, lo: float | None = None, hi: float | None = None
+) -> float:
+    stepped = _quantize_depth(depth_k)
+    lo_b = DEPTH_MIN_K if lo is None else float(lo)
+    hi_b = DEPTH_MAX_K if hi is None else float(hi)
+    if lo_b > hi_b:
+        lo_b, hi_b = hi_b, lo_b
+    return min(max(stepped, lo_b), hi_b)
+
+
+def _sync_depth_views(
+    state: ControllerState,
+    zid: str,
+    depth_k: float,
+    now: float,
+    *,
+    lo: float | None = None,
+    hi: float | None = None,
+) -> float:
+    """Persist signed depth and mirror park_margin / track_delta views."""
+    depth = _clamp_depth(depth_k, lo, hi)
+    state.zone_head_depth_k[zid] = depth
+    if depth > 0.0:
+        state.zone_park_margin[zid] = depth
+        if zid not in state.zone_parked_since:
+            state.zone_parked_since[zid] = now
+        # Positive hold: keep chase target at least the grid default.
+        state.zone_track_delta[zid] = max(
+            state.zone_track_delta.get(zid, TRACK_DELTA_DEFAULT_K), TRACK_DELTA_MIN_K
+        )
+    else:
+        state.zone_track_delta[zid] = abs(depth) if depth < 0.0 else TRACK_DELTA_MIN_K
+        if zid in state.zone_parked_since:
+            # Left positive hysteresis — drop learning session without probe charge.
+            state.zone_park_probe_entry.pop(zid, None)
+            state.zone_parked_since.pop(zid, None)
+            state.zone_park_margin.pop(zid, None)
+    return depth
+
+
+def _extraction_none_at_depth(zone: ZoneSnapshot, depth_k: float) -> bool:
+    """True when this positive depth is not moving useful heat / not compressing."""
+    if depth_k <= 0.0:
+        return False
+    if zone.park_current_is_fan_type is True:
+        return True
+    if zone.park_residuals is False:
+        return True
+    from .park import CLASSIFY_MIN_SAMPLES, IDLE_MAX_W, RESIDUAL_HOLD_DUTY_MIN, margin_bin
+
+    b = margin_bin(depth_k)
+    if b is None:
+        return False
+    entry = (zone.park_margin_bins or {}).get(b)
+    if entry is None or entry[2] < CLASSIFY_MIN_SAMPLES:
+        return False
+    return entry[1] < RESIDUAL_HOLD_DUTY_MIN or float(entry[0]) <= IDLE_MAX_W
+
+
+def _shallower_depth_useful(
+    zone: ZoneSnapshot,
+    depth_k: float,
+    *,
+    want_conditioning: bool,
+    mixing_covered: bool,
+) -> bool:
+    """Can a lower depth restore compression / useful in-band work?"""
+    if mixing_covered and not want_conditioning:
+        return False
+    from .park import CLASSIFY_MIN_SAMPLES, IDLE_MAX_W, RESIDUAL_HOLD_DUTY_MIN
+
+    for key, (ext, duty, n) in (zone.park_margin_bins or {}).items():
+        try:
+            m = float(key)
+        except (TypeError, ValueError):
+            continue
+        if (
+            m < depth_k - 1e-9
+            and n >= CLASSIFY_MIN_SAMPLES
+            and duty >= RESIDUAL_HOLD_DUTY_MIN
+            and float(ext) > IDLE_MAX_W
+        ):
+            return True
+    # Chase / zero always available when the zone still wants conditioning.
+    return want_conditioning
+
+
+def _adapt_head_depth_k(
+    state: ControllerState,
+    zid: str,
+    zone: ZoneSnapshot,
+    mode: str,
+    depth_k: float,
+    *,
+    want_conditioning: bool,
+    mixing_covered: bool = False,
+    pull_down: bool = False,
+) -> tuple[float, bool, bool]:
+    """Signed depth adapt. Returns ``(depth, changed, should_off)``.
+
+    Under-conditioning lowers depth through 0 into chase, floored at the
+    live tracking chase on the 0.5 grid (``-_chase_floor_k``). Over-
+    conditioning raises depth only up to the deepest still COP/residual-
+    useful hold (``_hysteresis_ceiling_k``). When extraction is ~none at
+    this depth, step down only if a shallower depth can restore useful
+    work; otherwise ``should_off`` (future overcooling / no need).
+    """
+    floor = _chase_floor_k(state, zid)
+    ceiling = _hysteresis_ceiling_k(zone, state)
+    depth = _clamp_depth(depth_k, floor, ceiling)
+    if zone.temp is None or mode not in (MODE_HEAT, MODE_COOL):
+        return depth, False, False
+    if pull_down:
+        # Fast path toward the chase floor when the near edge is breached.
+        target = _clamp_depth(min(depth, floor), floor, ceiling)
+        if abs(target - depth) > 1e-9:
+            state.zone_park_ref[zid] = zone.temp
+            return target, True, False
+        return depth, False, False
+
+    ref = state.zone_park_ref.get(zid)
+    if ref is None:
+        state.zone_park_ref[zid] = zone.temp
+        return depth, False, False
+    moved = ref - zone.temp if mode == MODE_COOL else zone.temp - ref
+    changed = False
+    should_off = False
+    if moved >= PARK_ADAPT_EPS_K:
+        # Over-holding: raise depth toward the COP-useful ceiling, then hold
+        # there (keep-temp). Far-edge overcorrection is the caller's job —
+        # do not soft-release merely because we are already at useful max.
+        if depth < ceiling - 1e-9:
+            depth = _clamp_depth(depth + DEPTH_STEP_K, floor, ceiling)
+            changed = True
+            if depth > 0.0:
+                _raise_park_preferred(state, zid, depth)
+        state.zone_park_ref[zid] = zone.temp
+    elif moved <= -PARK_ADAPT_EPS_K:
+        # Under-holding / load side: step toward chase floor only.
+        none = _extraction_none_at_depth(zone, depth)
+        if none and not _shallower_depth_useful(
+            zone, depth, want_conditioning=want_conditioning, mixing_covered=mixing_covered
+        ):
+            should_off = True
+            state.zone_park_ref[zid] = zone.temp
+        else:
+            new_depth = _clamp_depth(depth - DEPTH_STEP_K, floor, ceiling)
+            if abs(new_depth - depth) > 1e-9:
+                depth = new_depth
+                changed = True
+            elif (
+                not want_conditioning
+                and none
+                and depth <= floor + 1e-9
+            ):
+                # Already at chase floor with no useful shallower depth.
+                should_off = True
+            state.zone_park_ref[zid] = zone.temp
+    return depth, changed, should_off
 
 
 def _park_preferred(zone: ZoneSnapshot, state: ControllerState) -> float:
@@ -1438,56 +1684,48 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             state.zone_park_preferred[zid] = _park_preferred(zone, state)
         parked_since = state.zone_parked_since.get(zid)
         if parked_since is not None and desired_on and mode in (MODE_HEAT, MODE_COOL):
-            # Demand-side hysteresis depth: same margin adapt / overcool
-            # guards as want-off park, but the zone still wants conditioning.
+            # Demand-side hysteresis depth: continuum adapt; still wants conditioning.
             lo_b, hi_b = bands[zid]
-            if not _park_ok_now(zone, lo_b, hi_b, mode):
-                # Pull-down needed: drop positive depth and fall through.
+            preferred = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
+            depth = state.zone_head_depth_k.get(
+                zid, state.zone_park_margin.get(zid, preferred)
+            )
+            overcorrected = zone.temp is not None and (
+                zone.temp <= lo_b - PARK_OVERCOOL_BUFFER_K
+                if mode == MODE_COOL
+                else zone.temp >= hi_b + PARK_OVERCOOL_BUFFER_K
+            )
+            pull_down = not _park_ok_now(zone, lo_b, hi_b, mode)
+            depth, depth_changed, should_off = _adapt_head_depth_k(
+                state,
+                zid,
+                zone,
+                mode,
+                depth,
+                want_conditioning=True,
+                pull_down=pull_down,
+            )
+            floor = _chase_floor_k(state, zid)
+            ceiling = _hysteresis_ceiling_k(zone, state)
+            depth = _sync_depth_views(state, zid, depth, now, lo=floor, hi=ceiling)
+            if overcorrected or should_off:
                 _clear_park_session(state, zid, zone, now)
+                state.zone_head_depth_k.pop(zid, None)
+                diag.setdefault("park_overcorrected", []).append(zid)
+                # Fall through to demand / off handling.
+            elif depth > 0.0:
+                if _depth_command_due(
+                    state, zid, now, zone, depth, mode, force=depth_changed
+                ):
+                    commands.append(
+                        _command_with_depth(zid, mode, None, "depth_residual", depth)
+                    )
+                    state.zone_last_cmd[zid] = now
+                state.zone_fan[zid] = False
+                continue
             else:
-                preferred = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
-                margin = state.zone_park_margin.get(zid, preferred)
-                margin_changed = False
-                overcorrected = zone.temp is not None and (
-                    zone.temp <= lo_b - PARK_OVERCOOL_BUFFER_K
-                    if mode == MODE_COOL
-                    else zone.temp >= hi_b + PARK_OVERCOOL_BUFFER_K
-                )
-                if zone.temp is not None:
-                    ref = state.zone_park_ref.get(zid)
-                    if ref is None:
-                        state.zone_park_ref[zid] = zone.temp
-                    else:
-                        moved = ref - zone.temp if mode == MODE_COOL else zone.temp - ref
-                        if moved >= PARK_ADAPT_EPS_K:
-                            if margin < PARK_MARGIN_MAX_K:
-                                margin = min(margin + PARK_MARGIN_STEP_K, PARK_MARGIN_MAX_K)
-                                state.zone_park_margin[zid] = margin
-                                state.zone_park_ref[zid] = zone.temp
-                                _raise_park_preferred(state, zid, margin)
-                                margin_changed = True
-                        elif moved <= -PARK_ADAPT_EPS_K:
-                            relax_floor = PARK_MARGIN_K
-                            if zone.park_residual_edge_k is not None:
-                                relax_floor = max(relax_floor, zone.park_residual_edge_k)
-                            new_margin = max(margin - PARK_MARGIN_STEP_K, relax_floor)
-                            if new_margin != margin:
-                                margin = new_margin
-                                state.zone_park_margin[zid] = margin
-                                margin_changed = True
-                            state.zone_park_ref[zid] = zone.temp
-                if overcorrected:
-                    _clear_park_session(state, zid, zone, now)
-                    diag.setdefault("park_overcorrected", []).append(zid)
-                else:
-                    last_cmd = state.zone_last_cmd.get(zid, 0.0)
-                    if margin_changed or now - last_cmd >= COMMAND_SPACING_S:
-                        commands.append(
-                            _command_with_depth(zid, mode, None, "depth_residual", margin)
-                        )
-                        state.zone_last_cmd[zid] = now
-                    state.zone_fan[zid] = False
-                    continue
+                # Crossed into 0 / chase — fall through; demand emits continuum depth.
+                diag.setdefault("depth_continuum", []).append(zid)
         if parked_since is not None and zid in state.zone_parked_since:
             # Direction: dominant mode when conditioning, else the head's own
             # physical mode - run-out parks must survive the house going idle.
@@ -1539,73 +1777,79 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 and now - last_cool < COIL_DRY_S
             )
 
-            # Margin escalation: if the room keeps moving in the conditioning
-            # direction while parked, the head is not holding temperature at
-            # this depth - raise the setpoint further away from the internal
-            # reading before giving up. Only when the margin is maxed and the
-            # room still falls (cool) / rises (heat) do we idle the head.
+            # Continuum depth escalation / under-cond step-down.
             preferred = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
-            margin = state.zone_park_margin.get(zid, preferred)
-            margin_exhausted = False
-            margin_changed = False
-            if zone.temp is not None and pmode in (MODE_HEAT, MODE_COOL):
-                ref = state.zone_park_ref.get(zid)
-                if ref is None:
-                    state.zone_park_ref[zid] = zone.temp
-                else:
-                    moved = ref - zone.temp if pmode == MODE_COOL else zone.temp - ref
-                    if moved >= PARK_ADAPT_EPS_K:
-                        if margin < PARK_MARGIN_MAX_K:
-                            margin = min(margin + PARK_MARGIN_STEP_K, PARK_MARGIN_MAX_K)
-                            state.zone_park_margin[zid] = margin
-                            state.zone_park_ref[zid] = zone.temp
-                            _raise_park_preferred(state, zid, margin)
-                            margin_changed = True
-                        else:
-                            margin_exhausted = True
-                    elif moved <= -PARK_ADAPT_EPS_K:
-                        # Drifting back toward the load side: the head eased
-                        # off (or idles); relax toward the base margin. A clean
-                        # exit then settles preferred toward this lower depth.
-                        # Bound the relax by the learned residual-hold edge
-                        # (not the bare PARK_MARGIN_K floor) so it cannot walk
-                        # down into full-conditioning depths a shallow bin
-                        # would otherwise offer (e.g. 1.5 K at duty 1.0 is not
-                        # a park — it is just tracked demand with a park label).
-                        relax_floor = PARK_MARGIN_K
-                        if zone.park_residual_edge_k is not None:
-                            relax_floor = max(relax_floor, zone.park_residual_edge_k)
-                        new_margin = max(margin - PARK_MARGIN_STEP_K, relax_floor)
-                        if new_margin != margin:
-                            margin = new_margin
-                            state.zone_park_margin[zid] = margin
-                            margin_changed = True
-                        state.zone_park_ref[zid] = zone.temp
+            depth = state.zone_head_depth_k.get(
+                zid, state.zone_park_margin.get(zid, preferred)
+            )
+            depth_changed = False
+            depth_exhausted = False
+            if pmode in (MODE_HEAT, MODE_COOL):
+                depth, depth_changed, depth_exhausted = _adapt_head_depth_k(
+                    state,
+                    zid,
+                    zone,
+                    pmode,
+                    depth,
+                    want_conditioning=False,
+                    mixing_covered=mixing_covered,
+                )
+                floor = _chase_floor_k(state, zid)
+                ceiling = _hysteresis_ceiling_k(zone, state)
+                depth = _sync_depth_views(state, zid, depth, now, lo=floor, hi=ceiling)
+            margin = depth if depth > 0.0 else preferred
 
-            if (overcorrected or margin_exhausted) and not off_allowed:
+            hold_ceiling = (
+                _hysteresis_ceiling_k(zone, state)
+                if pmode in (MODE_HEAT, MODE_COOL)
+                else PARK_MARGIN_MAX_K
+            )
+            if (overcorrected or depth_exhausted) and not off_allowed:
                 # Head cannot hold temperature, but min-runtime forbids off:
-                # hold at maximum depth (the gentlest expressible output).
-                state.zone_park_margin[zid] = PARK_MARGIN_MAX_K
+                # hold at COP-useful ceiling (gentlest expressible residual).
+                depth = _sync_depth_views(
+                    state, zid, hold_ceiling, now, lo=_chase_floor_k(state, zid), hi=hold_ceiling
+                )
                 diag.setdefault("park_overcorrected_held", []).append(zid)
-                if (
-                    now - state.zone_last_cmd.get(zid, 0.0) >= COMMAND_SPACING_S
-                    and pmode is not None
+                if pmode is not None and _depth_command_due(
+                    state, zid, now, zone, depth, pmode
                 ):
                     commands.append(
-                        _command_with_depth(zid, pmode, None, "park", PARK_MARGIN_MAX_K)
+                        _command_with_depth(zid, pmode, None, "park", depth)
                     )
                     state.zone_last_cmd[zid] = now
                 continue
-            if overcorrected or margin_exhausted:
-                # Head cannot hold temperature at any depth: idle it.
-                # Keep preferred high-water so the next park starts deeper.
+            if overcorrected or depth_exhausted:
+                # Head cannot hold temperature at any useful depth: idle it.
                 _clear_park_session(state, zid, zone, now)
+                state.zone_head_depth_k.pop(zid, None)
                 diag.setdefault("park_overcorrected", []).append(zid)
                 desired_on = False
             elif coil_wet_fan_type and off_allowed:
-                # Fan-type hold, coil still wet: true off beats a park that
-                # is doing no useful work while re-evaporating condensate.
+                # Fan-type + wet coil: step depth down (toward chase / off),
+                # not a hard soft-release — re-evaporation risk falls as depth
+                # leaves positive hysteresis; off only once depth is exhausted.
+                if depth > 0.0:
+                    depth = _sync_depth_views(
+                        state,
+                        zid,
+                        depth - DEPTH_STEP_K,
+                        now,
+                        lo=_chase_floor_k(state, zid),
+                        hi=hold_ceiling,
+                    )
+                    diag.setdefault("park_coil_wet_step", []).append(zid)
+                    if pmode is not None and _depth_command_due(
+                        state, zid, now, zone, depth, pmode, force=True
+                    ):
+                        commands.append(
+                            _command_with_depth(zid, pmode, None, "park", depth)
+                        )
+                        state.zone_last_cmd[zid] = now
+                    if depth > 0.0:
+                        continue
                 _clear_park_session(state, zid, zone, now)
+                state.zone_head_depth_k.pop(zid, None)
                 diag.setdefault("park_coil_wet_released", []).append(zid)
                 desired_on = False
             elif out_of_band and (
@@ -1622,11 +1866,9 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     )
                 )
             ):
-                # Load beat the parked output: fall through to normal demand
-                # handling below (zone re-enters as wanting on). This margin
-                # was an overshoot/escalation depth, not a proven
-                # residual-hold — do not blend preferred toward it.
+                # Load beat the parked output: fall through to normal demand.
                 _clear_park_session(state, zid, zone, now)
+                state.zone_head_depth_k.pop(zid, None)
             elif zid in state.shed or (
                 dwell_ok
                 and off_allowed
@@ -1637,34 +1879,64 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                         not _anchor_active(state, s, mode, zid)
                         and (
                             probe_done
-                            or zone.park_residuals is False
                             or (
+                                # Known idler with no useful shallower depth → off.
+                                zone.park_residuals is False
+                                and not _shallower_depth_useful(
+                                    zone,
+                                    depth if depth > 0 else preferred,
+                                    want_conditioning=False,
+                                    mixing_covered=mixing_covered,
+                                )
+                            )
+                            or (
+                                # Soft-release when exploit/sibling fail — but keep
+                                # stepping a residual head whose depth can still
+                                # move toward the chase floor (weak cover).
                                 regime != "continuous"
                                 and (not _park_exploit_ok(zone, pmode) or not sibling_alive)
+                                and not (
+                                    zone.park_residuals is True
+                                    and depth > _chase_floor_k(state, zid) + 1e-9
+                                )
                             )
                             or pmode is None
                         )
                     )
                 )
             ):
-                # Probe finished, head classified as idler, exploitation no
-                # longer justified, or sibling mixing already covers hold load
-                # (handoff — residual park would add compressor work for free).
-                # continuous / plant min_on / prefer_continuous anchor waive
-                # sibling+exploit release so residual park can finish the run;
-                # mixing_covered still wins (even for the anchor).
-                if zid not in state.shed:
-                    _settle_park_preferred(state, zid, margin)
+                # Soft-release: mixing free-ride, finished probe idler, etc.
+                if zid not in state.shed and depth > 0.0:
+                    _settle_park_preferred(state, zid, depth)
                 _clear_park_session(state, zid, zone, now)
+                state.zone_head_depth_k.pop(zid, None)
                 desired_on = False
             else:
-                # Stay parked: refresh when spacing elapses *or* margin moved
-                # so the head sees the new depth immediately.
-                last_cmd = state.zone_last_cmd.get(zid, 0.0)
-                if (margin_changed or now - last_cmd >= COMMAND_SPACING_S) and pmode is not None:
-                    commands.append(_command_with_depth(zid, pmode, None, "park", margin))
+                # Stay parked / continuum: refresh on spacing, depth move, or
+                # head-anchor drift. Weak residual cover stays here so adapt
+                # can step depth down rather than soft-releasing to off.
+                if depth <= 0.0:
+                    # Stepped into chase while want-off — idle if allowed.
+                    if off_allowed and not plant_min_on:
+                        _clear_park_session(state, zid, zone, now)
+                        state.zone_head_depth_k.pop(zid, None)
+                        desired_on = False
+                    elif pmode is not None and _depth_command_due(
+                        state, zid, now, zone, depth, pmode, force=depth_changed
+                    ):
+                        commands.append(
+                            _command_with_depth(zid, pmode, None, "park", depth)
+                        )
+                        state.zone_last_cmd[zid] = now
+                        continue
+                elif pmode is not None and _depth_command_due(
+                    state, zid, now, zone, depth, pmode, force=depth_changed
+                ):
+                    commands.append(_command_with_depth(zid, pmode, None, "park", depth))
                     state.zone_last_cmd[zid] = now
-                continue
+                    continue
+                if depth > 0.0 or zid in state.zone_parked_since:
+                    continue
         elif (
             not desired_on
             and currently_on
@@ -1697,6 +1969,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 state.zone_park_preferred[zid] = preferred
                 state.zone_parked_since[zid] = now
                 state.zone_park_margin[zid] = entry
+                state.zone_head_depth_k[zid] = entry
                 if zone.temp is not None:
                     state.zone_park_ref[zid] = zone.temp
                 if probe_due and not plant_hold:
@@ -1730,6 +2003,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     entry = _park_entry_margin(zone, state)
                     state.zone_parked_since[zid] = now
                     state.zone_park_margin[zid] = entry
+                    state.zone_head_depth_k[zid] = entry
                     if zone.temp is not None:
                         state.zone_park_ref[zid] = zone.temp
                     commands.append(_command_with_depth(zid, zone.head_mode, None, "park", entry))
@@ -1744,17 +2018,13 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             # tracked setpoint: ease it to minimum tracking depth in its own
             # physical direction so it modulates gently instead of cooling hard into
             # a room nobody asked to condition further.
-            if (
-                s.tracking
-                and zone.is_on
-                and zone.head_mode in (MODE_HEAT, MODE_COOL)
-                and now - state.zone_last_cmd.get(zid, 0.0) >= COMMAND_SPACING_S
-            ):
+            if s.tracking and zone.is_on and zone.head_mode in (MODE_HEAT, MODE_COOL):
                 state.zone_track_delta[zid] = TRACK_DELTA_MIN_K
-                commands.append(
-                    _command_with_depth(zid, zone.head_mode, None, "runout", -TRACK_DELTA_MIN_K)
-                )
-                state.zone_last_cmd[zid] = now
+                if _depth_command_due(state, zid, now, zone, -TRACK_DELTA_MIN_K, zone.head_mode):
+                    commands.append(
+                        _command_with_depth(zid, zone.head_mode, None, "runout", -TRACK_DELTA_MIN_K)
+                    )
+                    state.zone_last_cmd[zid] = now
             continue
 
         if desired_on:
@@ -1772,8 +2042,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
             # Tracking depth adaptation (room frame): deepen while the room is
             # not converging toward its target edge, relax once it is inside.
-            # Then pick signed head depth — residual bins may replace chase
-            # with a hysteresis hold when they cover standing load.
+            # Continuum head depth is floored at −this chase (0.5 grid).
             track_delta = None
             depth_k: float | None = None
             if s.tracking and mode in (MODE_HEAT, MODE_COOL):
@@ -1790,44 +2059,77 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 delta = min(max(delta, TRACK_DELTA_MIN_K), TRACK_DELTA_MAX_K)
                 state.zone_track_delta[zid] = delta
                 track_delta = delta
-                depth_k, depth_tag = pick_depth_k(
-                    mode=mode,
-                    temp=zone.temp,
-                    lo=lo,
-                    hi=hi,
-                    standing_load_w=zone.standing_load_w,
-                    n_rooms=zone.n_rooms,
-                    park_residuals=zone.park_residuals,
-                    margin_bins=zone.park_margin_bins,
-                    residual_edge_k=zone.park_residual_edge_k,
-                    track_delta=delta,
-                    park_learning=s.park_learning,
-                )
-                if depth_k > 0.0:
-                    reason = depth_tag
-                    if zid not in state.zone_parked_since:
-                        state.zone_parked_since[zid] = now
-                        state.zone_park_margin[zid] = depth_k
-                        if zone.temp is not None:
-                            state.zone_park_ref[zid] = zone.temp
-                        state.zone_park_preferred.setdefault(zid, _park_preferred(zone, state))
-                        diag.setdefault("depth_residual", []).append(zid)
+                # Continuum depth from prior adapt / residual pick.
+                if zid in state.zone_head_depth_k and zid not in state.zone_parked_since:
+                    # Already stepped into 0/chase via continuum; clamp to live
+                    # chase floor after track adapt above.
+                    floor = _chase_floor_k(state, zid)
+                    ceiling = _hysteresis_ceiling_k(zone, state)
+                    depth_k = _sync_depth_views(
+                        state,
+                        zid,
+                        state.zone_head_depth_k[zid],
+                        now,
+                        lo=floor,
+                        hi=ceiling,
+                    )
+                    if reason == "demand":
+                        reason = "depth_chase" if depth_k < 0.0 else "depth_hold"
+                else:
+                    depth_k, depth_tag = pick_depth_k(
+                        mode=mode,
+                        temp=zone.temp,
+                        lo=lo,
+                        hi=hi,
+                        standing_load_w=zone.standing_load_w,
+                        n_rooms=zone.n_rooms,
+                        park_residuals=zone.park_residuals,
+                        margin_bins=zone.park_margin_bins,
+                        residual_edge_k=zone.park_residual_edge_k,
+                        track_delta=delta,
+                        park_learning=s.park_learning,
+                    )
+                    if depth_k > 0.0:
+                        if reason == "demand":
+                            reason = depth_tag
+                        floor = _chase_floor_k(state, zid)
+                        ceiling = _hysteresis_ceiling_k(zone, state)
+                        depth_k = _sync_depth_views(
+                            state, zid, depth_k, now, lo=floor, hi=ceiling
+                        )
+                        if zid not in state.zone_parked_since:
+                            state.zone_park_preferred.setdefault(zid, _park_preferred(zone, state))
+                            diag.setdefault("depth_residual", []).append(zid)
+                        else:
+                            depth_k = state.zone_head_depth_k.get(
+                                zid, state.zone_park_margin.get(zid, depth_k)
+                            )
                     else:
-                        depth_k = state.zone_park_margin.get(zid, depth_k)
-                elif zid in state.zone_parked_since:
-                    _clear_park_session(state, zid, zone, now)
+                        floor = _chase_floor_k(state, zid)
+                        ceiling = _hysteresis_ceiling_k(zone, state)
+                        depth_k = _sync_depth_views(
+                            state, zid, depth_k, now, lo=floor, hi=ceiling
+                        )
+                        if reason == "demand":
+                            reason = depth_tag
+                        if zid in state.zone_parked_since:
+                            _clear_park_session(state, zid, zone, now)
 
-            last_cmd = state.zone_last_cmd.get(zid, 0.0)
             last_sp = state.zone_last_setpoint.get(zid)
             setpoint_changed = last_sp is None or abs(setpoint - last_sp) >= SETPOINT_EPSILON_K
-            spacing_ok = now - last_cmd >= COMMAND_SPACING_S
-            # Re-anchor to the moving internal reading on every spacing interval.
-            refresh = (
-                (track_delta is not None or (depth_k is not None and depth_k != 0.0))
+            # Re-anchor on spacing, room-setpoint change, or head-internal drift
+            # vs the live device SP (chase and hysteresis share this path).
+            depth_for_anchor = depth_k
+            if depth_for_anchor is None and track_delta is not None:
+                depth_for_anchor = -float(track_delta)
+            has_depth = depth_for_anchor is not None
+            spacing_ok = now - state.zone_last_cmd.get(zid, 0.0) >= COMMAND_SPACING_S
+            depth_due = (
+                has_depth
                 and zone.is_on
-                and spacing_ok
+                and _depth_command_due(state, zid, now, zone, depth_for_anchor, mode)
             )
-            if transitioned or not zone.is_on or (setpoint_changed and spacing_ok) or refresh:
+            if transitioned or not zone.is_on or (setpoint_changed and spacing_ok) or depth_due:
                 if depth_k is not None:
                     commands.append(_command_with_depth(zid, mode, setpoint, reason, depth_k))
                 else:

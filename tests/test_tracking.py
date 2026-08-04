@@ -3,6 +3,7 @@
 from custom_components.adaptive_comfort.core import controller, power
 from custom_components.adaptive_comfort.core.types import (
     MODE_COOL,
+    MODE_HEAT,
     ControllerState,
     HouseSnapshot,
     Settings,
@@ -104,6 +105,55 @@ def test_running_zone_gets_refresh_commands_at_spacing():
     cmd = find_cmd(decision, "z1")
     assert cmd is not None, "tracking must refresh even without a setpoint change"
     assert cmd.track_delta is not None
+
+
+def test_head_anchor_drift_refreshes_before_spacing():
+    """Inflated entry internal→SP must re-anchor when the head sensor collapses."""
+    # Cool chase depth -0.7 → ideal SP = internal - 0.7.
+    # Device still at 26.3 from a 27°C entry; live internal is now 24.
+    zone = make_zone(
+        "z1",
+        26.0,
+        is_on=True,
+        head_internal_temp=24.0,
+        device_setpoint=26.3,
+    )
+    state = warmed_state([zone])
+    state.zone_on["z1"] = True
+    state.zone_track_delta["z1"] = 0.7
+    state.zone_last_setpoint["z1"] = 23.35
+    # Spacing not elapsed, but re-anchor min has.
+    state.zone_last_cmd["z1"] = NOW - controller.HEAD_REANCHOR_MIN_S - 1.0
+    decision = tick([zone], state)
+    cmd = find_cmd(decision, "z1")
+    assert cmd is not None, "head-anchor drift must refresh before COMMAND_SPACING_S"
+    assert cmd.head_depth_k is not None or cmd.track_delta is not None
+
+
+def test_head_anchor_stable_waits_for_spacing():
+    # OOB deepen 0.7→1.2 this tick; device SP already matches the post-adapt depth.
+    zone = make_zone(
+        "z1",
+        26.0,
+        is_on=True,
+        head_internal_temp=24.0,
+        device_setpoint=24.0 - 1.2,
+    )
+    state = warmed_state([zone])
+    state.zone_on["z1"] = True
+    state.zone_track_delta["z1"] = 0.7
+    state.zone_last_setpoint["z1"] = 23.35
+    state.zone_last_cmd["z1"] = NOW - controller.HEAD_REANCHOR_MIN_S - 1.0
+    decision = tick([zone], state)
+    cmd = find_cmd(decision, "z1")
+    assert cmd is None, "aligned head anchor must not spam before COMMAND_SPACING_S"
+
+
+def test_ideal_device_setpoint_signed_depth():
+    assert controller._ideal_device_setpoint(24.0, -0.7, MODE_COOL) == 23.3
+    assert controller._ideal_device_setpoint(24.0, 2.0, MODE_COOL) == 26.0
+    assert controller._ideal_device_setpoint(22.0, -0.5, MODE_HEAT) == 22.5
+    assert controller._ideal_device_setpoint(22.0, 1.5, MODE_HEAT) == 20.5
 
 
 def test_tracking_disabled_yields_no_delta_and_no_refresh():

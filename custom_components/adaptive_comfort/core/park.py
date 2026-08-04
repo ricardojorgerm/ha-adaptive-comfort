@@ -120,19 +120,6 @@ def margin_bin(margin_k: float | None) -> str | None:
     return f"{round(margin_k / MARGIN_BIN_K) * MARGIN_BIN_K:.1f}"
 
 
-def _bin_extraction_w(margin_bins: dict[str, list[float]], margin_k: float) -> float | None:
-    """EWMA extraction for the bin containing margin_k, if well sampled."""
-    b = margin_bin(margin_k)
-    if b is None:
-        return None
-    entry = margin_bins.get(b)
-    if entry is None or entry[2] < CLASSIFY_MIN_SAMPLES:
-        return None
-    if entry[1] < RESIDUAL_HOLD_DUTY_MIN:
-        return None
-    return float(entry[0])
-
-
 def shallowest_covering_margin_k(
     margin_bins: dict[str, list[float]],
     required_w: float,
@@ -189,15 +176,11 @@ def pick_depth_k(
     covering = shallowest_covering_margin_k(bins, required)
     if covering is None:
         return chase, "depth_track"
-    # Prefer residual_edge when that depth itself covers (entry target).
-    if residual_edge_k is not None:
-        edge_ext = _bin_extraction_w(bins, residual_edge_k)
-        if edge_ext is not None and edge_ext >= required:
-            covering = min(max(residual_edge_k, MARGIN_MIN_K), MARGIN_MAX_K)
-        else:
-            covering = min(max(covering, MARGIN_MIN_K), MARGIN_MAX_K)
-    else:
-        covering = min(max(covering, MARGIN_MIN_K), MARGIN_MAX_K)
+    # Shallowest covering bin (COP-friendly). residual_edge remains an entry
+    # hint for want-off probes / preferred learning, not a demand re-pick
+    # floor — forcing the edge blocked stepping down into chase.
+    _ = residual_edge_k
+    covering = min(max(covering, MARGIN_MIN_K), MARGIN_MAX_K)
     return covering, "depth_residual"
 
 

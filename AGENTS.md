@@ -44,9 +44,12 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
 - **Two coordinate frames for setpoints.** The controller thinks in *room frame* (external
   sensor). Heads regulate on their *internal* sensor, which reads ~3 K low while cooling
   (supply-air contamination). Translation between frames happens **only** in
-  `coordinator.py` command execution — either dynamically (tracking control: command
-  `internal − delta`, re-anchored every `COMMAND_SPACING_S`) or statically via
-  `DriftEstimator.offset(state)` as fallback. Never translate anywhere else.
+  `coordinator.py` command execution — either dynamically (signed head depth:
+  cool `internal + depth`, heat `internal − depth`; negative = chase track,
+  positive = hysteresis park) re-anchored every `COMMAND_SPACING_S` **or**
+  sooner when `|device_SP − ideal| ≥ HEAD_REANCHOR_EPS_K` after
+  `HEAD_REANCHOR_MIN_S` — or statically via `DriftEstimator.offset(state)` as
+  fallback. Never translate anywhere else.
 - **`sensible_power_w` is signed**: negative while cooling. It is
   `c_eff · (dT/dt − free_float_rate)` — same rates `predict_free` integrates —
   so standing load / COP / park extraction agree with the temperature model.
@@ -74,19 +77,20 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   wire all four places: dataclass, `to_dict`, `from_dict`, and the `_persist` settings dict
   (+ restore key list) — and the switch/number entity if user-facing.
 
-- **Head depth is signed; parking is the positive half.** Cool device setpoint is
-  `internal + head_depth_k` (heat: `internal − depth`). Negative depth is chase
-  tracking (`track_delta`); positive depth is hysteresis residual hold (legacy
-  park margin). `park.pick_depth_k` chooses: pull-down / far-edge → chase; when
-  residual `margin_bins` cover `standing_load_w / n_rooms`, demand/helper may
-  hold positive depth (`depth_residual`) without leaving want=demand — small-house
-  field COPs often beat deep tracking. Want-off park / run-out still use the same
-  table (bounded probes while unclassified, exploit when residual covers load).
-  Park entry requires in-band keep-temp (`_park_ok_now`); unfinished pull-down
-  stays on track. Session margin escalates/settles as before; devices are measured,
-  never assumed. Shed zones never park. Overcorrection release sits
-  `PARK_OVERCOOL_BUFFER_K` below the floor (cool). Probe budget charged at release
-  only when the probe produced observations; stillborn → `PARK_PROBE_RETRY_S`.
+- **Head depth is a signed 0.5 K continuum.** Cool device setpoint is
+  `internal + head_depth_k` (heat: `internal − depth`). Positive = hysteresis
+  residual hold; `0` = SP at live internal; negative = chase
+  (`track_delta = −depth`). Under-conditioning steps `+2 → … → 0 → −chase`,
+  floored at the **live tracking chase on the 0.5 grid** (not unbounded to
+  `−TRACK_DELTA_MAX`). Over-conditioning raises only up to the deepest
+  **still COP/residual-useful** depth (`park_residual_max_margin_k` / edge;
+  `DEPTH_MAX` while unmapped). If extraction is ~none at the current depth,
+  step down only when a shallower depth can restore useful in-band work;
+  otherwise off (future overcooling). Coil-wet fan-type and weak residual
+  cover step depth down rather than hard soft-release. `pick_depth_k` still
+  chooses shallowest covering residual bin when in-band. Shed zones never
+  park. Overcorrection release sits `PARK_OVERCOOL_BUFFER_K` below the floor
+  (cool).
 - **Run-out is the free probe window (when in-band).** A zone wanting off while `min_on`
   forces it to run is parked immediately if already in-band — no sibling requirement, no
   probe budget — because the compressor is alive regardless: observations are free, and an

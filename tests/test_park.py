@@ -162,8 +162,8 @@ def test_pick_depth_residual_when_bins_cover():
         residual_edge_k=3.0,
         track_delta=0.7,
     )
-    # Edge bin covers → prefer residual_edge.
-    assert depth == 3.0 and tag == "depth_residual"
+    # Shallowest covering bin — not residual_edge (soft-deprecate).
+    assert depth == 1.5 and tag == "depth_residual"
 
 
 def test_pick_depth_shallowest_when_edge_does_not_cover():
@@ -249,6 +249,156 @@ def test_demand_uses_residual_depth_without_want_off():
     assert cmd.head_depth_k == 2.0
     assert cmd.reason == "depth_residual"
     assert "z1" in state.zone_parked_since
+
+
+def test_undercond_steps_down_toward_park_margin_floor():
+    """Under-conditioning lowers positive margin; residual_edge must not floor it."""
+    bins = _residual_bins(**{"1.0": 80.0, "2.0": 200.0, "3.0": 280.0})
+    zone = replace(
+        make_zone(
+            "z1",
+            23.3,
+            is_on=True,
+            park_residuals=True,
+            park_extraction_w=200.0,
+            park_residual_edge_k=3.0,
+            park_margin_bins=bins,
+            standing_load_w=100.0,
+        ),
+        free_float=tuple([24.5] * 24),
+    )
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        target=23.0,
+        adaptive_blend=0.0,
+        band_k=1.0,
+        tracking=True,
+        park_learning=True,
+        multisplit=True,
+    )
+    state = warmed_state([zone])
+    state.zone_on["z1"] = True
+    tick([zone], state, settings=settings)
+    state.zone_park_margin["z1"] = 2.5
+    state.zone_head_depth_k["z1"] = 2.5
+    state.zone_park_ref["z1"] = 23.3
+    state.zone_parked_since["z1"] = NOW
+    state.zone_last_cmd["z1"] = NOW
+    warmer = replace(zone, temp=23.3 + 0.2)  # load-side move
+    later = NOW + 60.0
+    tick([warmer], state, now=later, settings=settings)
+    assert state.zone_head_depth_k["z1"] == 2.0  # stepped down past residual_edge floor
+    assert state.zone_park_margin["z1"] == 2.0
+
+
+def test_undercond_steps_through_zero_into_chase_floor():
+    """Under-conditioning walks +1.0 → +0.5 → 0 → −track (chase floor), no force_chase cliff."""
+    bins = _residual_bins(**{"1.0": 80.0, "2.0": 200.0})
+    zone = replace(
+        make_zone(
+            "z1",
+            23.3,
+            is_on=True,
+            park_residuals=True,
+            park_extraction_w=200.0,
+            park_residual_edge_k=2.0,
+            park_margin_bins=bins,
+            standing_load_w=100.0,
+        ),
+        free_float=tuple([24.5] * 24),
+    )
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        target=23.0,
+        adaptive_blend=0.0,
+        band_k=1.0,
+        tracking=True,
+        park_learning=True,
+        multisplit=True,
+    )
+    state = warmed_state([zone])
+    state.zone_on["z1"] = True
+    tick([zone], state, settings=settings)
+    state.zone_park_margin["z1"] = controller.PARK_MARGIN_K
+    state.zone_head_depth_k["z1"] = controller.PARK_MARGIN_K
+    state.zone_park_ref["z1"] = 23.3
+    state.zone_parked_since["z1"] = NOW
+    state.zone_last_cmd["z1"] = NOW
+    state.zone_track_delta["z1"] = controller.TRACK_DELTA_DEFAULT_K
+    t = 23.3
+    depth = controller.PARK_MARGIN_K
+    for i in range(4):
+        t += 0.2
+        later = NOW + (i + 1) * (controller.HEAD_REANCHOR_MIN_S + 1.0)
+        warmer = replace(zone, temp=t)
+        state.zone_park_ref["z1"] = t - 0.2
+        d = tick([warmer], state, now=later, settings=settings)
+        depth = state.zone_head_depth_k.get("z1", depth)
+        if depth > 0.0:
+            assert "z1" in state.zone_parked_since
+            cmd = find_cmd(d, "z1")
+            assert cmd is not None
+            assert cmd.head_depth_k == depth
+        else:
+            # Reached 0 or chase floor (−0.5 default track).
+            assert depth <= 0.0
+            assert depth >= -controller.TRACK_DELTA_DEFAULT_K - 1e-9
+            break
+    else:
+        raise AssertionError("expected continuum to leave positive hysteresis")
+    assert state.zone_force_chase_until.get("z1", 0) == 0
+
+
+def test_overcond_ceiling_is_residual_max_not_depth_max():
+    """Over-conditioning raises only up to residual_max (COP-useful), not +3."""
+    bins = _residual_bins(**{"1.0": 80.0, "2.0": 200.0})
+    zone = replace(
+        make_zone(
+            "z1",
+            23.3,
+            is_on=True,
+            park_residuals=True,
+            park_extraction_w=200.0,
+            park_residual_edge_k=2.0,
+            park_residual_max_margin_k=2.0,
+            park_margin_bins=bins,
+            standing_load_w=100.0,
+        ),
+        free_float=tuple([24.5] * 24),
+    )
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        target=23.0,
+        adaptive_blend=0.0,
+        band_k=1.0,
+        tracking=True,
+        park_learning=True,
+        multisplit=True,
+    )
+    state = warmed_state([zone])
+    state.zone_on["z1"] = True
+    tick([zone], state, settings=settings)
+    state.zone_park_margin["z1"] = 1.5
+    state.zone_head_depth_k["z1"] = 1.5
+    state.zone_park_ref["z1"] = 23.5
+    state.zone_parked_since["z1"] = NOW
+    state.zone_last_cmd["z1"] = NOW
+    # Room falling (over-hold for cool).
+    cooler = replace(zone, temp=23.5 - 0.2)
+    later = NOW + controller.HEAD_REANCHOR_MIN_S + 1.0
+    tick([cooler], state, now=later, settings=settings)
+    assert state.zone_head_depth_k["z1"] == 2.0
+    # Another over-hold must not climb past residual_max to DEPTH_MAX.
+    state.zone_park_ref["z1"] = 23.3
+    cooler2 = replace(zone, temp=23.3 - 0.2)
+    tick(
+        [cooler2],
+        state,
+        now=later + controller.HEAD_REANCHOR_MIN_S + 1.0,
+        settings=settings,
+    )
+    assert state.zone_head_depth_k["z1"] == 2.0
+    assert state.zone_head_depth_k["z1"] < controller.DEPTH_MAX_K
 
 
 def test_demand_pull_down_stays_on_track_delta():
@@ -520,12 +670,40 @@ def test_margin_change_refreshes_immediately():
     assert cmd.park_margin == controller.PARK_MARGIN_K + controller.PARK_MARGIN_STEP_K
 
 
-def test_margin_exhaustion_idles_head():
+def test_park_head_anchor_drift_refreshes_before_spacing():
+    """Park SP must follow a collapsing head internal (27→24) within one tick min."""
     satisfied, hot, state = _two_zone_setup(
         park_residuals=True, park_extraction_w=200.0, standing_load_w=100.0
     )
     tick([satisfied, hot], state)
-    state.zone_park_margin["sat"] = controller.PARK_MARGIN_MAX_K  # already maxed
+    margin = state.zone_park_margin["sat"]
+    # Entry commanded SP≈29 at internal 27; head has since fallen to 24.
+    drifted = make_zone(
+        "sat",
+        23.0,
+        is_on=True,
+        park_residuals=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+        head_internal_temp=24.0,
+        device_setpoint=27.0 + margin,
+    )
+    later = NOW + controller.HEAD_REANCHOR_MIN_S + 1.0
+    state.zone_last_cmd["sat"] = NOW  # well inside COMMAND_SPACING_S
+    decision = tick([drifted, hot], state, now=later)
+    cmd = find_cmd(decision, "sat")
+    assert cmd is not None and cmd.park is True
+    assert cmd.park_margin == margin
+
+
+def test_margin_exhaustion_holds_at_ceiling():
+    """At DEPTH_MAX / COP ceiling, over-hold stays keep-temp (no soft-idle)."""
+    satisfied, hot, state = _two_zone_setup(
+        park_residuals=True, park_extraction_w=200.0, standing_load_w=100.0
+    )
+    tick([satisfied, hot], state)
+    state.zone_park_margin["sat"] = controller.DEPTH_MAX_K
+    state.zone_head_depth_k["sat"] = controller.DEPTH_MAX_K
     state.zone_park_ref["sat"] = 23.0
     cooler = make_zone(
         "sat",
@@ -536,7 +714,8 @@ def test_margin_exhaustion_idles_head():
         standing_load_w=100.0,
     )
     tick([cooler, hot], state, now=NOW + 60.0)
-    assert "sat" not in state.zone_parked_since  # idled due to overcorrection
+    assert "sat" in state.zone_parked_since
+    assert state.zone_head_depth_k["sat"] == controller.DEPTH_MAX_K
 
 
 def test_margin_relaxes_when_room_drifts_back():
@@ -545,6 +724,7 @@ def test_margin_relaxes_when_room_drifts_back():
     )
     tick([satisfied, hot], state)
     state.zone_park_margin["sat"] = 2.0
+    state.zone_head_depth_k["sat"] = 2.0
     state.zone_park_ref["sat"] = 23.0
     warmer = make_zone(
         "sat",
@@ -556,6 +736,7 @@ def test_margin_relaxes_when_room_drifts_back():
     )
     tick([warmer, hot], state, now=NOW + 60.0)
     assert state.zone_park_margin["sat"] == 1.5
+    assert state.zone_head_depth_k["sat"] == 1.5
 
 
 def test_heating_park_entry_and_far_edge_release():
@@ -970,21 +1151,28 @@ def test_park_entry_ignores_fan_margin_without_residual_hold():
     assert controller._park_entry_margin(zone, state) == 2.0 - controller.PARK_ENTRY_UNDERSHOOT_K
 
 
-def test_fan_type_park_released_within_coil_dry():
-    """A live fan-type park session inside the coil-dry window prefers a
-    true off, reusing fan_assist's wet-coil policy instead of holding a
-    park that blows air over a wet coil for no compressor output."""
+def test_fan_type_park_steps_down_within_coil_dry():
+    """Fan-type + wet coil: step depth down (continuum), not an immediate off."""
     satisfied, hot, state = _two_zone_setup()
     tick([satisfied, hot], state)  # probe park entered at NOW
     assert "sat" in state.zone_parked_since
+    assert state.zone_head_depth_k.get("sat", state.zone_park_margin["sat"]) >= 1.0
     soon = NOW + 120.0  # well inside dwell/probe window
     state.zone_last_cool["sat"] = soon - 60.0  # cooled recently -> coil wet
     state.zone_last_cmd["sat"] = soon - 3600.0
     fan_type_zone = make_zone("sat", 23.0, is_on=True, park_current_is_fan_type=True)
     decision = tick([fan_type_zone, hot], state, now=soon)
-    assert "sat" not in state.zone_parked_since
-    cmd = find_cmd(decision, "sat")
-    assert cmd is None or cmd.park is False
+    assert "sat" in (decision.diag.get("park_coil_wet_step") or [])
+    # One step from entry (≥1.0): still parked at a shallower positive depth,
+    # or released once depth left positive hysteresis.
+    depth = state.zone_head_depth_k.get("sat")
+    if "sat" in state.zone_parked_since:
+        assert depth is not None and depth < controller.PARK_MARGIN_K + 1e-9
+        cmd = find_cmd(decision, "sat")
+        assert cmd is not None and cmd.park is True
+    else:
+        cmd = find_cmd(decision, "sat")
+        assert cmd is None or cmd.park is False
 
 
 def test_residual_live_session_ignores_coil_dry():
@@ -1032,9 +1220,8 @@ def test_settle_does_not_blend_toward_overshoot_margin():
     assert state.zone_park_preferred["sat"] == 2.0  # unchanged, not blended down
 
 
-def test_relax_bounded_by_learned_residual_edge():
-    """Relaxing on warming must not walk the margin down past the learned
-    residual-hold edge into full-conditioning depths."""
+def test_want_off_undercond_steps_down_past_residual_edge():
+    """Soft-deprecate: under-cond step-down floors at PARK_MARGIN_K, not residual_edge."""
     satisfied, hot, state = _two_zone_setup(
         park_residuals=True,
         park_extraction_w=200.0,
@@ -1053,9 +1240,7 @@ def test_relax_bounded_by_learned_residual_edge():
         park_residual_edge_k=2.0,
     )
     tick([warmer, hot], state, now=NOW + 60.0)
-    # Would relax to 1.5 (2.0 - PARK_MARGIN_STEP_K) without the bound; the
-    # learned residual edge holds it at 2.0 instead.
-    assert state.zone_park_margin["sat"] == 2.0
+    assert state.zone_park_margin["sat"] == 2.0 - controller.PARK_MARGIN_STEP_K
 
 
 def test_power_debounce_ignores_brief_crossings():
