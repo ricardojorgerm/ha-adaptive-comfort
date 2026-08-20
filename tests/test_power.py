@@ -4,10 +4,19 @@ from custom_components.adaptive_comfort.core import power
 def test_compose_load_with_battery_discharge():
     # Grid shows 200 W but battery supplies 800 W: real load is 1000 W.
     assert power.compose_load(200.0, 800.0, True) == 1000.0
-    # Charging battery does not reduce the measured load.
-    assert power.compose_load(1200.0, -500.0, True) == 1200.0
-    # Inverted sign convention.
+    # Charging subtracts — it is not AC.
+    assert power.compose_load(1200.0, -500.0, True) == 700.0
+    # Inverted sign convention (positive = charging): discharge is -p_battery.
     assert power.compose_load(200.0, -800.0, False) == 1000.0
+    assert power.compose_load(1050.0, 800.0, False) == 250.0
+
+
+def test_compose_load_battery_also_in_known_loads_double_subtracts():
+    """Footgun: the battery entity must not also be a known-load entity."""
+    once = power.compose_load(1050.0, 800.0, False)
+    twice = power.compose_load(1050.0, 800.0, False, [800.0])
+    assert once == 250.0
+    assert twice == 0.0
 
 
 def test_compose_load_subtracts_known_loads():
@@ -69,3 +78,35 @@ def test_contracted_demand_uses_known_loads_when_meter_lags():
     )
     assert demand == 2900.0
     assert demand >= 2850.0
+
+
+def test_contracted_demand_discharge_follows_import():
+    """Discharge must not inflate the lag term; restore stays on honest demand."""
+    demand = power.contracted_demand_w(
+        p_grid=200.0,
+        known_loads=[100.0],
+        active_ac_w=250.0,
+        p_grid_peak=200.0,
+        discharge_w=800.0,
+    )
+    assert demand == 200.0
+    assert power.restore_allowed(demand, 3450.0, 0.75, 1000.0)
+
+
+def test_contracted_demand_charge_counts_on_grid():
+    demand = power.contracted_demand_w(
+        p_grid=1050.0,
+        known_loads=[],
+        active_ac_w=250.0,
+        discharge_w=-800.0,
+    )
+    assert demand == 1050.0
+
+
+def test_baseline_schema_wipes_charge_inclusive_slots():
+    dirty = power.BaselineModel()
+    dirty.update(23.5, 900.0)
+    wiped = power.BaselineModel.from_dict({"slots": list(dirty.slots)})
+    assert wiped.value(23.5, fallback=False) is None
+    kept = power.BaselineModel.from_dict(dirty.to_dict())
+    assert kept.value(23.5, fallback=False) == dirty.value(23.5, fallback=False)

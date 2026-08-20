@@ -78,7 +78,9 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
 - **Persistence**: everything that must survive a restart goes through `coordinator._persist()`
   / restore and the `to_dict`/`from_dict` pairs. If you add controller state or a setting,
   wire all four places: dataclass, `to_dict`, `from_dict`, and the `_persist` settings dict
-  (+ restore key list) — and the switch/number entity if user-facing.
+  (+ restore key list) — and the switch/number entity if user-facing. Baseline slots carry
+  `schema` (2 = signed `compose_load`); older dumps wipe rather than subtract charge from a
+  charge-inflated night median.
 
 - **Head depth is a signed 0.5 K continuum.** Cool device setpoint is
   `internal + head_depth_k` (heat: `internal − depth`). Positive = hysteresis
@@ -113,7 +115,13 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   through entire parks while the electrical record is bimodal (fan-only <60 W vs real
   compression >300 W) — the device cycles via an internal hysteresis around its own sensor.
   House `p_ac` is the electrical residual (`p_load − baseline`), never forced to 0 because
-  `hvac_action` reports idle. Baseline *learning* stays gated on device quiet
+  `hvac_action` reports idle. **Charging is the battery branch of `compose_load`**, not a
+  known-load entity (listing it there double-subtracts). Discharge is added so AC-on-battery
+  stays in `p_load`; charge is subtracted. Shed demand is
+  `max(p_grid, 120s peak, max(0, known + residual_p_ac − discharge))` — not
+  `max(learned, p_ac)`. Restore uses that same `p_demand`. Night baseline slots learned
+  under charge-inclusive `p_load` are wiped on restore (`BaselineModel` schema 2).
+  Baseline *learning* stays gated on device quiet
   (`_all_off_since`, including fan-only as busy). Park gating / StartCounter prefer a
   *learned* baseline slot (`fallback=False`) so cross-slot medians do not invent phantom AC.
   Parked observations are power-gated (`park.gate_observation`); extraction uses

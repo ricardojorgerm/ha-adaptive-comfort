@@ -255,6 +255,7 @@ class AdaptiveComfortRuntime:
         self.p_load: float | None = None
         self.p_ac: float | None = None
         self.p_demand: float | None = None
+        self.p_discharge: float = 0.0
         self.known_load_total: float = 0.0
         self.shed_urgent: bool = False
         self._prev_known_total: float | None = None
@@ -456,27 +457,28 @@ class AdaptiveComfortRuntime:
         entities: list[str] = []
         if grid := data.get(CONF_GRID_POWER):
             entities.append(grid)
+        if batt := data.get(CONF_BATTERY_POWER):
+            entities.append(batt)
         entities.extend(data.get(CONF_KNOWN_LOADS, []))
         return entities
 
     def _known_load_readings(self) -> list[float]:
+        batt = self.entry.data.get(CONF_BATTERY_POWER)
         return [
             v
             for eid in self.entry.data.get(CONF_KNOWN_LOADS, [])
-            if (v := _float_state(self.hass, eid)) is not None
+            if eid != batt and (v := _float_state(self.hass, eid)) is not None
         ]
 
     def _finalize_demand(self, now_ts: float) -> None:
-        """Conservative contracted demand for shedding (handles meter lag)."""
+        """Contracted demand: max(p_grid, 120s peak, known + p_ac - discharge)."""
         known = self._known_load_readings()
         self.known_load_total = sum(known)
-        active = [z for z in self.zones.values() if z.is_on]
-        mode = MODE_HEAT if any(z.head_state == STATE_HEATING for z in active) else MODE_COOL
-        draws = [self.draws.draw_w(z.config.zone_id, mode) for z in active]
-        # Empty active + house residual must not count as "active AC draw".
-        ac_w = power.estimated_active_ac_draw_w(draws, self.p_ac if active else None)
+        # Residual p_ac only — not max(learned, p_ac). Heads off → no AC term.
+        active = any(z.is_on for z in self.zones.values())
+        ac_w = self.p_ac if active and self.p_ac is not None else 0.0
         peak = self.p_grid_series.max_window(now_ts - power.SHED_PEAK_WINDOW_S, now_ts)
-        self.p_demand = power.contracted_demand_w(self.p_grid, known, ac_w, peak)
+        self.p_demand = power.contracted_demand_w(self.p_grid, known, ac_w, peak, self.p_discharge)
 
         if (
             self._prev_known_total is not None
@@ -490,7 +492,7 @@ class AdaptiveComfortRuntime:
             if self.grid_over_since is None:
                 self.grid_over_since = now_ts
         elif self.p_demand is None or self.p_demand <= threshold:
-            peak_demand = power.contracted_demand_w(None, known, ac_w, peak)
+            peak_demand = power.contracted_demand_w(None, known, ac_w, peak, self.p_discharge)
             if peak_demand is None or peak_demand <= threshold:
                 self.grid_over_since = None
 
@@ -945,6 +947,9 @@ class AdaptiveComfortRuntime:
         data = self.entry.data
         self.p_grid = _float_state(self.hass, data.get(CONF_GRID_POWER))
         battery = _float_state(self.hass, data.get(CONF_BATTERY_POWER))
+        self.p_discharge = power.battery_discharge_w(
+            battery, data.get(CONF_BATTERY_POSITIVE_DISCHARGING, True)
+        )
         known = self._known_load_readings()
         if self.p_grid is not None:
             self.p_grid_series.append(now_ts, self.p_grid)

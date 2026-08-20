@@ -3,7 +3,9 @@
 The house only has a meter-side (grid) power sensor. The AC draw is
 inferred by combining a time-of-day baseline (learned while all heads
 are off) with robust step deltas measured when heads switch. An optional
-battery sensor lets consumption exceed the grid reading while discharging.
+battery sensor is signed: discharge adds to house load (AC on battery
+stays visible); charge subtracts (charging is not AC). Do not also list
+the battery entity as a known load — that double-subtracts.
 """
 
 from __future__ import annotations
@@ -271,20 +273,39 @@ def zone_depth_is_park(depth_k: float | None, *, parked_fallback: bool = False) 
     return parked_fallback
 
 
+def battery_discharge_w(
+    p_battery: float | None,
+    battery_positive_discharging: bool = True,
+) -> float:
+    """Signed battery contribution: positive = discharging, negative = charging."""
+    if p_battery is None:
+        return 0.0
+    return p_battery if battery_positive_discharging else -p_battery
+
+
 def compose_load(
     p_grid: float,
     p_battery: float | None = None,
     battery_positive_discharging: bool = True,
     known_loads: list[float] | None = None,
 ) -> float:
-    """Total house load attributable to unmonitored devices (incl. the AC)."""
+    """Total house load attributable to unmonitored devices (incl. the AC).
+
+    Discharge (positive) is added so AC-on-battery remains in ``p_load``.
+    Charge (negative discharge) is subtracted — charging is not AC. The
+    battery entity must not also appear in ``known_loads``.
+    """
     load = p_grid
     if p_battery is not None:
-        discharge = p_battery if battery_positive_discharging else -p_battery
-        load += max(0.0, discharge)
+        load += battery_discharge_w(p_battery, battery_positive_discharging)
     for p in known_loads or []:
         load -= p
     return max(0.0, load)
+
+
+# Slots learned under charge-inclusive p_load (schema < 2) are not reusable:
+# p_ac = clean_load - dirty_baseline -> 0 until EWMA forgets.
+BASELINE_SCHEMA = 2
 
 
 class BaselineModel:
@@ -334,11 +355,13 @@ class BaselineModel:
         }
 
     def to_dict(self) -> dict:
-        return {"slots": list(self.slots)}
+        return {"slots": list(self.slots), "schema": BASELINE_SCHEMA}
 
     @classmethod
     def from_dict(cls, data: dict) -> BaselineModel:
         model = cls()
+        if int(data.get("schema", 0)) < BASELINE_SCHEMA:
+            return model
         slots = data.get("slots") or []
         if len(slots) == BASELINE_SLOTS:
             model.slots = [None if s is None else float(s) for s in slots]
@@ -463,12 +486,13 @@ def contracted_demand_w(
     known_loads: list[float] | None = None,
     active_ac_w: float = 0.0,
     p_grid_peak: float | None = None,
+    discharge_w: float = 0.0,
 ) -> float | None:
     """Best-effort whole-house demand for shedding (max of meter and parts sum).
 
-    When the grid sensor lags (common with energy-style meters), a large known
-    load such as an oven plus running AC can exceed the contract limit even
-    though the latest grid sample still looks low.
+    Third term is ``max(0, known + residual_p_ac - discharge)`` so battery
+    discharge does not trip the import limiter, while charging still counts
+    via ``p_grid``. Do not pass ``max(learned, p_ac)`` as ``active_ac_w``.
     """
     parts: list[float] = []
     if p_grid is not None:
@@ -476,8 +500,9 @@ def contracted_demand_w(
     if p_grid_peak is not None:
         parts.append(p_grid_peak)
     known_sum = sum(known_loads or [])
-    if known_sum > 0.0 or active_ac_w > 0.0:
-        parts.append(known_sum + active_ac_w)
+    lag = max(0.0, known_sum + active_ac_w - discharge_w)
+    if lag > 0.0 or known_sum > 0.0 or active_ac_w > 0.0:
+        parts.append(lag)
     return max(parts) if parts else None
 
 
@@ -502,16 +527,19 @@ def shed_needed(
 
 
 def restore_allowed(
-    p_grid: float | None,
+    p_demand: float | None,
     limit_w: float,
     restore_pct: float,
     zone_draw_w: float | None,
     margin_w: float = 100.0,
 ) -> bool:
-    """True when there is headroom to restore a zone with the given draw."""
-    if p_grid is None:
+    """True when there is headroom to restore a zone with the given draw.
+
+    ``p_demand`` is contracted demand (same quantity as shed), not raw import.
+    """
+    if p_demand is None:
         return False
-    if p_grid >= restore_pct * limit_w:
+    if p_demand >= restore_pct * limit_w:
         return False
     draw = zone_draw_w if zone_draw_w is not None else 800.0  # conservative default
-    return (limit_w - p_grid) > (draw + margin_w)
+    return (limit_w - p_demand) > (draw + margin_w)
