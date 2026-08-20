@@ -200,6 +200,15 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   vacant helpers/fan-assist, and unoccupied weight in mode integrals; off treats
   zone occupancy as unknown (`effective_zone_occupied` → `None`) for those paths
   while sensors still update for diagnostics.
+  **Quiet night** (`zone_quiet_night`, per zone, default off): 22:00–08:00,
+  heat or cool. This zone is not selected as helper / fan-assist / preferred
+  anchor. Out-of-band demand still uses the same comfort band as other rooms.
+  In-band standing load may be carried by another zone (vacant cover allowed).
+  Two hours before night (`QUIET_NIGHT_BANK_H`), this zone may run to the
+  **conditioning hold edge** of that band (cool: `lo + BAND_HOLD_MARGIN_K`;
+  heat: `hi − BAND_HOLD_MARGIN_K`) so mix can hold overnight. Boost
+  center-seeks and skips quiet-night. Mirrored heads all defer — no office-only
+  command.
 
 ## Control-loop cheatsheet (what happens each 60 s tick)
 

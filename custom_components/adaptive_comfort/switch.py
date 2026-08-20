@@ -119,7 +119,11 @@ async def async_setup_entry(
     )
     for zone in runtime.zones.values():
         async_add_entities(
-            [ZoneEnabledSwitch(runtime, zone)], config_subentry_id=zone.config.zone_id
+            [
+                ZoneEnabledSwitch(runtime, zone),
+                ZoneQuietNightSwitch(runtime, zone),
+            ],
+            config_subentry_id=zone.config.zone_id,
         )
 
 
@@ -189,5 +193,33 @@ class ZoneEnabledSwitch(AdaptiveComfortZoneEntity, SwitchEntity):
 
     async def async_turn_off(self, **kwargs: Any) -> None:
         self.runtime.settings.zone_enabled[self.zone.config.zone_id] = False
+        self.runtime.request_save()
+        self.runtime.notify()
+
+
+class ZoneQuietNightSwitch(AdaptiveComfortZoneEntity, SwitchEntity):
+    """Prefer other zones at night so this room's heads stay off (dryness / snoring).
+
+    Two hours before night the zone may still run, banking to the
+    conditioning hold edge of the existing band.
+    """
+
+    _attr_translation_key = "zone_quiet_night"
+    _attr_entity_category = EntityCategory.CONFIG
+
+    def __init__(self, runtime: AdaptiveComfortRuntime, zone) -> None:
+        super().__init__(runtime, zone, "quiet_night")
+
+    @property
+    def is_on(self) -> bool:
+        return bool(self.runtime.settings.zone_quiet_night.get(self.zone.config.zone_id, False))
+
+    async def async_turn_on(self, **kwargs: Any) -> None:
+        self.runtime.settings.zone_quiet_night[self.zone.config.zone_id] = True
+        self.runtime.request_save()
+        self.runtime.notify()
+
+    async def async_turn_off(self, **kwargs: Any) -> None:
+        self.runtime.settings.zone_quiet_night[self.zone.config.zone_id] = False
         self.runtime.request_save()
         self.runtime.notify()

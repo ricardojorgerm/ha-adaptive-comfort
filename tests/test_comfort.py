@@ -116,6 +116,35 @@ def test_demand_setpoint_band_hold_when_away():
     )
 
 
+def test_demand_setpoint_condition_hold_uses_conditioning_edge():
+    from custom_components.adaptive_comfort.core.types import PRESET_BOOST, PRESET_NONE
+
+    assert (
+        abs(
+            comfort.demand_setpoint(
+                MODE_COOL, 22.5, 21.8, 23.2, True, PRESET_NONE, condition_hold=True
+            )
+            - (21.8 + comfort.BAND_HOLD_MARGIN_K)
+        )
+        < 1e-9
+    )
+    assert (
+        abs(
+            comfort.demand_setpoint(
+                MODE_HEAT, 22.5, 21.8, 23.2, True, PRESET_NONE, condition_hold=True
+            )
+            - (23.2 - comfort.BAND_HOLD_MARGIN_K)
+        )
+        < 1e-9
+    )
+    assert (
+        comfort.demand_setpoint(
+            MODE_COOL, 22.5, 21.8, 23.2, True, PRESET_BOOST, condition_hold=True
+        )
+        == 22.5
+    )
+
+
 def test_running_mean_seed_and_update():
     t_rm = comfort.update_running_mean(None, 20.0, 1.0)
     assert t_rm == 20.0

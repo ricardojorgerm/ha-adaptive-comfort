@@ -158,6 +158,11 @@ class Settings:
     preset: str = PRESET_NONE
     zone_offsets: dict[str, float] = field(default_factory=dict)
     zone_enabled: dict[str, bool] = field(default_factory=dict)
+    # Per-zone: at night (heat or cool), prefer other zones so this room's
+    # heads stay off (dryness / snoring). Out-of-band still uses the normal
+    # comfort band. Two hours before night, bank this zone to the
+    # conditioning hold edge (cool lo / heat hi). Mirrored heads defer together.
+    zone_quiet_night: dict[str, bool] = field(default_factory=dict)
 
     @property
     def limit_w(self) -> float:

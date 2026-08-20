@@ -23,6 +23,7 @@ from .types import (
     ControllerState,
     Decision,
     HouseSnapshot,
+    Settings,
     ZoneSnapshot,
 )
 
@@ -83,6 +84,9 @@ NIGHT_START_H = 22.0
 NIGHT_END_H = 8.0
 NIGHT_VENT_MARGIN_K = 0.0  # at night, outdoor at/below coolest target is enough
 NIGHT_SKIP_CONT_K = 2.0  # outdoor within this of coolest → prefer cycling over continuous
+# Pre-sleep window: bank a quiet-night zone to the conditioning hold edge
+# of the existing band (cool lo / heat hi), then night prefers other zones.
+QUIET_NIGHT_BANK_H = 2.0
 # COP-timed efficiency band (center fixed; half grows). Field cool priors
 # (Jul 29/30): mild ~2.4 / warm ~1.6 / hot ~1.1. Heat uses learned table only.
 COP_TIMING_LOOKAHEAD_H = 6
@@ -97,6 +101,118 @@ _BAND_RANK = {"mild": 0, "warm": 1, "hot": 2}
 
 def _is_night(local_hour: float) -> bool:
     return local_hour >= NIGHT_START_H or local_hour < NIGHT_END_H
+
+
+def _is_quiet_night_bank_hour(local_hour: float) -> bool:
+    start = NIGHT_START_H - QUIET_NIGHT_BANK_H
+    return start <= local_hour < NIGHT_START_H
+
+
+def _quiet_night_opted(s: Settings, zid: str) -> bool:
+    return bool(s.zone_quiet_night.get(zid)) and s.preset != PRESET_BOOST
+
+
+def _quiet_night_active(s: Settings, zid: str, local_hour: float, mode: str) -> bool:
+    """Night deferral for zones that should not blow on sleepers."""
+    return mode in (MODE_HEAT, MODE_COOL) and _is_night(local_hour) and _quiet_night_opted(s, zid)
+
+
+def _quiet_night_bank_active(s: Settings, zid: str, local_hour: float, mode: str) -> bool:
+    """Pre-sleep: this zone may run to bank the conditioning hold edge."""
+    return (
+        mode in (MODE_HEAT, MODE_COOL)
+        and _is_quiet_night_bank_hour(local_hour)
+        and _quiet_night_opted(s, zid)
+    )
+
+
+def _quiet_night_condition_hold(s: Settings, zid: str, local_hour: float, mode: str) -> bool:
+    """Demand setpoint uses the conditioning hold edge (same band)."""
+    return _quiet_night_active(s, zid, local_hour, mode) or _quiet_night_bank_active(
+        s, zid, local_hour, mode
+    )
+
+
+def _quiet_night_bank_needed(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> bool:
+    if zone.temp is None or _reached_far_edge(zone, lo, hi, mode):
+        return False
+    target = comfort.hold_edge_setpoint(mode, lo, hi, conditioning=True)
+    if mode == MODE_COOL:
+        return zone.temp > target
+    if mode == MODE_HEAT:
+        return zone.temp < target
+    return False
+
+
+def _quiet_night_cover(
+    zones: list[ZoneSnapshot],
+    quiet_ids: set[str],
+    bands: dict[str, tuple[float, float]],
+    mode: str,
+) -> ZoneSnapshot | None:
+    """One non-quiet zone that can carry standing load instead of the sleep room."""
+    cands = [
+        z
+        for z in zones
+        if z.zone_id not in quiet_ids
+        and z.temp is not None
+        and not _reached_far_edge(z, *bands[z.zone_id], mode)
+    ]
+    if not cands:
+        return None
+    return max(cands, key=lambda z: (z.is_on, z.temp or 0.0))
+
+
+def _quiet_night_wants_cover(zone: ZoneSnapshot, center: float, mode: str) -> bool:
+    """In-band room on the conditioning side of center — house load, not pull-down."""
+    if zone.temp is None:
+        return False
+    if mode == MODE_COOL:
+        return zone.temp > center
+    if mode == MODE_HEAT:
+        return zone.temp < center
+    return False
+
+
+def _apply_quiet_night(
+    zones: list[ZoneSnapshot],
+    demand: list[ZoneSnapshot],
+    helpers: list[ZoneSnapshot],
+    s: Settings,
+    snap: HouseSnapshot,
+    mode: str,
+    bands: dict[str, tuple[float, float]],
+    centers: dict[str, float],
+) -> tuple[list[ZoneSnapshot], list[ZoneSnapshot], list[str]]:
+    """Prefer other zones at night. Same comfort band as everyone else.
+
+    Quiet rooms stay demand when they are out of band. They are skipped as
+    helpers / fan-assist / preferred anchors. If they are only on the
+    conditioning side of center, a vacant sibling may carry standing load.
+    """
+    quiet_ids = {
+        z.zone_id for z in zones if _quiet_night_active(s, z.zone_id, snap.local_hour, mode)
+    }
+    helpers = [z for z in helpers if z.zone_id not in quiet_ids]
+    if not quiet_ids:
+        return demand, helpers, []
+    cover = _quiet_night_cover(zones, quiet_ids, bands, mode)
+    demand_ids = {z.zone_id for z in demand}
+    deferred: list[str] = []
+    if cover is not None:
+        taken = demand_ids | {z.zone_id for z in helpers}
+        for zone in zones:
+            if zone.zone_id not in quiet_ids:
+                continue
+            if zone.zone_id in demand_ids:
+                continue
+            if not _quiet_night_wants_cover(zone, centers[zone.zone_id], mode):
+                continue
+            deferred.append(zone.zone_id)
+            if cover.zone_id not in taken:
+                helpers.append(cover)
+            break
+    return demand, helpers, deferred
 
 
 def _band_cop(snap: HouseSnapshot, band: str, mode: str) -> float | None:
@@ -744,9 +860,7 @@ def _hysteresis_ceiling_k(zone: ZoneSnapshot, state: ControllerState) -> float:
     return DEPTH_MAX_K
 
 
-def _clamp_depth(
-    depth_k: float, lo: float | None = None, hi: float | None = None
-) -> float:
+def _clamp_depth(depth_k: float, lo: float | None = None, hi: float | None = None) -> float:
     stepped = _quantize_depth(depth_k)
     lo_b = DEPTH_MIN_K if lo is None else float(lo)
     hi_b = DEPTH_MAX_K if hi is None else float(hi)
@@ -895,11 +1009,7 @@ def _adapt_head_depth_k(
             if abs(new_depth - depth) > 1e-9:
                 depth = new_depth
                 changed = True
-            elif (
-                not want_conditioning
-                and none
-                and depth <= floor + 1e-9
-            ):
+            elif not want_conditioning and none and depth <= floor + 1e-9:
                 # Already at chase floor with no useful shallower depth.
                 should_off = True
             state.zone_park_ref[zid] = zone.temp
@@ -1231,10 +1341,16 @@ def _anchor_should_release(
     return (margin is not None and margin > 0.0), margin
 
 
-def _select_anchor(zones: list[ZoneSnapshot], mode: str, shed: dict) -> str | None:
+def _select_anchor(
+    zones: list[ZoneSnapshot],
+    mode: str,
+    shed: dict,
+    quiet_ids: set[str] | None = None,
+) -> str | None:
     """Elect the anchor from already-loaded heads: best load coverage with
     least excess, tie-broken by head count (mirrored zones commit every head)
     then mixing centrality. Never recruits an idle zone just to be the anchor.
+    Quiet-night sleep rooms lose to any other already-on candidate.
     """
     candidates = [
         z
@@ -1244,6 +1360,10 @@ def _select_anchor(zones: list[ZoneSnapshot], mode: str, shed: dict) -> str | No
         and z.zone_id not in shed
         and (z.head_mode == mode or z.head_mode is None)
     ]
+    if quiet_ids:
+        preferred = [z for z in candidates if z.zone_id not in quiet_ids]
+        if preferred:
+            candidates = preferred
     if not candidates:
         return None
     total_load = sum(z.standing_load_w or 0.0 for z in zones if z.enabled)
@@ -1304,7 +1424,12 @@ def _update_anchor(
             state.anchor_since = 0.0
             return None
         return margin
-    candidate = _select_anchor(zones, mode, state.shed)
+    candidate = _select_anchor(
+        zones,
+        mode,
+        state.shed,
+        {z.zone_id for z in zones if _quiet_night_active(s, z.zone_id, snap.local_hour, mode)},
+    )
     if candidate is not None:
         state.anchor_zone = candidate
         state.anchor_since = snap.now_ts
@@ -1450,11 +1575,28 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             sibs = [sid for sid in conditioning_sibs if sid != zone.zone_id]
             lo_b, hi_b = bands[zone.zone_id]
             if sibs and _mixing_free_rider(zone, mode, state, sibs, lo_b, hi_b, now):
-                free_riders.append(zone.zone_id)
+                if _quiet_night_bank_active(s, zone.zone_id, snap.local_hour, mode):
+                    kept.append(zone)
+                else:
+                    free_riders.append(zone.zone_id)
             else:
                 kept.append(zone)
         demand = kept
     diag["free_riders"] = sorted(free_riders)
+    banked: list[str] = []
+    if mode in (MODE_HEAT, MODE_COOL):
+        demand_ids = {z.zone_id for z in demand}
+        for zone in zones:
+            if zone.zone_id in demand_ids:
+                continue
+            if not _quiet_night_bank_active(s, zone.zone_id, snap.local_hour, mode):
+                continue
+            lo_b, hi_b = bands[zone.zone_id]
+            if _quiet_night_bank_needed(zone, lo_b, hi_b, mode):
+                demand.append(zone)
+                demand_ids.add(zone.zone_id)
+                banked.append(zone.zone_id)
+    diag["quiet_night_bank"] = sorted(banked)
     demand_ids = {z.zone_id for z in demand}
 
     helpers: list[ZoneSnapshot] = []
@@ -1465,6 +1607,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             if zone.zone_id in free_riders:
                 continue
             if comfort.effective_zone_occupied(s, zone.occupied) is False:
+                continue
+            if _quiet_night_active(s, zone.zone_id, snap.local_hour, mode):
                 continue
             # A helper must have margin in the mode direction: only trim
             # rooms sitting above center (cooling) / below center (heating).
@@ -1492,9 +1636,14 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     ):
         helpers = []
         diag["consolidated_by_cop_table"] = True
-    diag["demand"] = sorted(demand_ids)
+    demand, helpers, quiet_deferred = _apply_quiet_night(
+        zones, demand, helpers, s, snap, mode, bands, centers
+    )
+    demand_ids = {z.zone_id for z in demand}
     helper_ids = {z.zone_id for z in helpers}
+    diag["demand"] = sorted(demand_ids)
     diag["helpers"] = sorted(helper_ids)
+    diag["quiet_night_deferred"] = sorted(quiet_deferred)
 
     want_on = {z.zone_id: (z in demand or z in helpers) for z in zones}
     for zid in free_riders:
@@ -1507,7 +1656,13 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         half_min_s = 0.5 * s.min_on_min * 60.0
         any_wanted = any(want_on.values())
         if not any_wanted:
-            for zone in zones:
+            ordered = sorted(
+                zones,
+                key=lambda z: (
+                    0 if not _quiet_night_active(s, z.zone_id, snap.local_hour, mode) else 1
+                ),
+            )
+            for zone in ordered:
                 if zone.zone_id in state.shed or not zone.enabled:
                     continue
                 lo_b, hi_b = bands[zone.zone_id]
@@ -1626,6 +1781,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 want_on.get(zid)
                 or comfort.effective_zone_occupied(s, zone.occupied) is False
                 or zid in state.shed
+                or _quiet_night_active(s, zid, snap.local_hour, mode)
             ):
                 continue
             if _opposite_deviation(zone, *bands[zid], mode) < FAN_ASSIST_MIN_DEV_K:
@@ -1702,9 +1858,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             # Demand-side hysteresis depth: continuum adapt; still wants conditioning.
             lo_b, hi_b = bands[zid]
             preferred = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
-            depth = state.zone_head_depth_k.get(
-                zid, state.zone_park_margin.get(zid, preferred)
-            )
+            depth = state.zone_head_depth_k.get(zid, state.zone_park_margin.get(zid, preferred))
             overcorrected = zone.temp is not None and (
                 zone.temp <= lo_b - PARK_OVERCOOL_BUFFER_K
                 if mode == MODE_COOL
@@ -1729,12 +1883,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 diag.setdefault("park_overcorrected", []).append(zid)
                 # Fall through to demand / off handling.
             elif depth > 0.0:
-                if _depth_command_due(
-                    state, zid, now, zone, depth, mode, force=depth_changed
-                ):
-                    commands.append(
-                        _command_with_depth(zid, mode, None, "depth_residual", depth)
-                    )
+                if _depth_command_due(state, zid, now, zone, depth, mode, force=depth_changed):
+                    commands.append(_command_with_depth(zid, mode, None, "depth_residual", depth))
                     state.zone_last_cmd[zid] = now
                 state.zone_fan[zid] = False
                 continue
@@ -1794,9 +1944,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
             # Continuum depth escalation / under-cond step-down.
             preferred = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
-            depth = state.zone_head_depth_k.get(
-                zid, state.zone_park_margin.get(zid, preferred)
-            )
+            depth = state.zone_head_depth_k.get(zid, state.zone_park_margin.get(zid, preferred))
             depth_changed = False
             depth_exhausted = False
             if pmode in (MODE_HEAT, MODE_COOL):
@@ -1826,12 +1974,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     state, zid, hold_ceiling, now, lo=_chase_floor_k(state, zid), hi=hold_ceiling
                 )
                 diag.setdefault("park_overcorrected_held", []).append(zid)
-                if pmode is not None and _depth_command_due(
-                    state, zid, now, zone, depth, pmode
-                ):
-                    commands.append(
-                        _command_with_depth(zid, pmode, None, "park", depth)
-                    )
+                if pmode is not None and _depth_command_due(state, zid, now, zone, depth, pmode):
+                    commands.append(_command_with_depth(zid, pmode, None, "park", depth))
                     state.zone_last_cmd[zid] = now
                 continue
             if overcorrected or depth_exhausted:
@@ -1857,9 +2001,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     if pmode is not None and _depth_command_due(
                         state, zid, now, zone, depth, pmode, force=True
                     ):
-                        commands.append(
-                            _command_with_depth(zid, pmode, None, "park", depth)
-                        )
+                        commands.append(_command_with_depth(zid, pmode, None, "park", depth))
                         state.zone_last_cmd[zid] = now
                     if depth > 0.0:
                         continue
@@ -1939,9 +2081,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     elif pmode is not None and _depth_command_due(
                         state, zid, now, zone, depth, pmode, force=depth_changed
                     ):
-                        commands.append(
-                            _command_with_depth(zid, pmode, None, "park", depth)
-                        )
+                        commands.append(_command_with_depth(zid, pmode, None, "park", depth))
                         state.zone_last_cmd[zid] = now
                         continue
                 elif pmode is not None and _depth_command_due(
@@ -2045,8 +2185,19 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         if desired_on:
             center = centers[zid]
             lo, hi = bands[zid]
+            condition_hold = False
             if zid in demand_ids:
-                setpoint = comfort.demand_setpoint(mode, center, lo, hi, zone.occupied, preset, s)
+                condition_hold = _quiet_night_condition_hold(s, zid, snap.local_hour, mode)
+                setpoint = comfort.demand_setpoint(
+                    mode,
+                    center,
+                    lo,
+                    hi,
+                    zone.occupied,
+                    preset,
+                    s,
+                    condition_hold=condition_hold,
+                )
                 reason = "demand"
             else:
                 # Helper zones trim gently toward the band edge.
@@ -2054,6 +2205,13 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 setpoint = center + offset if mode == MODE_COOL else center - offset
                 reason = "helper"
             setpoint = quantize_setpoint(setpoint)
+            pick_lo, pick_hi = lo, hi
+            if condition_hold:
+                # Chase until the hold edge, not residual-park in mid-band.
+                if mode == MODE_COOL:
+                    pick_hi = min(hi, setpoint)
+                elif mode == MODE_HEAT:
+                    pick_lo = max(lo, setpoint)
 
             # Tracking depth adaptation (room frame): deepen while the room is
             # not converging toward its target edge, relax once it is inside.
@@ -2066,7 +2224,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     past_target = (
                         zone.temp <= setpoint if mode == MODE_COOL else zone.temp >= setpoint
                     )
-                    out_of_band = zone.temp > hi if mode == MODE_COOL else zone.temp < lo
+                    out_of_band = zone.temp > pick_hi if mode == MODE_COOL else zone.temp < pick_lo
                     if out_of_band:
                         delta += TRACK_DELTA_STEP_K
                     elif past_target:
@@ -2094,8 +2252,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     depth_k, depth_tag = pick_depth_k(
                         mode=mode,
                         temp=zone.temp,
-                        lo=lo,
-                        hi=hi,
+                        lo=pick_lo,
+                        hi=pick_hi,
                         standing_load_w=zone.standing_load_w,
                         n_rooms=zone.n_rooms,
                         park_residuals=zone.park_residuals,
@@ -2109,9 +2267,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                             reason = depth_tag
                         floor = _chase_floor_k(state, zid)
                         ceiling = _hysteresis_ceiling_k(zone, state)
-                        depth_k = _sync_depth_views(
-                            state, zid, depth_k, now, lo=floor, hi=ceiling
-                        )
+                        depth_k = _sync_depth_views(state, zid, depth_k, now, lo=floor, hi=ceiling)
                         if zid not in state.zone_parked_since:
                             state.zone_park_preferred.setdefault(zid, _park_preferred(zone, state))
                             diag.setdefault("depth_residual", []).append(zid)
@@ -2122,9 +2278,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     else:
                         floor = _chase_floor_k(state, zid)
                         ceiling = _hysteresis_ceiling_k(zone, state)
-                        depth_k = _sync_depth_views(
-                            state, zid, depth_k, now, lo=floor, hi=ceiling
-                        )
+                        depth_k = _sync_depth_views(state, zid, depth_k, now, lo=floor, hi=ceiling)
                         if reason == "demand":
                             reason = depth_tag
                         if zid in state.zone_parked_since:

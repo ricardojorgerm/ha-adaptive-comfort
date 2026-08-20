@@ -305,7 +305,8 @@
       "prefer_continuous": { "name": "Preferir contínuo (cabeça âncora carrega a casa)" },
       "window_suggest": { "name": "Aguardar ventilação manual" },
       "manual_control": { "name": "Controlo manual (pausar adaptativo)" },
-      "zone_enabled": { "name": "Zona ativa" }
+      "zone_enabled": { "name": "Zona ativa" },
+      "zone_quiet_night": { "name": "Preferir arrefecer outras zonas à noite" }
     }
   }
 }

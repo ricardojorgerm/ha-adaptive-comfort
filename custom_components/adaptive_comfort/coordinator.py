@@ -558,6 +558,9 @@ class AdaptiveComfortRuntime:
             self.settings.preset = settings["preset"]
         self.settings.zone_offsets = dict(settings.get("zone_offsets", {}))
         self.settings.zone_enabled = dict(settings.get("zone_enabled", {}))
+        self.settings.zone_quiet_night = {
+            str(k): bool(v) for k, v in dict(settings.get("zone_quiet_night") or {}).items()
+        }
         # Seed so the first tick does not Off-spam zones already disabled.
         self._prev_zone_enabled = {
             zid: bool(self.settings.zone_enabled.get(zid, True)) for zid in self.zones
@@ -670,6 +673,7 @@ class AdaptiveComfortRuntime:
                 "preset": s.preset,
                 "zone_offsets": s.zone_offsets,
                 "zone_enabled": s.zone_enabled,
+                "zone_quiet_night": s.zone_quiet_night,
             },
             "preset_before_manual": self._preset_before_manual,
             "prev_house_occupied": self._prev_house_occupied,

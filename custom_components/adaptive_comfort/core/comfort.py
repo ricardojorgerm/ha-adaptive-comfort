@@ -142,6 +142,19 @@ def zone_band(
     return center - half - max(0.0, extra_lo_k), center + half + max(0.0, extra_hi_k)
 
 
+def hold_edge_setpoint(mode: str, lo: float, hi: float, *, conditioning: bool) -> float:
+    """``BAND_HOLD_MARGIN_K`` inset from a band edge.
+
+    ``conditioning=True``: cool toward ``lo``, heat toward ``hi`` (bank a
+    quiet-night room before sleep). ``False``: the Away/vacant drift edge.
+    """
+    if mode == MODE_COOL:
+        return (lo + BAND_HOLD_MARGIN_K) if conditioning else (hi - BAND_HOLD_MARGIN_K)
+    if mode == MODE_HEAT:
+        return (hi - BAND_HOLD_MARGIN_K) if conditioning else (lo + BAND_HOLD_MARGIN_K)
+    return (lo + hi) / 2.0
+
+
 def demand_setpoint(
     mode: str,
     center: float,
@@ -150,26 +163,25 @@ def demand_setpoint(
     zone_occupied: bool | None,
     preset: str,
     settings: Settings | None = None,
+    *,
+    condition_hold: bool = False,
 ) -> float:
     """Room-frame demand target: center-seek, or band-hold when Away/vacant.
 
-    Boost always center-seeks (overrides Away and vacant widen semantics).
+    ``condition_hold`` banks the conditioning edge (cool ``lo``, heat ``hi``).
+    Boost always center-seeks (overrides Away, vacant, and condition-hold).
     """
     if preset == PRESET_BOOST:
         return center
+    if condition_hold:
+        return hold_edge_setpoint(mode, lo, hi, conditioning=True)
     occ = (
-        effective_zone_occupied(settings, zone_occupied)
-        if settings is not None
-        else zone_occupied
+        effective_zone_occupied(settings, zone_occupied) if settings is not None else zone_occupied
     )
     band_hold = preset == PRESET_AWAY or occ is False
     if not band_hold:
         return center
-    if mode == MODE_COOL:
-        return hi - BAND_HOLD_MARGIN_K
-    if mode == MODE_HEAT:
-        return lo + BAND_HOLD_MARGIN_K
-    return center
+    return hold_edge_setpoint(mode, lo, hi, conditioning=False)
 
 
 def indoor_deviation(

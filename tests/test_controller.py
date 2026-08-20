@@ -28,10 +28,10 @@ def make_zone(zone_id, temp, occupied=None, free_float=None, confidence=0.9, **k
     )
 
 
-def make_snapshot(zones, settings=None, now=NOW, **kw):
+def make_snapshot(zones, settings=None, now=NOW, local_hour=12.0, **kw):
     return HouseSnapshot(
         now_ts=now,
-        local_hour=12.0,
+        local_hour=local_hour,
         settings=settings or Settings(hvac_mode=MODE_AUTO),
         zones=zones,
         **kw,
@@ -166,6 +166,84 @@ def test_zone_presence_off_allows_vacant_helpers():
     decision = controller.tick(snap, state)
     by_zone = {c.zone_id: c for c in decision.commands}
     assert "empty" in by_zone
+
+
+def test_quiet_night_defers_in_band_sleep_room_to_other_zone():
+    settings = Settings(hvac_mode=MODE_COOL, zone_quiet_night={"bed": True})
+    bed = make_zone("bed", 22.8, occupied=True)
+    east = make_zone("east", 22.6, occupied=False)
+    snap = make_snapshot([bed, east], settings, local_hour=23.0)
+    state = warmed_state([bed, east])
+    decision = controller.tick(snap, state)
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert "bed" not in by_zone or by_zone["bed"].hvac_mode == MODE_OFF
+    assert by_zone["east"].hvac_mode == MODE_COOL
+    assert "bed" in decision.diag.get("quiet_night_deferred", [])
+
+
+def test_quiet_night_ignored_during_day():
+    settings = Settings(hvac_mode=MODE_COOL, zone_quiet_night={"bed": True})
+    bed = make_zone("bed", 22.8, occupied=True)
+    east = make_zone("east", 22.6, occupied=False)
+    snap = make_snapshot([bed, east], settings, local_hour=14.0)
+    state = warmed_state([bed, east])
+    decision = controller.tick(snap, state)
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert "east" not in by_zone
+    assert not decision.diag.get("quiet_night_deferred")
+    assert not decision.diag.get("quiet_night_bank")
+
+
+def test_quiet_night_banks_conditioning_hold_edge_before_night():
+    settings = Settings(hvac_mode=MODE_COOL, zone_quiet_night={"bed": True})
+    bed = make_zone("bed", 22.8, occupied=True)
+    east = make_zone("east", 22.6, occupied=False)
+    snap = make_snapshot([bed, east], settings, local_hour=20.5)
+    state = warmed_state([bed, east])
+    decision = controller.tick(snap, state)
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert by_zone["bed"].hvac_mode == MODE_COOL
+    assert by_zone["bed"].setpoint is not None
+    assert by_zone["bed"].setpoint < 22.5
+    assert "bed" in decision.diag.get("quiet_night_bank", [])
+    assert not decision.diag.get("quiet_night_deferred")
+
+
+def test_quiet_night_keeps_normal_band_demand():
+    settings = Settings(hvac_mode=MODE_AUTO, zone_quiet_night={"bed": True})
+    bed = make_zone("bed", 25.0, occupied=True)
+    east = make_zone("east", 22.6, occupied=False)
+    snap = make_snapshot([bed, east], settings, local_hour=23.0)
+    state = warmed_state([bed, east])
+    decision = controller.tick(snap, state)
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert by_zone["bed"].hvac_mode == MODE_COOL
+    assert by_zone["bed"].setpoint is not None
+    assert by_zone["bed"].setpoint < 22.5
+    assert "bed" not in decision.diag.get("quiet_night_deferred", [])
+
+
+def test_quiet_night_defers_in_band_in_heat():
+    settings = Settings(hvac_mode=MODE_HEAT, zone_quiet_night={"bed": True})
+    bed = make_zone("bed", 22.0, occupied=True)
+    east = make_zone("east", 21.5, occupied=False)
+    snap = make_snapshot([bed, east], settings, local_hour=23.0)
+    state = warmed_state([bed, east])
+    decision = controller.tick(snap, state)
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert "bed" not in by_zone or by_zone["bed"].hvac_mode == MODE_OFF
+    assert by_zone["east"].hvac_mode == MODE_HEAT
+    assert "bed" in decision.diag.get("quiet_night_deferred", [])
+
+
+def test_quiet_night_solo_zone_still_runs():
+    settings = Settings(hvac_mode=MODE_AUTO, zone_quiet_night={"bed": True})
+    bed = make_zone("bed", 25.0, occupied=True)
+    snap = make_snapshot([bed], settings, local_hour=23.0)
+    state = warmed_state([bed])
+    decision = controller.tick(snap, state)
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert by_zone["bed"].hvac_mode == MODE_COOL
 
 
 def test_coordination_disabled_runs_demand_only():
