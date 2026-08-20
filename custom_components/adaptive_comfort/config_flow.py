@@ -165,7 +165,7 @@ class AdaptiveComfortConfigFlow(ConfigFlow, domain=DOMAIN):
     ) -> ConfigFlowResult:
         entry = self._get_reconfigure_entry()
         if user_input is not None:
-            return self.async_update_reload_and_abort(entry, data=user_input)
+            return self.async_update_and_abort(entry, data=user_input)
         return self.async_show_form(
             step_id="reconfigure", data_schema=_house_schema(dict(entry.data))
         )
