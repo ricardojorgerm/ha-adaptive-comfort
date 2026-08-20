@@ -31,7 +31,6 @@ from .types import (
 )
 
 PREDICT_MARGIN_K = 0.1
-HELPER_BAND_FRACTION = 0.5
 MAX_MODE_CHANGES_PER_H = 3
 # Per-zone anti-chatter dwell (s). Plant-level min_on_min is enforced against
 # the compressor run clock, not this — zones may leave demand into residual
@@ -592,27 +591,126 @@ def _depth_chase_cap_k(snap: HouseSnapshot, n_heads: int, in_band: bool) -> floa
     return best
 
 
-def _shallow_hold_k(zone: ZoneSnapshot) -> float:
-    """Helper/pack hysteresis cap: keep compressing, never the fan-type shelf.
+def _compressing_hold_k(zone: ZoneSnapshot) -> float:
+    """Slow-walk ceiling: deepest still-compressing depth, not residual-edge.
 
-    Recruited extras walk here 0.5 K/tick instead of jumping to a deep
-    covering residual that lets the head's internal hysteresis shut off.
+    Unmapped heads may walk toward DEPTH_MAX; a live fan-type read steps back.
     """
-    cap = PARK_MARGIN_K
     if zone.park_residual_max_margin_k is not None:
-        cap = min(cap, max(0.0, float(zone.park_residual_max_margin_k)))
+        cap = max(0.0, float(zone.park_residual_max_margin_k))
+    else:
+        cap = DEPTH_MAX_K
     fan = zone.park_fan_type_min_margin_k
     if fan is not None and fan > 0.0:
         cap = min(cap, float(fan) - DEPTH_STEP_K)
     return max(0.0, _quantize_depth(cap))
 
 
-def _step_depth_toward(current: float, target: float) -> float:
-    if current < target - 1e-9:
-        return min(current + DEPTH_STEP_K, target)
-    if current > target + 1e-9:
-        return max(current - DEPTH_STEP_K, target)
-    return current
+# Helper park walk: 0 → 0.5 → 1.0 → 1.5 … per re-anchor. Stop deepening
+# when the room is stable; deepen when the far edge is arriving fast, but
+# only while the next step still looks like compression. Prefer lingering
+# in-band over peeling off.
+HELPER_STABLE_K = 0.1
+HELPER_EDGE_FAST_S = 45.0 * 60.0
+
+
+def _far_edge_slack_k(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> float | None:
+    if zone.temp is None:
+        return None
+    if mode == MODE_COOL:
+        return zone.temp - lo
+    if mode == MODE_HEAT:
+        return hi - zone.temp
+    return None
+
+
+def _helper_toward_far_edge_k(zone: ZoneSnapshot, ref: float | None, mode: str) -> float:
+    if zone.temp is None or ref is None:
+        return 0.0
+    if mode == MODE_COOL:
+        return ref - zone.temp
+    if mode == MODE_HEAT:
+        return zone.temp - ref
+    return 0.0
+
+
+def _helper_too_fast_to_edge(
+    zone: ZoneSnapshot,
+    lo: float,
+    hi: float,
+    mode: str,
+    toward_k: float,
+    dt_s: float,
+) -> bool:
+    slack = _far_edge_slack_k(zone, lo, hi, mode)
+    if slack is None:
+        return False
+    if zone.pred_60m is not None:
+        if mode == MODE_COOL and zone.pred_60m <= lo + 0.2:
+            return True
+        if mode == MODE_HEAT and zone.pred_60m >= hi - 0.2:
+            return True
+    if toward_k <= HELPER_STABLE_K or dt_s <= 1.0:
+        return False
+    rate = toward_k / dt_s
+    if rate <= 1e-9:
+        return False
+    return (slack / rate) < HELPER_EDGE_FAST_S
+
+
+def _helper_still_compressing(zone: ZoneSnapshot, depth_k: float) -> bool:
+    if depth_k <= 0.0:
+        return True
+    if zone.park_current_is_fan_type is True:
+        return False
+    return not _extraction_none_at_depth(zone, depth_k)
+
+
+def _helper_walk_depth(
+    state: ControllerState,
+    zone: ZoneSnapshot,
+    lo: float,
+    hi: float,
+    mode: str,
+    now: float,
+) -> float:
+    """0, then +0.5 K per re-anchor while useful; hold when stable.
+
+    First command is zero-hold (SP = live reading). The next re-anchor
+    enters park at +0.5 K. Further steps only if the room is still moving
+    toward the far edge (or arriving too fast) and the next bin should
+    still compress. Stable in-band helpers stay put so the pack can linger.
+    """
+    zid = zone.zone_id
+    cap = _compressing_hold_k(zone)
+    current = state.zone_head_depth_k.get(zid)
+    last = state.zone_last_cmd.get(zid, 0.0)
+    ref = state.zone_park_ref.get(zid)
+    if current is None:
+        if zone.temp is not None:
+            state.zone_park_ref[zid] = zone.temp
+        return 0.0
+    if last <= 0.0 or now - last < COMMAND_SPACING_S:
+        return current
+    toward = _helper_toward_far_edge_k(zone, ref, mode)
+    dt_s = now - last
+    too_fast = _helper_too_fast_to_edge(zone, lo, hi, mode, toward, dt_s)
+    stable = toward <= HELPER_STABLE_K
+    stepped = current
+    nxt = min(current + DEPTH_STEP_K, cap)
+    if not _helper_still_compressing(zone, current) and current > 0.0:
+        stepped = max(current - DEPTH_STEP_K, 0.0)
+    elif current < DEPTH_STEP_K - 1e-9 and _helper_still_compressing(zone, DEPTH_STEP_K):
+        stepped = DEPTH_STEP_K
+    elif stable and not too_fast:
+        stepped = current
+    elif _helper_still_compressing(zone, nxt):
+        stepped = nxt
+    else:
+        stepped = current
+    if zone.temp is not None:
+        state.zone_park_ref[zid] = zone.temp
+    return stepped
 
 
 def _pack_residual_ids(
@@ -2337,7 +2435,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 preferred = _park_preferred(zone, state)
                 entry = _park_entry_margin(zone, state)
                 if zid in pack_ids:
-                    hold = _shallow_hold_k(zone)
+                    hold = _compressing_hold_k(zone)
                     entry = min(entry, hold) if hold > 0.0 else min(entry, PARK_MARGIN_K)
                 state.zone_park_preferred[zid] = preferred
                 state.zone_parked_since[zid] = now
@@ -2405,6 +2503,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             lo, hi = bands[zid]
             condition_hold = False
             quiet_cover = diag.get("quiet_cover_extended") == zid
+            helper_depth_k: float | None = None
             if zid in demand_ids:
                 condition_hold = _quiet_night_condition_hold(s, zid, snap.local_hour, mode)
                 if (
@@ -2434,10 +2533,22 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 condition_hold = True
                 lo, hi = ext_lo, ext_hi
             else:
-                # Helper zones trim gently toward the band edge.
-                offset = HELPER_BAND_FRACTION * (hi - center)
-                setpoint = center + offset if mode == MODE_COOL else center - offset
+                # Hold at live room temp (depth 0), then SP follows 0.5 K
+                # park steps: 21 → 21.5 → 22 … while still compressing.
                 reason = "helper"
+                prev_d = state.zone_head_depth_k.get(zid, 0.0)
+                helper_depth_k = _helper_walk_depth(state, zone, lo, hi, mode, now)
+                hold = quantize_setpoint(zone.temp) if zone.temp is not None else center
+                hold = min(max(hold, lo), hi)
+                last_sp = state.zone_last_setpoint.get(zid)
+                if last_sp is None:
+                    setpoint = hold
+                elif mode == MODE_COOL:
+                    base = float(last_sp) - prev_d
+                    setpoint = min(max(base + helper_depth_k, lo), hi)
+                else:
+                    base = float(last_sp) + prev_d
+                    setpoint = min(max(base - helper_depth_k, lo), hi)
             setpoint = quantize_setpoint(setpoint)
             pick_lo, pick_hi = lo, hi
             if condition_hold:
@@ -2474,26 +2585,12 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 state.zone_track_delta[zid] = delta
                 track_delta = delta
                 # Continuum depth from prior adapt / residual pick.
-                if reason == "helper" and not condition_hold:
-                    # Recruited extras keep tracking, then ease into a shallow
-                    # residual hold one 0.5 K step per re-anchor. Stepping
-                    # every 60 s tick would land at the cap on the first
-                    # COMMAND_SPACING refresh and look like a park jump.
-                    cap = _shallow_hold_k(zone)
-                    current = state.zone_head_depth_k.get(zid)
-                    last = state.zone_last_cmd.get(zid, 0.0)
-                    if current is None:
-                        depth_k = -delta
-                    elif last > 0.0 and now - last >= COMMAND_SPACING_S:
-                        depth_k = _step_depth_toward(current, cap)
-                    else:
-                        depth_k = current
-                    if zone.park_current_is_fan_type is True and depth_k > 0.0:
-                        depth_k = max(depth_k - DEPTH_STEP_K, 0.0)
-                    floor = _chase_floor_k(state, zid)
+                if reason == "helper" and not condition_hold and helper_depth_k is not None:
+                    cap = _compressing_hold_k(zone)
+                    floor = 0.0
                     ceiling = min(_hysteresis_ceiling_k(zone, state), cap)
                     depth_k = _sync_depth_views(
-                        state, zid, depth_k, now, lo=floor, hi=max(ceiling, 0.0)
+                        state, zid, helper_depth_k, now, lo=floor, hi=max(ceiling, 0.0)
                     )
                 elif zid in state.zone_head_depth_k and zid not in state.zone_parked_since:
                     # Already stepped into 0/chase via continuum; clamp to live

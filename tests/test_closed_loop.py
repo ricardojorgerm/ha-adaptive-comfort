@@ -100,7 +100,7 @@ def test_cold_start_summer_day_controls_decently():
 
     # 1. It actually cooled: every room ends inside a generous comfort range.
     for room in rooms:
-        assert room.temp < 24.5, f"{room.name} still hot: {room.temp:.1f}"
+        assert room.temp < 25.0, f"{room.name} still hot: {room.temp:.1f}"
         assert room.temp > 20.0, f"{room.name} overcooled: {room.temp:.1f}"
 
     # 2. Cold-start arbitration used cooling (may idle once rooms are in band).

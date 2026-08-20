@@ -853,15 +853,17 @@ def test_depth_ledger_raises_in_band_chase_cap():
     assert controller._depth_chase_cap_k(empty, n_heads=1, in_band=True) == 2.5
 
 
-def test_shallow_hold_stays_below_fan_type_shelf():
+def test_compressing_hold_stays_below_fan_type_shelf():
     zone = make_zone("ok", 22.6, park_residual_max_margin_k=2.5, park_fan_type_min_margin_k=1.0)
-    assert controller._shallow_hold_k(zone) == 0.5
+    assert controller._compressing_hold_k(zone) == 0.5
+    mapped = make_zone("ok", 22.6, park_residual_max_margin_k=2.0, park_residual_edge_k=2.5)
+    assert controller._compressing_hold_k(mapped) == 2.0
     unmapped = make_zone("ok", 22.6)
-    assert controller._shallow_hold_k(unmapped) == 1.0
+    assert controller._compressing_hold_k(unmapped) == controller.DEPTH_MAX_K
 
 
 def test_helper_walks_into_shallow_park_not_covering_bin():
-    """Recruited helpers step 0.5 K/tick; they must not jump to a 2 K residual."""
+    """Recruited helpers hold at live temp (depth 0), then +0.5 K per re-anchor."""
     hot = make_zone("hot", 25.0)
     ok = make_zone(
         "ok",
@@ -877,9 +879,9 @@ def test_helper_walks_into_shallow_park_not_covering_bin():
     decision = controller.tick(snap, state)
     cmd = {c.zone_id: c for c in decision.commands}["ok"]
     assert cmd.reason == "helper"
-    assert cmd.head_depth_k is not None
-    # First command stays on chase tracking, not a covering residual park.
-    assert cmd.head_depth_k == -controller.TRACK_DELTA_DEFAULT_K
+    assert cmd.head_depth_k == 0.0
+    assert cmd.park is False
+    assert cmd.setpoint == 22.5  # hold at live 22.6, quantized
     ok_on = make_zone(
         "ok",
         22.6,
@@ -893,6 +895,29 @@ def test_helper_walks_into_shallow_park_not_covering_bin():
     snap2 = make_snapshot([hot, ok_on], now=NOW + controller.COMMAND_SPACING_S)
     decision = controller.tick(snap2, decision.state)
     cmd2 = {c.zone_id: c for c in decision.commands}["ok"]
-    assert cmd2.head_depth_k == cmd.head_depth_k + controller.DEPTH_STEP_K
-    assert cmd2.head_depth_k < 2.0
-    assert cmd2.head_depth_k <= controller.PARK_MARGIN_K
+    assert cmd2.head_depth_k == 0.5
+    assert cmd2.park is True
+    assert cmd2.head_depth_k < 2.5
+    assert cmd2.setpoint == 23.0  # 22.5 + 0.5
+
+    snap3 = make_snapshot([hot, ok_on], now=NOW + 2 * controller.COMMAND_SPACING_S)
+    decision = controller.tick(snap3, decision.state)
+    cmd3 = {c.zone_id: c for c in decision.commands}["ok"]
+    assert cmd3.head_depth_k == 0.5  # stable: stop deepening
+
+    racing = make_zone(
+        "ok",
+        22.0,
+        is_on=True,
+        park_residuals=True,
+        park_residual_max_margin_k=2.0,
+        park_residual_edge_k=2.5,
+        park_margin_bins={"2.0": [150.0, 0.8, 12.0]},
+        standing_load_w=80.0,
+        pred_60m=21.7,
+    )
+    snap4 = make_snapshot([hot, racing], now=NOW + 3 * controller.COMMAND_SPACING_S)
+    decision = controller.tick(snap4, decision.state)
+    cmd4 = {c.zone_id: c for c in decision.commands}["ok"]
+    assert cmd4.head_depth_k == 1.0
+    assert cmd4.head_depth_k < 2.5
