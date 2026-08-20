@@ -518,12 +518,19 @@ def test_quantize_setpoint():
 
 
 def test_heating_demand_in_winter():
+    from custom_components.adaptive_comfort.core import comfort
+
     zone = make_zone("bed", 19.0, free_float=[19.0 - 0.05 * h for h in range(24)])
-    snap = make_snapshot([zone], t_rm=11.0)
+    settings = Settings(hvac_mode=MODE_AUTO)
+    snap = make_snapshot([zone], settings, t_rm=11.0)
     state = warmed_state([zone])
     decision = controller.tick(snap, state)
     by_zone = {c.zone_id: c for c in decision.commands}
     assert by_zone["bed"].hvac_mode == MODE_HEAT
+    center = comfort.band_center(settings, 11.0)
+    lo, _hi = comfort.zone_band(settings, center, None, None)
+    expected = comfort.hold_edge_setpoint(MODE_HEAT, lo, _hi, conditioning=False)
+    assert abs(by_zone["bed"].setpoint - controller.quantize_setpoint(expected)) < 0.01
 
 
 def test_mixing_free_ride_in_band_hold():
@@ -718,9 +725,6 @@ def test_pack_stay_parks_two_in_band_heads():
         22.6,
         is_on=True,
         head_state="cooling",
-        park_residuals=True,
-        park_extraction_w=120.0,
-        standing_load_w=80.0,
         free_float=[22.6] * 24,
     )
     ok = make_zone(
@@ -728,9 +732,7 @@ def test_pack_stay_parks_two_in_band_heads():
         22.0,
         is_on=True,
         head_state="cooling",
-        park_residuals=True,
-        park_extraction_w=100.0,
-        standing_load_w=60.0,
+        park_residual_edge_k=2.5,
         free_float=[22.0] * 24,
     )
     settings = Settings(hvac_mode=MODE_COOL, park_learning=True, multisplit=True)
@@ -745,6 +747,9 @@ def test_pack_stay_parks_two_in_band_heads():
     )
     assert "hot" in parked and "ok" in parked
     assert not any(c.hvac_mode == MODE_OFF for c in decision.commands)
+    for zid in ("hot", "ok"):
+        depth = decision.state.zone_head_depth_k.get(zid, 0.0)
+        assert depth < 1.0
 
 
 def test_prefer_continuous_keeps_pack_not_one_leftover():
@@ -753,9 +758,6 @@ def test_prefer_continuous_keeps_pack_not_one_leftover():
         22.6,
         is_on=True,
         head_state="cooling",
-        park_residuals=True,
-        park_extraction_w=150.0,
-        standing_load_w=80.0,
         free_float=[22.6] * 24,
     )
     west = make_zone(
@@ -763,9 +765,6 @@ def test_prefer_continuous_keeps_pack_not_one_leftover():
         22.4,
         is_on=True,
         head_state="cooling",
-        park_residuals=True,
-        park_extraction_w=140.0,
-        standing_load_w=70.0,
         free_float=[22.4] * 24,
     )
     settings = Settings(
@@ -839,6 +838,80 @@ def test_eco_override_starts_immediately():
     assert not decision.diag.get("energy_wait")
     assert by_zone["west"].hvac_mode == MODE_COOL
     assert "east" not in by_zone or by_zone["east"].hvac_mode == MODE_OFF
+
+
+def test_eco_mid_burst_does_not_kill_remaining_demand():
+    from custom_components.adaptive_comfort.core.types import PRESET_ECO
+
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        preset=PRESET_ECO,
+        park_learning=True,
+        multisplit=True,
+    )
+    west = make_zone("west", 25.0, occupied=True, is_on=True, head_state="cooling")
+    east = make_zone("east", 22.6, occupied=True, is_on=True, head_state="cooling")
+    snap = make_snapshot([west, east], settings)
+    state = warmed_state([west, east])
+    state.zone_on["west"] = True
+    state.zone_on["east"] = True
+    decision = controller.tick(snap, state)
+    assert not decision.diag.get("energy_wait")
+    assert decision.diag["want"]["west"] == "demand"
+    assert not any(c.zone_id == "west" and c.hvac_mode == MODE_OFF for c in decision.commands)
+    assert (
+        "east" in decision.diag.get("pack_stay", []) or "east" in decision.state.zone_parked_since
+    )
+    assert not any(c.zone_id == "east" and c.hvac_mode == MODE_OFF for c in decision.commands)
+
+
+def test_away_waits_until_every_zone_needs_burst():
+    from custom_components.adaptive_comfort.core.types import PRESET_AWAY
+
+    settings = Settings(hvac_mode=MODE_COOL, preset=PRESET_AWAY)
+    west = make_zone("west", 27.0, occupied=True)
+    east = make_zone("east", 22.6, occupied=True)
+    snap = make_snapshot([west, east], settings, house_occupied=False)
+    state = warmed_state([west, east])
+    decision = controller.tick(snap, state)
+    assert decision.diag.get("energy_wait") is True
+    assert not any(c.hvac_mode == MODE_COOL for c in decision.commands)
+
+
+def test_mixing_does_not_peel_in_band_pack():
+    west = make_zone(
+        "west",
+        22.5,
+        is_on=True,
+        head_state="cooling",
+        mixing_gain_w=-80.0,
+        standing_load_w=40.0,
+        free_float=[22.5] * 24,
+    )
+    east = make_zone(
+        "east",
+        22.6,
+        is_on=True,
+        head_state="cooling",
+        standing_load_w=80.0,
+        free_float=[22.6] * 24,
+    )
+    settings = Settings(hvac_mode=MODE_COOL, park_learning=True, multisplit=True)
+    snap = make_snapshot([west, east], settings)
+    state = warmed_state([west, east])
+    state.zone_on["west"] = True
+    state.zone_on["east"] = True
+    state.zone_parked_since["west"] = NOW - 600.0
+    state.zone_parked_since["east"] = NOW - 600.0
+    state.zone_park_margin["west"] = 0.5
+    state.zone_park_margin["east"] = 0.5
+    state.zone_head_depth_k["west"] = 0.5
+    state.zone_head_depth_k["east"] = 0.5
+    decision = controller.tick(snap, state)
+    assert set(decision.diag.get("pack_stay", [])) == {"west", "east"}
+    assert "west" in decision.state.zone_parked_since
+    assert "east" in decision.state.zone_parked_since
+    assert not any(c.hvac_mode == MODE_OFF for c in decision.commands)
 
 
 def test_depth_ledger_raises_in_band_chase_cap():

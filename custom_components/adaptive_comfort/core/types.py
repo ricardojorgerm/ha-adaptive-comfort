@@ -144,12 +144,10 @@ class Settings:
     # ventilate / cycling path instead of continuous park-holds (opt-in;
     # field data showed ~280 W overnight compression against cool outdoor air).
     night_ventilate: bool = False
-    # Opt-in: keep exactly one already-loaded "anchor" head parked instead of
-    # released to off, so the compressor keeps running continuously for the
-    # house's aggregate standing load even when every zone is individually
-    # satisfied. Other zones cycle/off normally - this is not the per-zone
-    # 'continuous' regime (which parks whichever zones justify it on their
-    # own load), it is a single elected anchor. See controller._update_anchor.
+    # Opt-in: keep already-loaded heads parked instead of releasing to off
+    # so the compressor keeps running for house standing load when every
+    # zone is in-band. N≥2 stay as a pack; N=1 elects a leftover anchor.
+    # See controller._update_anchor / _pack_residual_ids.
     prefer_continuous: bool = False
     # Per-open-head electrical fan floor (W). Gate = 20 + this * heads.
     fan_floor_per_head_w: float = 55.0
@@ -345,8 +343,8 @@ class ControllerState:
     zone_force_chase_until: dict[str, float] = field(default_factory=dict)
     shed: dict[str, float] = field(default_factory=dict)  # zone_id -> shed ts
     last_shed_action: float = 0.0
-    # prefer_continuous: the single elected anchor zone (None when the
-    # policy is off or no zone currently qualifies).
+    # prefer_continuous leftover when the pack has drained to N=1
+    # (None when the policy is off or no zone currently qualifies).
     anchor_zone: str | None = None
     anchor_since: float = 0.0
     # sibling-sustain: observed, ORDERED (rider_zone -> lead_zone -> [ewma

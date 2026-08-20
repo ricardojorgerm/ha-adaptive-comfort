@@ -722,19 +722,26 @@ def _pack_residual_ids(
     energy_wait: bool,
     consolidated: bool,
     demand: list[ZoneSnapshot],
+    helpers: list[ZoneSnapshot],
+    coordination: bool,
+    energy_save: bool,
 ) -> set[str]:
     """In-band already-on coils that should residual-park together.
 
-    While demand is live, extras are helpers (want_on). After the burst's
-    demand rooms return in-band, keep N≥2 loaded via park rather than
-    peeling to a leftover cold coil. Solo leftovers and learned
-    consolidate still drop. Eco/Away energy-wait does not hold a pack.
+    Demand and helpers stay on tracking (want_on). Satisfied extras that
+    have left those sets park so N and Tevap stay high: N≥2 after the
+    burst, or a single in-band leftover while Eco/Away still has demand.
+    Solo leftovers with nobody in demand still drop unless
+    prefer_continuous elects them as the N=1 anchor. Fan-type members
+    drop when another residual coil is already in the pack. Off when
+    coordination is down, energy-wait (start gate), or learned consolidate.
     """
-    if energy_wait or consolidated or demand or mode not in (MODE_HEAT, MODE_COOL):
+    if not coordination or energy_wait or consolidated or mode not in (MODE_HEAT, MODE_COOL):
         return set()
-    members: list[str] = []
+    taken = {z.zone_id for z in demand} | {z.zone_id for z in helpers}
+    members: list[ZoneSnapshot] = []
     for zone in zones:
-        if not zone.enabled or zone.temp is None:
+        if zone.zone_id in taken or not zone.enabled or zone.temp is None:
             continue
         currently = zone.is_on or state.zone_on.get(zone.zone_id, False)
         if not currently:
@@ -744,10 +751,16 @@ def _pack_residual_ids(
             continue
         if not _park_ok_now(zone, lo, hi, mode):
             continue
-        members.append(zone.zone_id)
-    if len(members) < 2:
-        return set()
-    return set(members)
+        members.append(zone)
+    residual = {z.zone_id for z in members if z.park_residuals is True}
+    if residual:
+        members = [z for z in members if z.park_current_is_fan_type is not True]
+    ids = {z.zone_id for z in members}
+    if len(ids) >= 2:
+        return ids
+    if ids and demand and energy_save:
+        return ids
+    return set()
 
 
 # Fan assist: a multi-split head cannot run opposite to the shared mode, but
@@ -1633,12 +1646,15 @@ def _update_anchor(
     bands: dict[str, tuple[float, float]],
     want_on: dict[str, bool],
 ) -> float | None:
-    """prefer_continuous: keep ≥1 head loaded (demand or residual park).
+    """prefer_continuous: keep already-on heads loaded (demand or park).
 
-    Elects one already-on head as anchor so it may park instead of turning
-    off when the house is satisfied. Does *not* force demand setpoints —
-    parking is allowed. Releases when overserving, overcorrected, or when
-    a sibling's conditioning already covers the anchor via mixing (handoff).
+    Elects one already-on head as the N=1 leftover when the pack has
+    drained. N≥2 stay-loaded is ``pack_ids`` (every in-band coil), not
+    this single leftover. Does *not* force demand setpoints — parking is
+    allowed. Releases when overserving, overcorrected, or when a
+    *demand* sibling's conditioning already covers the leftover via
+    mixing (handoff). Pack members are not peeled because mix could
+    carry them.
 
     Returns the current over-serve margin (K) for diagnostics, or None.
     """
@@ -1679,19 +1695,31 @@ def _update_anchor(
     return None
 
 
-def _anchor_active(state: ControllerState, s, mode: str, zid: str) -> bool:
-    """True while `zid` is the elected prefer_continuous anchor and nothing
-    that outranks it (manual, shed, hub off, non-conditioning mode) applies.
+def _anchor_active(
+    state: ControllerState,
+    s,
+    mode: str,
+    zid: str,
+    pack_ids: set[str] | None = None,
+) -> bool:
+    """True while prefer_continuous should keep this head loaded.
+
+    The elected leftover (`anchor_zone`) covers N=1. Pack members
+    (`pack_ids`) stay loaded together so continuous does not collapse
+    to a single cold coil.
     """
-    return (
-        s.prefer_continuous
-        and s.park_learning
-        and s.multisplit
-        and s.preset != PRESET_MANUAL
-        and mode in (MODE_HEAT, MODE_COOL)
-        and state.anchor_zone == zid
-        and zid not in state.shed
-    )
+    if (
+        not s.prefer_continuous
+        or not s.park_learning
+        or not s.multisplit
+        or s.preset == PRESET_MANUAL
+        or mode not in (MODE_HEAT, MODE_COOL)
+        or zid in state.shed
+    ):
+        return False
+    if state.anchor_zone == zid:
+        return True
+    return bool(pack_ids) and zid in pack_ids
 
 
 def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
@@ -1904,8 +1932,10 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         zones, demand, helpers, s, snap, mode, bands, centers, energy_save=energy_save
     )
 
-    # Eco/Away: wait until every enabled zone needs conditioning, unless
-    # override or the N-table says the smaller demand set wins.
+    # Eco/Away: wait *to start* until every enabled zone needs conditioning,
+    # unless override or the N-table says the smaller demand set wins.
+    # Once any head is already running, do not clear remaining demand —
+    # satisfied rooms pack-stay instead of killing the hot room.
     energy_wait = False
     if energy_save and mode in (MODE_HEAT, MODE_COOL) and demand:
         enabled = [z for z in zones if z.enabled]
@@ -1918,7 +1948,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         n_dem = sum(z.n_rooms for z in demand)
         cd, cs = _cop_n_pair(snap, n_dem, n_all)
         consolidate_ok = cd is not None and cs is not None and cd > cs * COP_TABLE_ADVANTAGE
-        if not all_need and not override and not consolidate_ok:
+        already_running = any(z.is_on or state.zone_on.get(z.zone_id, False) for z in enabled)
+        if not all_need and not override and not consolidate_ok and not already_running:
             demand = []
             helpers = []
             energy_wait = True
@@ -1934,6 +1965,9 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         energy_wait=energy_wait,
         consolidated=bool(diag.get("consolidated_by_cop_table")),
         demand=demand,
+        helpers=helpers,
+        coordination=s.coordination,
+        energy_save=energy_save,
     )
 
     diag["demand"] = sorted(demand_ids)
@@ -2260,7 +2294,12 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             depth = state.zone_head_depth_k.get(zid, state.zone_park_margin.get(zid, preferred))
             depth_changed = False
             depth_exhausted = False
-            if pmode in (MODE_HEAT, MODE_COOL):
+            if pmode in (MODE_HEAT, MODE_COOL) and zid in pack_ids:
+                walked = _helper_walk_depth(state, zone, lo_b, hi_b, pmode, now)
+                depth_changed = abs(walked - depth) > 1e-9
+                cap = _compressing_hold_k(zone)
+                depth = _sync_depth_views(state, zid, walked, now, lo=0.0, hi=max(cap, 0.0))
+            elif pmode in (MODE_HEAT, MODE_COOL):
                 depth, depth_changed, depth_exhausted = _adapt_head_depth_k(
                     state,
                     zid,
@@ -2343,9 +2382,13 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 and off_allowed
                 and not plant_min_on
                 and (
-                    mixing_covered
+                    (
+                        mixing_covered
+                        and (zid not in pack_ids or any(sid in demand_ids for sid in covering_sibs))
+                    )
                     or (
-                        not _anchor_active(state, s, mode, zid)
+                        zid not in pack_ids
+                        and not _anchor_active(state, s, mode, zid, pack_ids)
                         and (
                             probe_done
                             or (
@@ -2386,7 +2429,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 # can step depth down rather than soft-releasing to off.
                 if depth <= 0.0:
                     # Stepped into chase while want-off — idle if allowed.
-                    if off_allowed and not plant_min_on:
+                    # Pack-stay zero-hold stays loaded (walk continues below).
+                    if off_allowed and not plant_min_on and zid not in pack_ids:
                         _clear_park_session(state, zid, zone, now)
                         state.zone_head_depth_k.pop(zid, None)
                         desired_on = False
@@ -2415,7 +2459,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             and (
                 regime == "continuous"
                 or plant_min_on
-                or _anchor_active(state, s, mode, zid)
+                or _anchor_active(state, s, mode, zid, pack_ids)
                 or any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones)
                 or zid in pack_ids
             )
@@ -2429,14 +2473,16 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             # Plant min_on / anchor: residual park serves the compressor run
             # even before the head is classified (observations are free —
             # do not charge the probe budget). Exploit or spaced probe otherwise.
-            plant_hold = plant_min_on or _anchor_active(state, s, mode, zid)
+            plant_hold = plant_min_on or _anchor_active(state, s, mode, zid, pack_ids)
             exploit = zone.park_residuals is True and _park_exploit_ok(zone, mode)
-            if plant_hold or probe_due or exploit:
+            if plant_hold or probe_due or exploit or zid in pack_ids:
                 preferred = _park_preferred(zone, state)
-                entry = _park_entry_margin(zone, state)
+                lo_p, hi_p = bands[zid]
                 if zid in pack_ids:
-                    hold = _compressing_hold_k(zone)
-                    entry = min(entry, hold) if hold > 0.0 else min(entry, PARK_MARGIN_K)
+                    # Continue the helper walk; never jump to residual-edge.
+                    entry = _helper_walk_depth(state, zone, lo_p, hi_p, mode, now)
+                else:
+                    entry = _park_entry_margin(zone, state)
                 state.zone_park_preferred[zid] = preferred
                 state.zone_parked_since[zid] = now
                 state.zone_park_margin[zid] = entry
@@ -2470,8 +2516,13 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     # Run-out park: the zone wants off but min-runtime forces
                     # it to keep running - the compressor is alive regardless,
                     # so parking is free. Keep-temp only: never park while
-                    # still out of band (unfinished pull-down).
-                    entry = _park_entry_margin(zone, state)
+                    # still out of band (unfinished pull-down). Pack members
+                    # continue the helper walk instead of jumping to residual-edge.
+                    lo_p, hi_p = bands[zid]
+                    if zid in pack_ids:
+                        entry = _helper_walk_depth(state, zone, lo_p, hi_p, zone.head_mode, now)
+                    else:
+                        entry = _park_entry_margin(zone, state)
                     state.zone_parked_since[zid] = now
                     state.zone_park_margin[zid] = entry
                     state.zone_head_depth_k[zid] = entry
@@ -2510,9 +2561,10 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     not condition_hold
                     and preset == PRESET_NONE
                     and s.coordination
-                    and mode == MODE_COOL
+                    and mode in (MODE_HEAT, MODE_COOL)
                 ):
-                    # Cool prior: hold near the return-air-warm edge (higher Tevap).
+                    # Coordinated None: hold the reactive edge (cool: warm
+                    # return air / higher Tevap; heat: cold return air).
                     setpoint = comfort.hold_edge_setpoint(mode, lo, hi, conditioning=False)
                 else:
                     setpoint = comfort.demand_setpoint(

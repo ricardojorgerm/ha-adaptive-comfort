@@ -81,12 +81,13 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   Cold-start / thin tables: pack extra in-band coils (occupancy-blind, including
   past center toward the far edge) so a burst is not a solo cold coil. Learned
   banded `cop(N_demand) > cop(N_spread) × COP_TABLE_ADVANTAGE` consolidates.
-  None-preset demand holds the **warm** band edge; `cop_by_depth` may raise the
-  in-band chase cap. After demand rooms return in-band, N≥2 already-on coils
-  residual-park together (`pack_stay`) rather than peeling to one leftover.
-  Eco/Away share an energy-only run (`energy_wait`): wait until every zone
-  needs conditioning, skip quiet-night cover-first and extra in-band coils.
-  House envelope is `target ± (band_k + 3)` (default **18.8–26.2 °C**).
+  None-preset demand holds the **reactive** band edge (cool: warm / higher Tevap;
+  heat: cold); `cop_by_depth` may raise the in-band chase cap. After demand rooms
+  return in-band, N≥2 already-on coils residual-park together (`pack_stay`) rather
+  than peeling to one leftover. Eco/Away share an energy-only run (`energy_wait`):
+  wait **to start** until every zone needs conditioning, then pack stay-on; skip
+  quiet-night cover-first and extra in-band coils. House envelope is
+  `target ± (band_k + 3)` (default **18.8–26.2 °C**).
   Warning-band shed stays over `SHED_SUSTAINED_S` (30 s); critical/urgent is
   immediate.
 - **Persistence**: everything that must survive a restart goes through `coordinator._persist()`
@@ -224,7 +225,7 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   stack; presence Away replaces Eco; vacant +1.5 K does not stack on Away.
   Edges clamp into `target ± (band_k + 3)` (18.8–26.2 at defaults).
   **Quiet night** (`zone_quiet_night`, per zone, default off): 22:00–08:00,
-  heat or cool, **None/Boost only** (Eco/Away skip this). Other rooms cover
+  heat or cool, **None only** (Boost skips; Eco/Away skip this). Other rooms cover
   first and may chase the extended far edge (vacant-widen slack on the
   conditioning side); recruit the sleeper after that (or `OVERRIDE_DELTA_K`),
   then keep the pack. This zone is not selected as helper / fan-assist /

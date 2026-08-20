@@ -161,5 +161,6 @@ def test_cold_start_winter_night_heats():
         for cmd in decision.commands:
             active = None if cmd.hvac_mode == MODE_OFF else (cmd.hvac_mode, cmd.setpoint)
 
-    assert rooms[0].temp > 20.0
+    # Cold-edge hold is shallower than center-seek; 4 h from 17 °C still heats.
+    assert rooms[0].temp > 19.0
     assert state.mode in ("heat", "off")

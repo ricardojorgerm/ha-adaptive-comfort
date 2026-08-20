@@ -129,10 +129,12 @@ banded COP tables can later consolidate to fewer heads. Expect:
   `off` rather than the vendor `hvac_action` (those heads often report
   “cooling” while only the fan is running).
 
-**Eco** and **Away** share an energy-only run (wait until every zone needs a
-burst; no extra in-band coils; no quiet-night cover-first). They still differ
+**Eco** and **Away** share an energy-only run (wait **to start** until every zone
+needs a burst, then pack stay-on; no extra in-band coils; no quiet-night
+cover-first). They still differ
 on the target: Eco is a slightly wider center-seek; Away is a wider band-hold
 at the drift edge. Both clamp to about **18.8–26.2 °C** at the default target.
+Quiet night (prefer other zones overnight) is **None only** — Boost skips it.
 Warning-band shedding confirms for 30 s; a critical overload still sheds
 immediately.
 
