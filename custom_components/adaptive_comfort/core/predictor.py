@@ -160,6 +160,13 @@ class PredictorScorer:
         mae = sum(abs(s.error_k) for s in use) / n
         return {"bias_k": round(bias, 3), "mae_k": round(mae, 3), "n": n}
 
+    def last_scored_ts(self, zone_id: str, horizon_min: int) -> float | None:
+        """Timestamp of the newest scored sample, or None if none yet."""
+        samples = self._scored.get((zone_id, horizon_min))
+        if not samples:
+            return None
+        return samples[-1].ts
+
     def all_stats(self, zone_id: str) -> dict[int, dict]:
         out = {}
         for horizon in HORIZONS_MIN:

@@ -113,6 +113,10 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   learning and park sessions are suspended. Hub HVAC **Off** still force-stops children
   even under Manual (the one exception). Clearing Manual restores the prior preset.
   Shedding while Manual is intentionally off: the user owns the plant.
+  **Do not re-arbitrate `state.mode` while Manual** (`mode_source = "manual"`): a
+  pulldown below the band would otherwise elect heat and latch `MODE_DWELL_S`.
+  Predictor scoring records only while heads are off (`all_off_since`); MAE
+  sensors stay on the last scored sample until a full off horizon elapses.
 - **Power is the only honest activity signal.** These heads report `hvac_action: cooling`
   through entire parks while the electrical record is bimodal (fan-only <60 W vs real
   compression >300 W) — the device cycles via an internal hysteresis around its own sensor.
@@ -188,8 +192,10 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   `compressor_starts_per_hour`.
 - **Mode integrals include on zones.** `demand_integrals` uses no-AC free-float (including
   while conditioning — `predict_free` is the counterfactual) over `MODE_HORIZON_H` (~8 h),
-  with temp persistence when confidence is low (for mixed houses). Enter cool/heat above
-  `MODE_DEADBAND_KH`; hold until below `MODE_EXIT_KH` — but seasonal demotion is not
+  with temp persistence when confidence is low (for mixed houses). A cooling head does
+  not add cold (overshoot ≠ heat demand); a heating head does not add warm. Seasonal
+  present-excess and emergency override skip the same manufactured side. Enter cool/heat
+  above `MODE_DEADBAND_KH`; hold until below `MODE_EXIT_KH` — but seasonal demotion is not
   re-promoted by the exit hold. With **no** confident free-float yet, arbitration uses
   `fallback_mode` (outdoor season + indoor deviation), not flat persistence alone — so a
   winter sunlit room cannot command house cooling. Boost beats presence-Away and skips

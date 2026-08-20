@@ -431,7 +431,7 @@
         "name": "Zone enabled"
       },
       "zone_quiet_night": {
-        "name": "Prefer cooling other zones at night"
+        "name": "Prefer conditioning other zones at night"
       },
       "manual_control": {
         "name": "Manual control (pause adaptive)"

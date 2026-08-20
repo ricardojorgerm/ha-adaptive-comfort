@@ -295,6 +295,8 @@ def demand_integrals(
 
     Integrates each zone's no-AC counterfactual vs its comfort band. Conditioning
     zones are included: predict_free is already "if this zone gets no AC."
+    A cooling head does not add cold (it manufactured the undershoot); a heating
+    head does not add warm.
     """
     warm = 0.0
     cold = 0.0
@@ -312,9 +314,16 @@ def demand_integrals(
         )
         weight = UNOCCUPIED_WEIGHT if occ is False else 1.0
         weight *= zone.n_rooms  # a mirrored zone is N rooms' worth of demand
+        # Active cooling made the room cold; that is not a heat request.
+        # Active heating made it hot; that is not a cool request. Manual
+        # pulldown (SP 18 overnight) must not elect heat at 25 °C outdoor.
+        skip_warm = zone.head_mode == MODE_HEAT
+        skip_cold = zone.head_mode == MODE_COOL
         for temp in trajectory:
-            warm += weight * max(0.0, temp - hi)  # 1 h per sample
-            cold += weight * max(0.0, lo - temp)
+            if not skip_warm:
+                warm += weight * max(0.0, temp - hi)  # 1 h per sample
+            if not skip_cold:
+                cold += weight * max(0.0, lo - temp)
     return warm, cold
 
 
@@ -332,9 +341,17 @@ def _emergency_override(
         if zone.occupied is False or zone.temp is None or zone.zone_id not in bands:
             continue
         lo, hi = bands[zone.zone_id]
-        if dominant == MODE_COOL and zone.temp < lo - OVERRIDE_DELTA_K:
+        if (
+            dominant == MODE_COOL
+            and zone.temp < lo - OVERRIDE_DELTA_K
+            and zone.head_mode != MODE_COOL
+        ):
             opposite = MODE_HEAT
-        elif dominant == MODE_HEAT and zone.temp > hi + OVERRIDE_DELTA_K:
+        elif (
+            dominant == MODE_HEAT
+            and zone.temp > hi + OVERRIDE_DELTA_K
+            and zone.head_mode != MODE_HEAT
+        ):
             opposite = MODE_COOL
     if opposite is None:
         state.override_since = 0.0
@@ -346,9 +363,17 @@ def _emergency_override(
                 if zone.temp is None or zone.zone_id not in bands:
                     continue
                 lo, hi = bands[zone.zone_id]
-                if state.override_mode == MODE_HEAT and zone.temp < lo:
+                if (
+                    state.override_mode == MODE_HEAT
+                    and zone.temp < lo
+                    and zone.head_mode != MODE_COOL
+                ):
                     still_needed = True
-                if state.override_mode == MODE_COOL and zone.temp > hi:
+                if (
+                    state.override_mode == MODE_COOL
+                    and zone.temp > hi
+                    and zone.head_mode != MODE_HEAT
+                ):
                     still_needed = True
             if not still_needed:
                 state.override_mode = None
@@ -366,10 +391,17 @@ def _max_present_excess(
     *,
     cool: bool,
 ) -> float | None:
-    """Largest current out-of-band excursion (K) on the cool or heat side."""
+    """Largest current out-of-band excursion (K) on the cool or heat side.
+
+    Skip heads that manufactured the excursion (cooling → not a heat need).
+    """
     best: float | None = None
     for zone in zones:
         if zone.temp is None or zone.zone_id not in bands:
+            continue
+        if cool and zone.head_mode == MODE_HEAT:
+            continue
+        if not cool and zone.head_mode == MODE_COOL:
             continue
         lo, hi = bands[zone.zone_id]
         excess = zone.temp - hi if cool else lo - zone.temp

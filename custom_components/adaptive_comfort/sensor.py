@@ -251,6 +251,10 @@ def _predictor_attrs(zone: ZoneRuntime, r: AdaptiveComfortRuntime) -> dict:
     stats = r.predictor_stats(zone.config.zone_id)
     attrs: dict[str, Any] = {f"{horizon}m": values for horizon, values in stats.items()}
     attrs["pending"] = r.predictor_scorer.pending_count(zone.config.zone_id)
+    attrs["blocked"] = zone.all_off_since is None
+    last_ts = r.predictor_scorer.last_scored_ts(zone.config.zone_id, 30)
+    if last_ts is not None:
+        attrs["last_scored"] = last_ts
     return attrs
 
 

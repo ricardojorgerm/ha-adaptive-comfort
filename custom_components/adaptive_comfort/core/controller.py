@@ -1509,6 +1509,11 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         diag["bands"] = {z: bands[z] for z in bands}
         diag["cop_band_widen_k"] = 0.0
         diag["cop_timing"] = "none"
+    elif s.preset == PRESET_MANUAL:
+        # User owns the plant. Do not re-arbitrate: a manual pulldown below
+        # the band would otherwise elect heat and latch MODE_DWELL_S.
+        mode = state.mode if state.mode in (MODE_HEAT, MODE_COOL, MODE_OFF) else MODE_OFF
+        diag["mode_source"] = "manual"
     elif s.hvac_mode in (MODE_HEAT, MODE_COOL):
         mode = s.hvac_mode
         diag["mode_source"] = "forced"

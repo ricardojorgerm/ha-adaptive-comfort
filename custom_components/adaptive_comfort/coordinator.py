@@ -1569,9 +1569,12 @@ class AdaptiveComfortRuntime:
                 free_float = tuple(trajectory)
                 if len(trajectory) > 1:
                     pred_60m = trajectory[1]
-                self._record_predictions(
-                    now_ts, zone, forecast, t_house, t_house_hourly, local_hour
-                )
+                # Free-float scores only while heads are off; recording during
+                # Manual/adaptive conditioning just queues rows that get dropped.
+                if zone.all_off_since is not None:
+                    self._record_predictions(
+                        now_ts, zone, forecast, t_house, t_house_hourly, local_hour
+                    )
             zone.free_float = free_float
             zone.pred_60m = pred_60m
             zone.standing_load_w = self._standing_load_w(zone)

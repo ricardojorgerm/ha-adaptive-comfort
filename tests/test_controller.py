@@ -82,6 +82,7 @@ def test_manual_emits_no_commands_but_keeps_want():
     zone = make_zone("bed", 26.0, is_on=True)
     snap = make_snapshot([zone], settings)
     state = warmed_state([zone])
+    state.mode = MODE_COOL
     state.zone_parked_since["bed"] = NOW
     decision = controller.tick(snap, state)
     assert decision.commands == []
@@ -129,6 +130,28 @@ def test_manual_clears_latched_shed_and_fan_keeps_coil_clock():
     assert state.shed == {}
     assert state.zone_fan == {}
     assert state.zone_last_cool.get("bed") == NOW
+
+
+def test_manual_does_not_flip_mode_on_cooling_overshoot():
+    """Manual pulldown below the band must not latch heat into MODE_DWELL_S."""
+    from custom_components.adaptive_comfort.core.types import PRESET_MANUAL, STATE_COOLING
+
+    settings = Settings(hvac_mode=MODE_AUTO, preset=PRESET_MANUAL)
+    zone = make_zone(
+        "bed",
+        19.5,
+        occupied=True,
+        is_on=True,
+        head_mode=MODE_COOL,
+        head_state=STATE_COOLING,
+    )
+    snap = make_snapshot([zone], settings, t_rm=23.5)
+    state = warmed_state([zone])
+    state.mode = MODE_COOL
+    decision = controller.tick(snap, state)
+    assert decision.commands == []
+    assert state.mode == MODE_COOL
+    assert decision.diag.get("mode_source") == "manual"
 
 
 def test_coordination_spreads_to_helper_zones():

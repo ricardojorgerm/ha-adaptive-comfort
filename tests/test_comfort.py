@@ -296,6 +296,38 @@ def test_demand_integrals_include_conditioning_zones():
     assert cold == 0.0
 
 
+def test_demand_integrals_skip_cold_from_cooling_heads():
+    """Active cooling below the band is overshoot, not a heat request."""
+    on = make_zone(
+        zone_id="west",
+        free_float=[19.5] * 24,
+        is_on=True,
+        temp=19.5,
+        head_mode=MODE_COOL,
+    )
+    bands = {"west": (21.8, 23.2)}
+    warm, cold = comfort.demand_integrals([on], bands)
+    assert warm == 0.0
+    assert cold == 0.0
+
+
+def test_cooling_overshoot_does_not_elect_heat_in_summer():
+    """Field: Manual/adaptive pulldown at 25 °C outdoor must not flip to heat."""
+    zone = make_zone(
+        temp=19.5,
+        free_float=[19.5] * 24,
+        is_on=True,
+        occupied=True,
+        head_mode=MODE_COOL,
+        confidence=0.9,
+    )
+    snap = make_snapshot([zone], t_rm=23.5)
+    state = ControllerState(mode=MODE_COOL, mode_since=0.0)
+    decision = comfort.dominant_mode(snap, state, {"z1": (21.8, 23.2)})
+    assert decision.mode != MODE_HEAT
+    assert decision.mode in (MODE_COOL, MODE_OFF)
+
+
 def test_hot_on_zone_keeps_cool_mode():
     """Field regression: occupied hot room that is already on must not drop to off."""
     zone = make_zone(

@@ -50,6 +50,7 @@ def test_scores_only_when_zone_off_throughout_horizon():
     assert scorer.pending_count("z1") == 0
     stats = scorer.stats("z1", 15)
     assert stats == {"bias_k": 0.5, "mae_k": 0.5, "n": 1}
+    assert scorer.last_scored_ts("z1", 15) == due_ts
 
 
 def test_ac_running_during_horizon_is_dropped_not_scored():
