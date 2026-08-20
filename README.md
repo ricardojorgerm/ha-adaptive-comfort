@@ -4,17 +4,21 @@ Self-learning whole-home thermostat for Home Assistant. Coordinates multiple AC 
 
 **Domain:** `adaptive_comfort` · **Requires:** Home Assistant 2025.4+
 
+**New install?** Follow [Getting started](docs/GETTING_STARTED.md).
+
 ## Features
 
 - **One house climate entity** — set target, mode (off/heat/cool/auto), and presets (eco/away/boost/manual); the integration drives your existing AC `climate` entities.
 - **Minimal configuration** — only room floor areas are required model inputs; everything else (UA, capacitance, air exchange, COP, latent load) is inferred.
 - **Multi-split aware** — all heads share one HVAC mode; optional fan assist for opposite-demand zones (respects wet-coil latent penalty).
-- **Model-driven mode selection** — predicts free-float drift instead of outdoor-temperature hysteresis; works from cold start with sensible priors and Lisbon climatology fallback.
+- **Model-driven mode selection** — predicts free-float drift instead of outdoor-temperature hysteresis; works from cold start with sensible priors and a climatology fallback.
 - **Power shedding** — sheds AC load against contracted kVA when grid power exceeds your limit.
 - **Optional open-window alerts** — when outdoors is much colder than indoors and someone is home, suggests opening windows instead of cooling (notification-ready binary sensor).
 - **Rich diagnostics** — k, ACH, UA, COP, sensible/latent power, drift offsets, model confidence per zone.
 
 ## Installation
+
+See [Getting started](docs/GETTING_STARTED.md) for a full walkthrough. Short version:
 
 ### HACS (recommended)
 
@@ -147,7 +151,7 @@ CI runs ruff, hassfest, HACS validation, and pytest on Python 3.13.
 
 ## Live validation
 
-After installing via HACS, work through the checklist in [`docs/VALIDATION.md`](docs/VALIDATION.md).
+After installing via HACS, follow [Getting started](docs/GETTING_STARTED.md), then the checklist in [`docs/VALIDATION.md`](docs/VALIDATION.md).
 
 ## License
 
