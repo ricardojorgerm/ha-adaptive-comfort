@@ -65,12 +65,8 @@ def test_cop_by_head_count_banded_is_cross_n_in_one_band():
 
 
 def test_cop_sample_mode_requires_controller_and_plant_agree():
-    assert (
-        power.cop_sample_mode("cool", any_heating=False, any_cooling=True) == "cool"
-    )
-    assert (
-        power.cop_sample_mode("heat", any_heating=True, any_cooling=False) == "heat"
-    )
+    assert power.cop_sample_mode("cool", any_heating=False, any_cooling=True) == "cool"
+    assert power.cop_sample_mode("heat", any_heating=True, any_cooling=False) == "heat"
     # Controller heat but heads still reporting cool (lag) → skip.
     assert power.cop_sample_mode("heat", any_heating=False, any_cooling=True) is None
     # Controller cool, no cooling heads → skip (do not default to cool).
@@ -85,3 +81,17 @@ def test_cop_depth_key_half_grid():
     assert power.cop_depth_key("cool", 0.0) == "cool|+0.0"
     assert power.cop_depth_key("heat", 1.26) == "heat|+1.5"
     assert power.cop_depth_key("cool", -0.74) == "cool|-0.5"
+
+
+def test_cop_by_depth_filters_mode_and_samples():
+    table = {
+        "cool|-0.5": (2.0, 25),
+        "cool|-2.0": (3.5, 25),
+        "cool|+1.0": (1.8, 25),
+        "heat|-0.5": (4.0, 25),
+        "cool|-1.0": (2.2, 10),
+    }
+    cool = power.cop_by_depth(table, "cool", min_samples=20)
+    assert cool == {-0.5: 2.0, -2.0: 3.5, 1.0: 1.8}
+    heat = power.cop_by_depth(table, "heat", min_samples=20)
+    assert heat == {-0.5: 4.0}

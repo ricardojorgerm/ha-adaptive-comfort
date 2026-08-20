@@ -292,7 +292,7 @@ def test_undercond_steps_down_toward_park_margin_floor():
 
 
 def test_undercond_steps_through_zero_into_chase_floor():
-    """Under-conditioning walks +1.0 → +0.5 → 0 → −track (chase floor), no force_chase cliff."""
+    """Under-conditioning walks +1.0 -> +0.5 -> 0 -> -track (chase floor), no force_chase cliff."""
     bins = _residual_bins(**{"1.0": 80.0, "2.0": 200.0})
     zone = replace(
         make_zone(
@@ -340,7 +340,7 @@ def test_undercond_steps_through_zero_into_chase_floor():
             assert cmd is not None
             assert cmd.head_depth_k == depth
         else:
-            # Reached 0 or chase floor (−0.5 default track).
+            # Reached 0 or chase floor (-0.5 default track).
             assert depth <= 0.0
             assert depth >= -controller.TRACK_DELTA_DEFAULT_K - 1e-9
             break

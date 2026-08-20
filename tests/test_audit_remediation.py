@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import random
+import time
 
 from custom_components.adaptive_comfort.core import controller, power
 from custom_components.adaptive_comfort.core.controller import (
@@ -235,8 +236,10 @@ def test_react_runs_on_shed_engage():
     rt.controller_state = ControllerState()
     rt.zones = {}
     rt.p_demand = 3200.0
-    rt.grid_over_since = NOW - 10.0
+    rt.grid_over_since = time.time() - 6.0
     rt.shed_urgent = False
+    assert not AdaptiveComfortRuntime._shed_needed_now(rt)
+    rt.grid_over_since = time.time() - 30.0
     assert AdaptiveComfortRuntime._react_should_run_control(rt)
 
 

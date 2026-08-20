@@ -117,7 +117,9 @@ fan assist, **and** shedding — and leaves heads as you set them. Estimators
 keep running. Hub HVAC **Off** still force-stops children even under Manual.
 
 Give it a day. Fit confidence starts low; the first hours use priors and
-indoor evidence, then free-float learning when heads are off. Expect:
+indoor evidence, then free-float learning when heads are off. Night spreading
+(extra in-band heads on a multi-split) is the cold-start prior — learned
+banded COP tables can later consolidate to fewer heads. Expect:
 
 - All multi-split heads in the **same** mode (never heat + cool together).
 - On periods at least the configured min-on (default 20 min).
@@ -126,6 +128,13 @@ indoor evidence, then free-float learning when heads are off. Expect:
 - Zone **Action** (`control_state`) showing `demand` / `helper` / `park` /
   `off` rather than the vendor `hvac_action` (those heads often report
   “cooling” while only the fan is running).
+
+**Eco** and **Away** share an energy-only run (wait until every zone needs a
+burst; no extra in-band coils; no quiet-night cover-first). They still differ
+on the target: Eco is a slightly wider center-seek; Away is a wider band-hold
+at the drift edge. Both clamp to about **18.8–26.2 °C** at the default target.
+Warning-band shedding confirms for 30 s; a critical overload still sheds
+immediately.
 
 Trust **Estimated AC power** (`p_ac`) over `hvac_action` for whether the
 compressor is actually working.

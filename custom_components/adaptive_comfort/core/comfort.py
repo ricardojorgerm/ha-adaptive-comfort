@@ -21,8 +21,11 @@ from .types import (
 )
 
 RUNNING_MEAN_TAU_H = 7.0 * 24.0
-ADAPTIVE_MIN_C = 20.0
-ADAPTIVE_MAX_C = 26.0
+# House envelope rails at default target 22.5: +/- (band_k + Away +3 K) -> 18.8-26.2.
+ADAPTIVE_MIN_C = 18.8
+ADAPTIVE_MAX_C = 26.2
+ECO_EXTRA_K = 1.5
+AWAY_EXTRA_K = 3.0
 
 # Lisbon climatological normals used as the outdoor fallback when neither an
 # outdoor sensor nor a weather entity is available (fresh installs stay sane).
@@ -87,12 +90,33 @@ def adaptive_target(t_rm: float) -> float:
     return min(max(0.33 * t_rm + 18.8, ADAPTIVE_MIN_C), ADAPTIVE_MAX_C)
 
 
+def house_envelope(settings: Settings) -> tuple[float, float]:
+    """Absolute indoor rails: ``target ± (band_k + Away extra)``.
+
+    Default 22.5 +/- 3.7 -> 18.8-26.2 C. Seasonal center may move inside;
+    Eco/Away widens cannot command outside.
+    """
+    half = settings.band_k + AWAY_EXTRA_K
+    return settings.target - half, settings.target + half
+
+
+def clamp_to_envelope(lo: float, hi: float, settings: Settings) -> tuple[float, float]:
+    elo, ehi = house_envelope(settings)
+    lo_c = min(max(lo, elo), ehi)
+    hi_c = min(max(hi, elo), ehi)
+    if lo_c > hi_c:
+        lo_c, hi_c = elo, ehi
+    return lo_c, hi_c
+
+
 def band_center(settings: Settings, t_rm: float | None, zone_offset: float = 0.0) -> float:
     center = settings.target
     if t_rm is not None and settings.adaptive_blend > 0:
         w = min(max(settings.adaptive_blend, 0.0), 1.0)
         center = (1.0 - w) * settings.target + w * adaptive_target(t_rm)
-    return center + zone_offset
+    center = center + zone_offset
+    elo, ehi = house_envelope(settings)
+    return min(max(center, elo), ehi)
 
 
 def effective_preset(settings: Settings, house_occupied: bool | None) -> str:
@@ -124,14 +148,18 @@ def zone_band(
     half = settings.band_k
     preset = effective_preset(settings, house_occupied)
     if preset == PRESET_ECO:
-        half += 1.5
+        half += ECO_EXTRA_K
     elif preset == PRESET_AWAY:
-        half += 3.0
+        half += AWAY_EXTRA_K
     elif preset == PRESET_BOOST:
         half = max(0.3, half * 0.5)
     # Manual uses the underlying band for diagnostics; it does not command.
     # Boost overrides vacant widen (same as it overrides presence-Away).
-    if effective_zone_occupied(settings, zone_occupied) is False and preset != PRESET_BOOST:
+    # Away already prices in empty-house slack — do not stack vacant +1.5 K.
+    if effective_zone_occupied(settings, zone_occupied) is False and preset not in (
+        PRESET_BOOST,
+        PRESET_AWAY,
+    ):
         half += UNOCCUPIED_WIDEN_K
     if extra_lo_k is None and extra_hi_k is None:
         extra_lo_k = extra_half_k
@@ -139,7 +167,9 @@ def zone_band(
     else:
         extra_lo_k = 0.0 if extra_lo_k is None else extra_lo_k
         extra_hi_k = 0.0 if extra_hi_k is None else extra_hi_k
-    return center - half - max(0.0, extra_lo_k), center + half + max(0.0, extra_hi_k)
+    lo = center - half - max(0.0, extra_lo_k)
+    hi = center + half + max(0.0, extra_hi_k)
+    return clamp_to_envelope(lo, hi, settings)
 
 
 def hold_edge_setpoint(mode: str, lo: float, hi: float, *, conditioning: bool) -> float:

@@ -151,6 +151,27 @@ def cop_by_band(
     return {band: acc[0] / acc[1] for band, acc in totals.items() if acc[1] >= min_samples}
 
 
+def cop_by_depth(
+    table: dict[str, tuple[float, int]],
+    mode: str,
+    min_samples: int,
+) -> dict[float, float]:
+    """Sample-gated COP by signed depth bin for one mode."""
+    prefix = f"{mode}|"
+    out: dict[float, float] = {}
+    for key, (cop, count) in table.items():
+        if count < min_samples or not key.startswith(prefix):
+            continue
+        rest = key[len(prefix) :]
+        if "|" in rest:
+            continue
+        try:
+            out[float(rest)] = cop
+        except ValueError:
+            continue
+    return out
+
+
 def cop_by_head_count_banded(
     table: dict[str, tuple[float, int]],
     mode: str,
@@ -537,7 +558,7 @@ def allocate_power(
 
 # -- contracted-power shedding ------------------------------------------------
 
-SHED_SUSTAINED_S = 5.0
+SHED_SUSTAINED_S = 30.0
 SHED_CRITICAL_PCT = 0.96
 SHED_PEAK_WINDOW_S = 120.0
 SHED_DEFAULT_START_PCT = 0.88

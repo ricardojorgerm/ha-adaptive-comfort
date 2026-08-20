@@ -74,9 +74,21 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   lag skips the row rather than contaminating the other season. Head count and
   weather stay confounded inside a mode (3 heads ↔ hot afternoons) — never draw
   head-count conclusions from the unbanded table alone. Helper drop uses
-  `cop_by_head_count_banded` (live outdoor band, demand vs demand+helpers) and
-  falls back to unbanded only when that band lacks both N keys. Schema 2 bare keys
+  `cop_by_head_count_banded` (live outdoor band, demand vs demand+helpers).
+  Missing either N key → spread (evaporator-first prior). Unbanded keys never
+  decide. Schema 2 bare keys
   migrate into `cool|…` on restore; schema 4 adds the depth ledger.
+  Cold-start / thin tables: pack extra in-band coils (occupancy-blind, including
+  past center toward the far edge) so a burst is not a solo cold coil. Learned
+  banded `cop(N_demand) > cop(N_spread) × COP_TABLE_ADVANTAGE` consolidates.
+  None-preset demand holds the **warm** band edge; `cop_by_depth` may raise the
+  in-band chase cap. After demand rooms return in-band, N≥2 already-on coils
+  residual-park together (`pack_stay`) rather than peeling to one leftover.
+  Eco/Away share an energy-only run (`energy_wait`): wait until every zone
+  needs conditioning, skip quiet-night cover-first and extra in-band coils.
+  House envelope is `target ± (band_k + 3)` (default **18.8–26.2 °C**).
+  Warning-band shed stays over `SHED_SUSTAINED_S` (30 s); critical/urgent is
+  immediate.
 - **Persistence**: everything that must survive a restart goes through `coordinator._persist()`
   / restore and the `to_dict`/`from_dict` pairs. If you add controller state or a setting,
   wire all four places: dataclass, `to_dict`, `from_dict`, and the `_persist` settings dict
@@ -201,14 +213,23 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   winter sunlit room cannot command house cooling. Boost beats presence-Away and skips
   vacant band widen; Away/vacant demand setpoints hold near the band edge (not center).
   **House presence** (`presence_adaptation`): vacant house → Away preset; homecoming
-  clears track deltas; off disables auto-Away only. **Zone presence**
-  (`zone_presence_adaptation`, default on): vacant widen, vacant band-hold, skip
-  vacant helpers/fan-assist, and unoccupied weight in mode integrals; off treats
+  clears track deltas; off disables auto-Away only.   **Zone presence**
+  (`zone_presence_adaptation`, default on): vacant widen, vacant band-hold,
+  skip vacant fan-assist, and unoccupied weight in mode integrals; pack
+  recruitment is occupancy-blind. Off treats
   zone occupancy as unknown (`effective_zone_occupied` → `None`) for those paths
   while sensors still update for diagnostics.
+  **Eco vs Away** share that energy-only when/who; Eco is +1.5 K center-seek
+  (occupied-house cheap), Away is +3 K band-hold (house empty). They do not
+  stack; presence Away replaces Eco; vacant +1.5 K does not stack on Away.
+  Edges clamp into `target ± (band_k + 3)` (18.8–26.2 at defaults).
   **Quiet night** (`zone_quiet_night`, per zone, default off): 22:00–08:00,
-  heat or cool. This zone is not selected as helper / fan-assist / preferred
-  anchor. Out-of-band demand still uses the same comfort band as other rooms.
+  heat or cool, **None/Boost only** (Eco/Away skip this). Other rooms cover
+  first and may chase the extended far edge (vacant-widen slack on the
+  conditioning side); recruit the sleeper after that (or `OVERRIDE_DELTA_K`),
+  then keep the pack. This zone is not selected as helper / fan-assist /
+  preferred anchor until cover is spent. Out-of-band demand still uses the
+  same comfort band as other rooms.
   In-band standing load may be carried by another zone (vacant cover allowed).
   Two hours before night (`QUIET_NIGHT_BANK_H`), this zone may run to the
   **conditioning hold edge** of that band (cool: `lo + BAND_HOLD_MARGIN_K`;

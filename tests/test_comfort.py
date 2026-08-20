@@ -34,9 +34,29 @@ def make_snapshot(zones, t_rm=None, now=1_000_000.0, aux=()):
 
 
 def test_adaptive_target_clamped():
-    assert comfort.adaptive_target(30.0) == 26.0
-    assert comfort.adaptive_target(0.0) == 20.0
+    assert comfort.adaptive_target(30.0) == 26.2
+    assert comfort.adaptive_target(0.0) == 18.8
     assert abs(comfort.adaptive_target(20.0) - (0.33 * 20 + 18.8)) < 1e-9
+
+
+def test_house_envelope_matches_away_rails():
+    s = Settings(target=22.5, band_k=0.7)
+    assert comfort.house_envelope(s) == (18.8, 26.2)
+    lo, hi = comfort.clamp_to_envelope(10.0, 40.0, s)
+    assert (lo, hi) == (18.8, 26.2)
+
+
+def test_away_does_not_stack_vacant_widen():
+    from custom_components.adaptive_comfort.core.types import PRESET_AWAY, PRESET_ECO
+
+    s = Settings(target=22.5, band_k=0.7, preset=PRESET_AWAY)
+    lo, hi = comfort.zone_band(s, 22.5, zone_occupied=False, house_occupied=False)
+    assert abs(lo - 18.8) < 1e-9
+    assert abs(hi - 26.2) < 1e-9
+    s_eco = Settings(target=22.5, band_k=0.7, preset=PRESET_ECO)
+    lo_e, hi_e = comfort.zone_band(s_eco, 22.5, zone_occupied=True, house_occupied=True)
+    assert abs((hi_e - lo_e) / 2 - 2.2) < 1e-9
+    assert lo_e >= 18.8 and hi_e <= 26.2
 
 
 def test_band_center_blend():

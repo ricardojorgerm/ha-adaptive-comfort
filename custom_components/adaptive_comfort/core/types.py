@@ -116,8 +116,9 @@ class Settings:
     coordination: bool = True
     # House-level: vacant house → Away preset; homecoming clears track deltas.
     presence_adaptation: bool = True
-    # Zone-level: vacant widen, vacant band-hold, skip vacant helpers / fan-assist,
-    # and down-weight vacant zones in mode integrals. Off → treat occupancy as
+    # Zone-level: vacant widen, vacant band-hold, skip vacant fan-assist,
+    # and down-weight vacant zones in mode integrals. Pack recruitment does
+    # not use occupancy. Off → treat occupancy as
     # unknown for those paths (sensors still update for diagnostics).
     zone_presence_adaptation: bool = True
     shedding_enabled: bool = True
@@ -254,6 +255,8 @@ class HouseSnapshot:
     cop_by_head_count: dict[int, float] = field(default_factory=dict)  # empirical COP hints
     # Head-count COP for the live outdoor band only (cross-N helper drop).
     cop_by_head_count_banded: dict[int, float] = field(default_factory=dict)
+    # Signed depth-bin COP for the snapshot mode (chase / hold economics).
+    cop_by_depth: dict[float, float] = field(default_factory=dict)
     # Empirical COP by outdoor band ('mild'|'warm'|'hot') for the mode in
     # ``cop_by_band_mode`` (sample-gated, aggregated across head counts).
     # COP-timed widen: advance/defer predictive demand with a bounded wider

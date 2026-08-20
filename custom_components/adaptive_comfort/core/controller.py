@@ -15,8 +15,11 @@ from .types import (
     MODE_FAN,
     MODE_HEAT,
     MODE_OFF,
+    PRESET_AWAY,
     PRESET_BOOST,
+    PRESET_ECO,
     PRESET_MANUAL,
+    PRESET_NONE,
     STATE_COOLING,
     STATE_FAN_ONLY,
     Command,
@@ -149,15 +152,22 @@ def _quiet_night_cover(
     quiet_ids: set[str],
     bands: dict[str, tuple[float, float]],
     mode: str,
+    s: Settings,
 ) -> ZoneSnapshot | None:
     """One non-quiet zone that can carry standing load instead of the sleep room."""
-    cands = [
-        z
-        for z in zones
-        if z.zone_id not in quiet_ids
-        and z.temp is not None
-        and not _reached_far_edge(z, *bands[z.zone_id], mode)
-    ]
+    cands = []
+    for z in zones:
+        if z.zone_id in quiet_ids or z.temp is None:
+            continue
+        lo, hi = bands[z.zone_id]
+        ext_lo, ext_hi = _extended_cover_band(s, z, lo, hi, mode)
+        # Spent cover still belongs in the pack after the sleeper joins.
+        if _reached_far_edge(z, ext_lo, ext_hi, mode) and z.temp is not None:
+            if mode == MODE_COOL and z.temp < ext_lo:
+                continue
+            if mode == MODE_HEAT and z.temp > ext_hi:
+                continue
+        cands.append(z)
     if not cands:
         return None
     return max(cands, key=lambda z: (z.is_on, z.temp or 0.0))
@@ -183,36 +193,59 @@ def _apply_quiet_night(
     mode: str,
     bands: dict[str, tuple[float, float]],
     centers: dict[str, float],
-) -> tuple[list[ZoneSnapshot], list[ZoneSnapshot], list[str]]:
+    *,
+    energy_save: bool,
+) -> tuple[list[ZoneSnapshot], list[ZoneSnapshot], list[str], str | None]:
     """Prefer other zones at night. Same comfort band as everyone else.
 
-    Quiet rooms stay demand when they are out of band. They are skipped as
-    helpers / fan-assist / preferred anchors. If they are only on the
-    conditioning side of center, a vacant sibling may carry standing load.
+    Cover may run to the extended far edge (vacant-widen slack on the
+    conditioning side even if occupied). Quiet rooms stay off that path
+    until the cover is spent or OVERRIDE_DELTA_K. Eco/Away skip this.
     """
+    if energy_save:
+        return demand, helpers, [], None
     quiet_ids = {
         z.zone_id for z in zones if _quiet_night_active(s, z.zone_id, snap.local_hour, mode)
     }
     helpers = [z for z in helpers if z.zone_id not in quiet_ids]
     if not quiet_ids:
-        return demand, helpers, []
-    cover = _quiet_night_cover(zones, quiet_ids, bands, mode)
+        return demand, helpers, [], None
+    cover = _quiet_night_cover(zones, quiet_ids, bands, mode, s)
     demand_ids = {z.zone_id for z in demand}
     deferred: list[str] = []
+    cover_id = cover.zone_id if cover is not None else None
+    cover_spent = False
     if cover is not None:
+        lo_c, hi_c = _extended_cover_band(s, cover, *bands[cover.zone_id], mode)
+        cover_spent = _reached_far_edge(cover, lo_c, hi_c, mode)
+    if cover is not None and not cover_spent:
+        kept: list[ZoneSnapshot] = []
+        for zone in demand:
+            if zone.zone_id not in quiet_ids:
+                kept.append(zone)
+                continue
+            lo_b, hi_b = bands[zone.zone_id]
+            if _same_mode_override(zone, lo_b, hi_b, mode):
+                kept.append(zone)
+                continue
+            deferred.append(zone.zone_id)
+        demand = kept
+        demand_ids = {z.zone_id for z in demand}
         taken = demand_ids | {z.zone_id for z in helpers}
+        if cover.zone_id not in taken:
+            helpers.append(cover)
         for zone in zones:
             if zone.zone_id not in quiet_ids:
                 continue
-            if zone.zone_id in demand_ids:
+            if zone.zone_id in demand_ids or zone.zone_id in deferred:
                 continue
-            if not _quiet_night_wants_cover(zone, centers[zone.zone_id], mode):
-                continue
-            deferred.append(zone.zone_id)
-            if cover.zone_id not in taken:
-                helpers.append(cover)
-            break
-    return demand, helpers, deferred
+            if _quiet_night_wants_cover(zone, centers[zone.zone_id], mode):
+                deferred.append(zone.zone_id)
+    elif cover is not None and cover_spent:
+        taken = demand_ids | {z.zone_id for z in helpers}
+        if cover.zone_id not in taken and cover.zone_id not in quiet_ids:
+            helpers.append(cover)
+    return demand, helpers, deferred, cover_id
 
 
 def _band_cop(snap: HouseSnapshot, band: str, mode: str) -> float | None:
@@ -496,15 +529,127 @@ COP_TABLE_ADVANTAGE = 1.05
 def _cop_n_pair(
     snap: HouseSnapshot, n_demand: int, n_spread: int
 ) -> tuple[float | None, float | None]:
-    """Demand vs demand+helpers COP, preferring the live outdoor band."""
+    """Demand vs demand+helpers COP from the live outdoor band only.
+
+    Unbanded head-count COP is diagnostic (N confounded with weather) and
+    must not decide spread vs consolidate.
+    """
     banded = snap.cop_by_head_count_banded
-    if banded:
-        demand = banded.get(n_demand)
-        spread = banded.get(n_spread)
-        if demand is not None and spread is not None:
-            return demand, spread
-    heads = snap.cop_by_head_count
-    return heads.get(n_demand), heads.get(n_spread)
+    if not banded:
+        return None, None
+    return banded.get(n_demand), banded.get(n_spread)
+
+
+def _energy_save_preset(preset: str) -> bool:
+    return preset in (PRESET_ECO, PRESET_AWAY)
+
+
+def _same_mode_override(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> bool:
+    """True when the room is past OVERRIDE_DELTA_K on the demand side."""
+    if zone.temp is None:
+        return False
+    if mode == MODE_COOL:
+        return zone.temp > hi + comfort.OVERRIDE_DELTA_K
+    if mode == MODE_HEAT:
+        return zone.temp < lo - comfort.OVERRIDE_DELTA_K
+    return False
+
+
+def _extended_cover_band(
+    s: Settings,
+    zone: ZoneSnapshot,
+    lo: float,
+    hi: float,
+    mode: str,
+) -> tuple[float, float]:
+    """Cover far-edge: vacant-widen slack on the conditioning side if occupied."""
+    ext_lo, ext_hi = lo, hi
+    if comfort.effective_zone_occupied(s, zone.occupied) is not False:
+        if mode == MODE_COOL:
+            ext_lo -= comfort.UNOCCUPIED_WIDEN_K
+        elif mode == MODE_HEAT:
+            ext_hi += comfort.UNOCCUPIED_WIDEN_K
+    return comfort.clamp_to_envelope(ext_lo, ext_hi, s)
+
+
+def _depth_chase_cap_k(snap: HouseSnapshot, n_heads: int, in_band: bool) -> float:
+    """In-band pack: shallow chase unless cop_by_depth says a deeper bin wins."""
+    if n_heads < 2 or not in_band:
+        return TRACK_DELTA_MAX_K
+    table = snap.cop_by_depth
+    if not table:
+        return TRACK_DELTA_MIN_K
+    shallow = table.get(-TRACK_DELTA_MIN_K)
+    best = TRACK_DELTA_MIN_K
+    best_cop = shallow
+    for depth, cop in table.items():
+        if depth >= 0.0:
+            continue
+        chase = abs(depth)
+        if best_cop is None or cop > best_cop * COP_TABLE_ADVANTAGE:
+            best_cop = cop
+            best = min(max(chase, TRACK_DELTA_MIN_K), TRACK_DELTA_MAX_K)
+    return best
+
+
+def _shallow_hold_k(zone: ZoneSnapshot) -> float:
+    """Helper/pack hysteresis cap: keep compressing, never the fan-type shelf.
+
+    Recruited extras walk here 0.5 K/tick instead of jumping to a deep
+    covering residual that lets the head's internal hysteresis shut off.
+    """
+    cap = PARK_MARGIN_K
+    if zone.park_residual_max_margin_k is not None:
+        cap = min(cap, max(0.0, float(zone.park_residual_max_margin_k)))
+    fan = zone.park_fan_type_min_margin_k
+    if fan is not None and fan > 0.0:
+        cap = min(cap, float(fan) - DEPTH_STEP_K)
+    return max(0.0, _quantize_depth(cap))
+
+
+def _step_depth_toward(current: float, target: float) -> float:
+    if current < target - 1e-9:
+        return min(current + DEPTH_STEP_K, target)
+    if current > target + 1e-9:
+        return max(current - DEPTH_STEP_K, target)
+    return current
+
+
+def _pack_residual_ids(
+    zones: list[ZoneSnapshot],
+    bands: dict[str, tuple[float, float]],
+    mode: str,
+    state: ControllerState,
+    *,
+    energy_wait: bool,
+    consolidated: bool,
+    demand: list[ZoneSnapshot],
+) -> set[str]:
+    """In-band already-on coils that should residual-park together.
+
+    While demand is live, extras are helpers (want_on). After the burst's
+    demand rooms return in-band, keep N≥2 loaded via park rather than
+    peeling to a leftover cold coil. Solo leftovers and learned
+    consolidate still drop. Eco/Away energy-wait does not hold a pack.
+    """
+    if energy_wait or consolidated or demand or mode not in (MODE_HEAT, MODE_COOL):
+        return set()
+    members: list[str] = []
+    for zone in zones:
+        if not zone.enabled or zone.temp is None:
+            continue
+        currently = zone.is_on or state.zone_on.get(zone.zone_id, False)
+        if not currently:
+            continue
+        lo, hi = bands[zone.zone_id]
+        if _reached_far_edge(zone, lo, hi, mode):
+            continue
+        if not _park_ok_now(zone, lo, hi, mode):
+            continue
+        members.append(zone.zone_id)
+    if len(members) < 2:
+        return set()
+    return set(members)
 
 
 # Fan assist: a multi-split head cannot run opposite to the shared mode, but
@@ -838,7 +983,7 @@ def _quantize_depth(depth_k: float) -> float:
 
 
 def _chase_floor_k(state: ControllerState, zid: str) -> float:
-    """Under-conditioning extreme: −tracking chase on the 0.5 K grid."""
+    """Under-conditioning extreme: -tracking chase on the 0.5 K grid."""
     chase = state.zone_track_delta.get(zid, TRACK_DELTA_DEFAULT_K)
     chase = min(max(float(chase), TRACK_DELTA_MIN_K), TRACK_DELTA_MAX_K)
     return -_quantize_depth(chase)
@@ -1589,7 +1734,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         demand = kept
     diag["free_riders"] = sorted(free_riders)
     banked: list[str] = []
-    if mode in (MODE_HEAT, MODE_COOL):
+    if mode in (MODE_HEAT, MODE_COOL) and not _energy_save_preset(preset):
         demand_ids = {z.zone_id for z in demand}
         for zone in zones:
             if zone.zone_id in demand_ids:
@@ -1605,34 +1750,50 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     demand_ids = {z.zone_id for z in demand}
 
     helpers: list[ZoneSnapshot] = []
-    if demand and s.coordination and snap.settings.hvac_mode in (MODE_AUTO, mode):
+    energy_save = _energy_save_preset(preset)
+    if (
+        demand
+        and s.coordination
+        and snap.settings.hvac_mode in (MODE_AUTO, mode)
+        and not energy_save
+    ):
         for zone in zones:
             if zone.zone_id in demand_ids:
                 continue
             if zone.zone_id in free_riders:
                 continue
-            if comfort.effective_zone_occupied(s, zone.occupied) is False:
-                continue
             if _quiet_night_active(s, zone.zone_id, snap.local_hour, mode):
                 continue
-            # A helper must have margin in the mode direction: only trim
-            # rooms sitting above center (cooling) / below center (heating).
-            center = centers[zone.zone_id]
             if zone.temp is None:
                 continue
-            if mode == MODE_COOL and zone.temp <= center:
-                continue
-            if mode == MODE_HEAT and zone.temp >= center:
+            currently = zone.is_on or state.zone_on.get(zone.zone_id, False)
+            if currently:
+                # Already-on extras stay loaded via residual park, not
+                # tracked helper setpoints (that would block park entry).
                 continue
             if _reached_far_edge(zone, *bands[zone.zone_id], mode):
                 continue
             helpers.append(zone)
+        helpers.sort(key=lambda z: (not z.is_on, z.zone_id))
 
-    # Empirical COP table: consolidate when fewer heads have measurably
-    # better efficiency at similar conditions.
+    # Keep mixing leads on: free-ride drops the rider, not the covering head.
+    if free_riders and s.coordination and not energy_save:
+        taken = {z.zone_id for z in demand} | {z.zone_id for z in helpers}
+        for zone in zones:
+            if zone.zone_id in taken or zone.zone_id in free_riders:
+                continue
+            if not zone.is_on or zone.temp is None:
+                continue
+            if _reached_far_edge(zone, *bands[zone.zone_id], mode):
+                continue
+            helpers.append(zone)
+            taken.add(zone.zone_id)
+
+    # Empirical COP table: consolidate only from the live outdoor band.
     n_spread = sum(z.n_rooms for z in demand) + sum(z.n_rooms for z in helpers)
     n_demand = sum(z.n_rooms for z in demand)
     cop_demand, cop_spread = _cop_n_pair(snap, n_demand, n_spread)
+    cop_n_source = "prior"
     if (
         helpers
         and cop_spread is not None
@@ -1641,16 +1802,58 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     ):
         helpers = []
         diag["consolidated_by_cop_table"] = True
-    demand, helpers, quiet_deferred = _apply_quiet_night(
-        zones, demand, helpers, s, snap, mode, bands, centers
+        cop_n_source = "banded_consolidate"
+    elif cop_demand is not None and cop_spread is not None:
+        cop_n_source = "banded_spread"
+    diag["cop_n_source"] = cop_n_source
+
+    demand, helpers, quiet_deferred, quiet_cover_id = _apply_quiet_night(
+        zones, demand, helpers, s, snap, mode, bands, centers, energy_save=energy_save
     )
+
+    # Eco/Away: wait until every enabled zone needs conditioning, unless
+    # override or the N-table says the smaller demand set wins.
+    energy_wait = False
+    if energy_save and mode in (MODE_HEAT, MODE_COOL) and demand:
+        enabled = [z for z in zones if z.enabled]
+        all_need = all(
+            _wants_conditioning(z, *bands[z.zone_id], mode, s.min_on_min, cop_timing)
+            for z in enabled
+        )
+        override = any(_same_mode_override(z, *bands[z.zone_id], mode) for z in enabled)
+        n_all = sum(z.n_rooms for z in enabled)
+        n_dem = sum(z.n_rooms for z in demand)
+        cd, cs = _cop_n_pair(snap, n_dem, n_all)
+        consolidate_ok = cd is not None and cs is not None and cd > cs * COP_TABLE_ADVANTAGE
+        if not all_need and not override and not consolidate_ok:
+            demand = []
+            helpers = []
+            energy_wait = True
+    diag["energy_wait"] = energy_wait
+
     demand_ids = {z.zone_id for z in demand}
     helper_ids = {z.zone_id for z in helpers}
+    pack_ids = _pack_residual_ids(
+        zones,
+        bands,
+        mode,
+        state,
+        energy_wait=energy_wait,
+        consolidated=bool(diag.get("consolidated_by_cop_table")),
+        demand=demand,
+    )
+
     diag["demand"] = sorted(demand_ids)
     diag["helpers"] = sorted(helper_ids)
     diag["quiet_night_deferred"] = sorted(quiet_deferred)
+    diag["n_heads"] = sum(z.n_rooms for z in demand) + sum(z.n_rooms for z in helpers)
+    diag["spread_prior"] = diag.get("cop_n_source") == "prior" and bool(helpers)
+    if quiet_cover_id:
+        diag["quiet_cover_extended"] = quiet_cover_id
+    if pack_ids:
+        diag["pack_stay"] = sorted(pack_ids)
 
-    want_on = {z.zone_id: (z in demand or z in helpers) for z in zones}
+    want_on = {z.zone_id: (z.zone_id in demand_ids or z.zone_id in helper_ids) for z in zones}
     for zid in free_riders:
         want_on[zid] = False
 
@@ -1664,7 +1867,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             ordered = sorted(
                 zones,
                 key=lambda z: (
-                    0 if not _quiet_night_active(s, z.zone_id, snap.local_hour, mode) else 1
+                    0 if z.is_on else 1,
+                    0 if not _quiet_night_active(s, z.zone_id, snap.local_hour, mode) else 1,
                 ),
             )
             for zone in ordered:
@@ -1881,6 +2085,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             )
             floor = _chase_floor_k(state, zid)
             ceiling = _hysteresis_ceiling_k(zone, state)
+            if zid in helper_ids:
+                ceiling = min(ceiling, _shallow_hold_k(zone))
             depth = _sync_depth_views(state, zid, depth, now, lo=floor, hi=ceiling)
             if overcorrected or should_off:
                 _clear_park_session(state, zid, zone, now)
@@ -1905,7 +2111,9 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 or zid in state.shed
                 or _transition_allowed(state, zid, now, False, s)
             )
-            sibling_alive = any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones)
+            sibling_alive = any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones) or (
+                zid in pack_ids and len(pack_ids) >= 2
+            )
             # Sibling conditioning + mixing already covers this zone's hold
             # load → residual park is pure extra compressor work; release.
             covering_sibs = [
@@ -1965,7 +2173,6 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 floor = _chase_floor_k(state, zid)
                 ceiling = _hysteresis_ceiling_k(zone, state)
                 depth = _sync_depth_views(state, zid, depth, now, lo=floor, hi=ceiling)
-            margin = depth if depth > 0.0 else preferred
 
             hold_ceiling = (
                 _hysteresis_ceiling_k(zone, state)
@@ -2110,6 +2317,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 or plant_min_on
                 or _anchor_active(state, s, mode, zid)
                 or any(want_on.get(z.zone_id) and z.zone_id != zid for z in zones)
+                or zid in pack_ids
             )
             and _transition_allowed(state, zid, now, False, s)
         ):
@@ -2126,6 +2334,9 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             if plant_hold or probe_due or exploit:
                 preferred = _park_preferred(zone, state)
                 entry = _park_entry_margin(zone, state)
+                if zid in pack_ids:
+                    hold = _shallow_hold_k(zone)
+                    entry = min(entry, hold) if hold > 0.0 else min(entry, PARK_MARGIN_K)
                 state.zone_park_preferred[zid] = preferred
                 state.zone_parked_since[zid] = now
                 state.zone_park_margin[zid] = entry
@@ -2191,19 +2402,35 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             center = centers[zid]
             lo, hi = bands[zid]
             condition_hold = False
+            quiet_cover = diag.get("quiet_cover_extended") == zid
             if zid in demand_ids:
                 condition_hold = _quiet_night_condition_hold(s, zid, snap.local_hour, mode)
-                setpoint = comfort.demand_setpoint(
-                    mode,
-                    center,
-                    lo,
-                    hi,
-                    zone.occupied,
-                    preset,
-                    s,
-                    condition_hold=condition_hold,
-                )
+                if (
+                    not condition_hold
+                    and preset == PRESET_NONE
+                    and s.coordination
+                    and mode == MODE_COOL
+                ):
+                    # Cool prior: hold near the return-air-warm edge (higher Tevap).
+                    setpoint = comfort.hold_edge_setpoint(mode, lo, hi, conditioning=False)
+                else:
+                    setpoint = comfort.demand_setpoint(
+                        mode,
+                        center,
+                        lo,
+                        hi,
+                        zone.occupied,
+                        preset,
+                        s,
+                        condition_hold=condition_hold,
+                    )
                 reason = "demand"
+            elif quiet_cover:
+                ext_lo, ext_hi = _extended_cover_band(s, zone, lo, hi, mode)
+                setpoint = comfort.hold_edge_setpoint(mode, ext_lo, ext_hi, conditioning=True)
+                reason = "helper"
+                condition_hold = True
+                lo, hi = ext_lo, ext_hi
             else:
                 # Helper zones trim gently toward the band edge.
                 offset = HELPER_BAND_FRACTION * (hi - center)
@@ -2220,7 +2447,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
             # Tracking depth adaptation (room frame): deepen while the room is
             # not converging toward its target edge, relax once it is inside.
-            # Continuum head depth is floored at −this chase (0.5 grid).
+            # Continuum head depth is floored at -this chase (0.5 grid).
             track_delta = None
             depth_k: float | None = None
             if s.tracking and mode in (MODE_HEAT, MODE_COOL):
@@ -2230,15 +2457,38 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                         zone.temp <= setpoint if mode == MODE_COOL else zone.temp >= setpoint
                     )
                     out_of_band = zone.temp > pick_hi if mode == MODE_COOL else zone.temp < pick_lo
+                    n_on = sum(
+                        z.n_rooms
+                        for z in zones
+                        if want_on.get(z.zone_id) and z.zone_id not in state.shed
+                    )
+                    chase_cap = _depth_chase_cap_k(snap, n_on, not out_of_band)
                     if out_of_band:
                         delta += TRACK_DELTA_STEP_K
                     elif past_target:
                         delta -= TRACK_DELTA_STEP_K
+                    delta = min(delta, chase_cap)
                 delta = min(max(delta, TRACK_DELTA_MIN_K), TRACK_DELTA_MAX_K)
                 state.zone_track_delta[zid] = delta
                 track_delta = delta
                 # Continuum depth from prior adapt / residual pick.
-                if zid in state.zone_head_depth_k and zid not in state.zone_parked_since:
+                if reason == "helper" and not condition_hold:
+                    # Recruited extras ease into a shallow residual hold
+                    # (0.5 K/tick). A jump to the covering park bin is deep
+                    # enough for the head's own hysteresis to shut off.
+                    cap = _shallow_hold_k(zone)
+                    current = state.zone_head_depth_k.get(zid)
+                    if current is None:
+                        current = -delta
+                    depth_k = _step_depth_toward(current, cap)
+                    if zone.park_current_is_fan_type is True and depth_k > 0.0:
+                        depth_k = max(depth_k - DEPTH_STEP_K, 0.0)
+                    floor = _chase_floor_k(state, zid)
+                    ceiling = min(_hysteresis_ceiling_k(zone, state), cap)
+                    depth_k = _sync_depth_views(
+                        state, zid, depth_k, now, lo=floor, hi=max(ceiling, 0.0)
+                    )
+                elif zid in state.zone_head_depth_k and zid not in state.zone_parked_since:
                     # Already stepped into 0/chase via continuum; clamp to live
                     # chase floor after track adapt above.
                     floor = _chase_floor_k(state, zid)

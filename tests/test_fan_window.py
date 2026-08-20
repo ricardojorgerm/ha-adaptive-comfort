@@ -6,7 +6,6 @@ from custom_components.adaptive_comfort.core.types import (
     MODE_COOL,
     MODE_FAN,
     MODE_HEAT,
-    MODE_OFF,
     STATE_COOLING,
     ControllerState,
     HouseSnapshot,
@@ -88,9 +87,10 @@ def test_fan_stops_when_zone_recovers():
     state.zone_fan["cold"] = True
     decision = controller.tick(snap, state)
     by_zone = {c.zone_id: c for c in decision.commands}
-    assert by_zone["cold"].hvac_mode == MODE_OFF
-    assert by_zone["cold"].reason == "fan_off"
-    assert not state.zone_fan["cold"]
+    # Recovered in-band room joins the pack as an extra coil (not fan-only).
+    assert by_zone["cold"].hvac_mode == MODE_COOL
+    assert by_zone["cold"].reason == "helper"
+    assert not state.zone_fan.get("cold")
 
 
 def test_wet_coil_tracked_from_head_state():

@@ -61,7 +61,8 @@ def test_shed_thresholds_for_345_kva():
     start = power.SHED_DEFAULT_START_PCT
     assert not power.shed_needed(3000.0, limit, start, None)
     assert not power.shed_needed(3300.0, limit, start, 3.0)  # not sustained
-    assert power.shed_needed(3300.0, limit, start, 6.0)
+    assert not power.shed_needed(3300.0, limit, start, 6.0)  # warning band needs 30 s
+    assert power.shed_needed(3300.0, limit, start, 30.0)
     assert power.shed_needed(3400.0, limit, start, None, urgent=True)
     assert power.shed_needed(3320.0, limit, start, None)  # >= 96% critical
     assert power.restore_allowed(1500.0, limit, 0.75, 700.0)

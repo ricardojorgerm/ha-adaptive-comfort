@@ -1641,10 +1641,12 @@ class AdaptiveComfortRuntime:
                 cop_banded_n = power.cop_by_head_count_banded(
                     self.cop_table_banded, mode_hint, band, COP_TABLE_MIN_SAMPLES
                 )
+            cop_depth = power.cop_by_depth(self.cop_table_depth, mode_hint, COP_TABLE_MIN_SAMPLES)
         else:
             cop_hints = {}
             cop_by_band = {}
             cop_by_band_mode = None
+            cop_depth = {}
         # Sensors in unconditioned rooms (e.g. a bathroom) give a fresh
         # install extra indoor evidence for cold-start mode arbitration.
         aux_indoor: list[tuple[float, float]] = []
@@ -1671,6 +1673,7 @@ class AdaptiveComfortRuntime:
             forecast_hours=tuple(forecast),
             cop_by_head_count=cop_hints,
             cop_by_head_count_banded=cop_banded_n,
+            cop_by_depth=cop_depth,
             cop_by_band=cop_by_band,
             cop_by_band_mode=cop_by_band_mode,
             aux_indoor=tuple(aux_indoor),
