@@ -16,6 +16,7 @@ from homeassistant.components.sensor import (
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
     PERCENTAGE,
+    UnitOfEnergy,
     UnitOfPower,
     UnitOfTemperature,
 )
@@ -60,6 +61,15 @@ HOUSE_SENSORS: tuple[HouseSensorDescription, ...] = (
         device_class=SensorDeviceClass.POWER,
         state_class=SensorStateClass.MEASUREMENT,
         value_fn=lambda r: _round(r.p_ac, 0),
+    ),
+    HouseSensorDescription(
+        key="ac_energy",
+        translation_key="ac_energy",
+        native_unit_of_measurement=UnitOfEnergy.WATT_HOUR,
+        device_class=SensorDeviceClass.ENERGY,
+        state_class=SensorStateClass.TOTAL_INCREASING,
+        value_fn=lambda r: _round(r.energy.house_wh, 0),
+        entity_category=EntityCategory.DIAGNOSTIC,
     ),
     HouseSensorDescription(
         key="power_headroom",

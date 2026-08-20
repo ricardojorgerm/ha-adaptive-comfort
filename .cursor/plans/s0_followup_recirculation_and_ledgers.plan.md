@@ -7,15 +7,15 @@ todos:
     status: completed
   - id: head-energy-merge
     content: "Optional consumption entities: house Wh. Merge max (duplicate outdoor) vs sum (partitioned). Never replace 60s p_ac from 0.25 kWh steps."
-    status: pending
+    status: completed
   - id: helper-cop-banded
     content: "Extend consolidated_by_cop_table to banded / kWh per K·h (cross-N). No new N2 latch. No copy of _select_regime. Keep _mixing_free_rider; do not start vacant East/office so West can ride mix."
-    status: pending
+    status: completed
   - id: reject-blunt-n1
     content: "Do not coast solely because p is 180–320 W. 253 W bedroom hold was useful."
     status: completed
   - id: tests-agents
-    content: "Charge/discharge shed; no double-subtract; dirty baseline; AGENTS.md. (0.25 kWh ≠ 15 kW p_ac waits on cut 2)"
+    content: "Charge/discharge shed; energy merge Wh tests; banded helper COP; AGENTS.md"
     status: completed
 isProject: false
 ---

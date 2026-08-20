@@ -50,6 +50,20 @@ def test_cop_by_band_aggregates_within_mode_only():
     assert "hot" not in heat
 
 
+def test_cop_by_head_count_banded_is_cross_n_in_one_band():
+    table = {
+        "cool|1|mild": (4.0, 25),
+        "cool|2|mild": (2.5, 25),
+        "cool|1|hot": (1.0, 25),
+        "heat|1|mild": (5.0, 25),
+        "cool|3|mild": (2.0, 10),  # below min_samples
+    }
+    mild = power.cop_by_head_count_banded(table, "cool", "mild", min_samples=20)
+    assert mild == {1: 4.0, 2: 2.5}
+    hot = power.cop_by_head_count_banded(table, "cool", "hot", min_samples=20)
+    assert hot == {1: 1.0}
+
+
 def test_cop_sample_mode_requires_controller_and_plant_agree():
     assert (
         power.cop_sample_mode("cool", any_heating=False, any_cooling=True) == "cool"

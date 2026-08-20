@@ -73,7 +73,9 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   head also reports the matching `hvac_action` (`cop_sample_mode`) — mode-change
   lag skips the row rather than contaminating the other season. Head count and
   weather stay confounded inside a mode (3 heads ↔ hot afternoons) — never draw
-  head-count conclusions from the unbanded table alone. Schema 2 bare keys
+  head-count conclusions from the unbanded table alone. Helper drop uses
+  `cop_by_head_count_banded` (live outdoor band, demand vs demand+helpers) and
+  falls back to unbanded only when that band lacks both N keys. Schema 2 bare keys
   migrate into `cool|…` on restore; schema 4 adds the depth ledger.
 - **Persistence**: everything that must survive a restart goes through `coordinator._persist()`
   / restore and the `to_dict`/`from_dict` pairs. If you add controller state or a setting,
@@ -121,6 +123,8 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   `max(p_grid, 120s peak, max(0, known + residual_p_ac − discharge))` — not
   `max(learned, p_ac)`. Restore uses that same `p_demand`. Night baseline slots learned
   under charge-inclusive `p_load` are wiped on restore (`BaselineModel` schema 2).
+  Optional consumption entities are a **Wh ledger** (`EnergyMerge`, max vs sum); 0.25 kWh
+  steps are not 60 s watts and never replace `p_ac` / park gating / `StartCounter`.
   Baseline *learning* stays gated on device quiet
   (`_all_off_since`, including fan-only as busy). Park gating / StartCounter prefer a
   *learned* baseline slot (`fallback=False`) so cross-slot medians do not invent phantom AC.
@@ -137,7 +141,8 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   scan + `_sample_power` + demand finalize + `notify`. Full `controller.tick` runs on that
   path **only when shed engage/release flips** (tracking-delta and park-margin adapt per
   tick and are not `COMMAND_SPACING_S`-gated). The 60 s tick owns `t_rm`, diurnal, baseline
-  EWMA, drift, thermal fits, moisture, and park learners.
+  EWMA, drift, thermal fits, moisture, park learners, and the optional energy Wh ledger
+  (`_sample_energy` — never on power-react, never as `p_ac`).
 - **Regime policy owns the macro decision.** `_select_regime` picks per tick (15 min dwell):
   `ventilate` when outdoor beats the coolest target by `REGIME_VENT_MARGIN_K` (forces the
   grace-gated window flow — never hard-strands a hot room), `continuous` when aggregate
@@ -240,4 +245,8 @@ ruff check . && ruff format .
   exploit compares extraction to `standing_load_w / n_rooms`. Solo-park electrical
   gating uses `fan_floor_w(n_rooms)` (`20 + fan_floor_per_head_w × N`) so multi-head
   fan draw is not mistaken for compression. `StartCounter` uses the same floor.
+  Climate entity ids can be swapped vs rooms — coil / EEV / indoor `energy_usage_total`
+  follow the physical head, not the HA name. Mixing is observation only
+  (`_mixing_free_rider`); a vacant sibling is not a house plant, and indoor kWh
+  counters that duplicate outdoor must be merged with `max`, never summed into watts.
 - Timezone: runtime uses `local_hour` for diurnal models; timestamps are epoch seconds.

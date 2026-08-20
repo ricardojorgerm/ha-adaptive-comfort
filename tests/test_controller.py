@@ -191,6 +191,21 @@ def test_cop_table_consolidates_when_fewer_heads_win():
     assert decision.diag.get("consolidated_by_cop_table")
 
 
+def test_cop_table_prefers_banded_cross_n():
+    hot = make_zone("hot", 25.0)
+    ok = make_zone("ok", 22.6)
+    snap = make_snapshot(
+        [hot, ok],
+        cop_by_head_count={1: 2.0, 2: 4.0},
+        cop_by_head_count_banded={1: 4.0, 2: 3.0},
+    )
+    state = warmed_state([hot, ok])
+    decision = controller.tick(snap, state)
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert "ok" not in by_zone
+    assert decision.diag.get("consolidated_by_cop_table")
+
+
 def test_min_off_blocks_restart():
     zone = make_zone("bed", 25.0)
     snap = make_snapshot([zone])

@@ -110,3 +110,28 @@ def test_baseline_schema_wipes_charge_inclusive_slots():
     assert wiped.value(23.5, fallback=False) is None
     kept = power.BaselineModel.from_dict(dirty.to_dict())
     assert kept.value(23.5, fallback=False) == dirty.value(23.5, fallback=False)
+
+
+def test_energy_merge_max_duplicate_heads_not_watts():
+    merge = power.EnergyMerge(power.ENERGY_MERGE_MAX)
+    merge.update({"a": 0.0, "b": 0.0})
+    delta = merge.update({"a": 250.0, "b": 250.0})
+    assert delta == 250.0
+    assert merge.house_wh == 250.0
+    assert delta != 15_000.0
+
+
+def test_energy_merge_sum_partitioned():
+    merge = power.EnergyMerge(power.ENERGY_MERGE_SUM)
+    merge.update({"a": 0.0, "b": 0.0})
+    assert merge.update({"a": 100.0, "b": 150.0}) == 250.0
+
+
+def test_energy_merge_ignores_negative_and_reset():
+    merge = power.EnergyMerge()
+    merge.update({"a": 500.0})
+    assert merge.update({"a": -1.0}) == 0.0
+    assert merge.last_wh["a"] == 500.0
+    assert merge.update({"a": 0.0}) == 0.0
+    assert merge.last_wh["a"] == 0.0
+    assert merge.update({"a": 250.0}) == 250.0

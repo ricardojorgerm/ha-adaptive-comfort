@@ -14,7 +14,14 @@ from datetime import timedelta
 from typing import Any
 
 from homeassistant.config_entries import ConfigEntry
-from homeassistant.const import ATTR_TEMPERATURE, STATE_ON, STATE_UNAVAILABLE, STATE_UNKNOWN
+from homeassistant.const import (
+    ATTR_TEMPERATURE,
+    ATTR_UNIT_OF_MEASUREMENT,
+    STATE_ON,
+    STATE_UNAVAILABLE,
+    STATE_UNKNOWN,
+    UnitOfEnergy,
+)
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.event import async_track_state_change_event, async_track_time_interval
@@ -25,9 +32,11 @@ from .const import (
     CONF_AREAS,
     CONF_BATTERY_POSITIVE_DISCHARGING,
     CONF_BATTERY_POWER,
+    CONF_CONSUMPTION,
     CONF_CONTRACTED_KVA,
     CONF_DEFAULT_TARGET,
     CONF_DOOR_SENSOR,
+    CONF_ENERGY_MERGE,
     CONF_GRID_POWER,
     CONF_HEADS,
     CONF_HEIGHT,
@@ -53,7 +62,7 @@ from .const import (
 )
 from .core import comfort, controller, park, power, psychro
 from .core.drift import DriftEstimator
-from .core.power import BaselineModel, DrawEstimator
+from .core.power import BaselineModel, DrawEstimator, EnergyMerge
 from .core.predictor import HORIZONS_MIN, PredictorScorer
 from .core.series import TimeSeries
 from .core.thermal import DiurnalModel, ThermalModel, house_other_temperature
@@ -243,6 +252,9 @@ class AdaptiveComfortRuntime:
         self.outdoor_source: str = "none"
 
         self.baseline = BaselineModel()
+        self.energy = EnergyMerge(
+            mode=str(entry.data.get(CONF_ENERGY_MERGE, power.ENERGY_MERGE_MAX))
+        )
         self.draws = DrawEstimator()
         self.outdoor_diurnal = DiurnalModel()
         self.controller_state = ControllerState()
@@ -559,6 +571,11 @@ class AdaptiveComfortRuntime:
             self.t_rm = float(data["t_rm"])
         if "baseline" in data:
             self.baseline = BaselineModel.from_dict(data["baseline"])
+        if "energy" in data:
+            self.energy = EnergyMerge.from_dict(
+                data["energy"],
+                mode=str(self.entry.data.get(CONF_ENERGY_MERGE, power.ENERGY_MERGE_MAX)),
+            )
         if "draws" in data:
             self.draws = DrawEstimator.from_dict(data["draws"])
         if "outdoor_diurnal" in data:
@@ -658,6 +675,7 @@ class AdaptiveComfortRuntime:
             "prev_house_occupied": self._prev_house_occupied,
             "t_rm": self.t_rm,
             "baseline": self.baseline.to_dict(),
+            "energy": self.energy.to_dict(),
             "draws": self.draws.to_dict(),
             "outdoor_diurnal": self.outdoor_diurnal.to_dict(),
             "controller": self.controller_state.to_dict(),
@@ -934,6 +952,7 @@ class AdaptiveComfortRuntime:
         self._sample_head_states(now_ts)
         # Power before environment so baseline learning sees a fresh p_load.
         self._sample_power(now_ts, local_hour)
+        self._sample_energy()
         self._sample_zone_environment(now_ts, local_hour)
         self._process_power_events(now_ts)
         self._update_estimators(now_ts, local_hour)
@@ -961,6 +980,28 @@ class AdaptiveComfortRuntime:
             )
             self.p_load_series.append(now_ts, self.p_load)
         self._estimate_p_ac(now_ts, local_hour)
+
+    def _energy_reading_wh(self, entity_id: str) -> float | None:
+        """Convert an energy sensor sample to Wh. Never a 60 s wattage."""
+        state = self.hass.states.get(entity_id)
+        if state is None or state.state in (STATE_UNKNOWN, STATE_UNAVAILABLE):
+            return None
+        try:
+            value = float(state.state)
+        except (TypeError, ValueError):
+            return None
+        unit = str(state.attributes.get(ATTR_UNIT_OF_MEASUREMENT) or "")
+        if unit in (UnitOfEnergy.WATT_HOUR, "Wh"):
+            return value
+        return value * 1000.0
+
+    def _sample_energy(self) -> None:
+        """Tick-only Wh ledger. Does not replace residual p_ac."""
+        raw = self.entry.data.get(CONF_CONSUMPTION) or []
+        entities = [raw] if isinstance(raw, str) else list(raw)
+        if not entities:
+            return
+        self.energy.update({eid: self._energy_reading_wh(eid) for eid in entities})
 
     def _estimate_p_ac(self, now_ts: float, local_hour: float) -> None:
         """Electrical AC residual — never zeroed from hvac_action.
@@ -1583,10 +1624,16 @@ class AdaptiveComfortRuntime:
                 )
             )
         mode_hint = self.controller_state.mode
+        cop_banded_n: dict[int, float] = {}
         if mode_hint in (MODE_HEAT, MODE_COOL):
             cop_hints = power.cop_by_head_count(self.cop_table, mode_hint, COP_TABLE_MIN_SAMPLES)
             cop_by_band = power.cop_by_band(self.cop_table_banded, mode_hint, COP_TABLE_MIN_SAMPLES)
             cop_by_band_mode = mode_hint
+            band = power.outdoor_band(self.t_out)
+            if band is not None:
+                cop_banded_n = power.cop_by_head_count_banded(
+                    self.cop_table_banded, mode_hint, band, COP_TABLE_MIN_SAMPLES
+                )
         else:
             cop_hints = {}
             cop_by_band = {}
@@ -1616,6 +1663,7 @@ class AdaptiveComfortRuntime:
             shed_urgent=self.shed_urgent,
             forecast_hours=tuple(forecast),
             cop_by_head_count=cop_hints,
+            cop_by_head_count_banded=cop_banded_n,
             cop_by_band=cop_by_band,
             cop_by_band_mode=cop_by_band_mode,
             aux_indoor=tuple(aux_indoor),
@@ -2014,6 +2062,7 @@ class AdaptiveComfortRuntime:
             "shed_urgent": self.shed_urgent,
             "p_load": self.p_load,
             "p_ac": self.p_ac,
+            "house_wh": self.energy.house_wh,
             "baseline_coverage": self.baseline.coverage(),
             "forecast": self.forecast,
             "cop_table": dict(self.cop_table),

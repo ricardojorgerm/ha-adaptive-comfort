@@ -151,6 +151,27 @@ def cop_by_band(
     return {band: acc[0] / acc[1] for band, acc in totals.items() if acc[1] >= min_samples}
 
 
+def cop_by_head_count_banded(
+    table: dict[str, tuple[float, int]],
+    mode: str,
+    band: str,
+    min_samples: int,
+) -> dict[int, float]:
+    """Sample-gated head-count COP for one mode and outdoor band."""
+    prefix = f"{mode}|"
+    suffix = f"|{band}"
+    out: dict[int, float] = {}
+    for key, (cop, count) in table.items():
+        if count < min_samples or not key.startswith(prefix) or not key.endswith(suffix):
+            continue
+        rest = key[len(prefix) : len(key) - len(suffix)]
+        try:
+            out[int(rest)] = cop
+        except ValueError:
+            continue
+    return out
+
+
 COMPRESSION_FLOOR_W = 75.0  # default = fan_floor_w(1); callers pass live floor
 START_DEBOUNCE_S = 180.0  # power must stay below the floor this long to arm
 START_WINDOW_S = 24.0 * 3600.0
@@ -301,6 +322,64 @@ def compose_load(
     for p in known_loads or []:
         load -= p
     return max(0.0, load)
+
+
+ENERGY_MERGE_MAX = "max"
+ENERGY_MERGE_SUM = "sum"
+
+
+class EnergyMerge:
+    """House Wh from optional consumption counters. Never a 60 s wattmeter.
+
+    ``max``: each head duplicates outdoor energy (this WF-RAC). ``sum``:
+    heads partition real kWh. Ignore NaN/negative; a downward reset is a
+    new origin (add 0).
+    """
+
+    def __init__(self, mode: str = ENERGY_MERGE_MAX) -> None:
+        self.mode = mode if mode in (ENERGY_MERGE_MAX, ENERGY_MERGE_SUM) else ENERGY_MERGE_MAX
+        self.last_wh: dict[str, float] = {}
+        self.house_wh: float = 0.0
+
+    def update(self, readings_wh: dict[str, float | None]) -> float:
+        """Integrate one sample. Returns Wh added this call (0 if none)."""
+        positives: list[float] = []
+        for eid, raw in readings_wh.items():
+            if raw is None or raw != raw or raw < 0.0:
+                continue
+            prev = self.last_wh.get(eid)
+            self.last_wh[eid] = raw
+            if prev is None or raw < prev:
+                continue
+            positives.append(raw - prev)
+        if not positives:
+            return 0.0
+        delta = max(positives) if self.mode == ENERGY_MERGE_MAX else sum(positives)
+        self.house_wh += delta
+        return delta
+
+    def to_dict(self) -> dict:
+        return {
+            "mode": self.mode,
+            "last_wh": dict(self.last_wh),
+            "house_wh": self.house_wh,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, *, mode: str | None = None) -> EnergyMerge:
+        merge = cls(mode=str(mode or data.get("mode") or ENERGY_MERGE_MAX))
+        try:
+            merge.house_wh = float(data.get("house_wh") or 0.0)
+        except (TypeError, ValueError):
+            merge.house_wh = 0.0
+        last = data.get("last_wh") or {}
+        if isinstance(last, dict):
+            for key, value in last.items():
+                try:
+                    merge.last_wh[str(key)] = float(value)
+                except (TypeError, ValueError):
+                    continue
+        return merge
 
 
 # Slots learned under charge-inclusive p_load (schema < 2) are not reusable:

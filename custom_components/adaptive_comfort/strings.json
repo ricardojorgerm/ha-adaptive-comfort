@@ -9,6 +9,8 @@
           "battery_power_entity": "Battery power sensor (optional)",
           "battery_positive_discharging": "Battery sensor is positive when discharging",
           "known_load_entities": "Known load power sensors (optional)",
+          "consumption_entities": "AC energy sensors (optional, kWh or Wh)",
+          "energy_merge": "How to merge head energy counters",
           "outdoor_temp_entity": "Outdoor temperature sensor (optional)",
           "weather_entity": "Weather entity (optional)",
           "presence_entity": "House presence (person or sensor, optional)",
@@ -20,6 +22,8 @@
         "data_description": {
           "grid_power_entity": "Real-time whole-house power at the meter; used for AC power inference and load shedding.",
           "known_load_entities": "Monitored appliances subtracted from the load before disaggregating the AC.",
+          "consumption_entities": "Indoor energy totals. Do not sum them into 60 s watts. Max merge for heads that duplicate outdoor kWh; sum when they partition.",
+          "energy_merge": "Max: each running head copies outdoor energy (this multi-split). Sum: partitioned per-head energy.",
           "presence_entity": "Person (home/not_home) or presence sensor. Falls back to zone sensors if unavailable.",
           "contracted_kva": "3.45 kVA converts to a 3450 W limit at power factor 1.0."
         }
@@ -32,6 +36,8 @@
           "battery_power_entity": "Battery power sensor (optional)",
           "battery_positive_discharging": "Battery sensor is positive when discharging",
           "known_load_entities": "Known load power sensors (optional)",
+          "consumption_entities": "AC energy sensors (optional, kWh or Wh)",
+          "energy_merge": "How to merge head energy counters",
           "outdoor_temp_entity": "Outdoor temperature sensor (optional)",
           "weather_entity": "Weather entity (optional)",
           "presence_entity": "House presence (person or sensor, optional)",
@@ -160,6 +166,12 @@
         "regular": "Regular room",
         "wet": "Wet room (bathroom / laundry)"
       }
+    },
+    "energy_merge": {
+      "options": {
+        "max": "Max (duplicate outdoor counters)",
+        "sum": "Sum (partitioned per-head energy)"
+      }
     }
   },
   "entity": {
@@ -169,6 +181,9 @@
       },
       "ac_power_estimate": {
         "name": "Estimated AC power"
+      },
+      "ac_energy": {
+        "name": "AC energy (merged)"
       },
       "power_headroom": {
         "name": "Power headroom"

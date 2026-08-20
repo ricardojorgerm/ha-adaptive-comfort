@@ -375,6 +375,22 @@ PARK_PROBE_SPACING_S = 6.0 * 3600.0
 # exploitation-parking instead of a plain off.
 PARK_LOAD_COVER_FRACTION = LOAD_COVER_FRACTION
 COP_TABLE_ADVANTAGE = 1.05
+
+
+def _cop_n_pair(
+    snap: HouseSnapshot, n_demand: int, n_spread: int
+) -> tuple[float | None, float | None]:
+    """Demand vs demand+helpers COP, preferring the live outdoor band."""
+    banded = snap.cop_by_head_count_banded
+    if banded:
+        demand = banded.get(n_demand)
+        spread = banded.get(n_spread)
+        if demand is not None and spread is not None:
+            return demand, spread
+    heads = snap.cop_by_head_count
+    return heads.get(n_demand), heads.get(n_spread)
+
+
 # Fan assist: a multi-split head cannot run opposite to the shared mode, but
 # fan-only mixing can nudge an out-of-band room using house air. Running the
 # fan over a wet coil re-evaporates condensate accumulated while cooling
@@ -1467,16 +1483,15 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
     # better efficiency at similar conditions.
     n_spread = sum(z.n_rooms for z in demand) + sum(z.n_rooms for z in helpers)
     n_demand = sum(z.n_rooms for z in demand)
-    if helpers and snap.cop_by_head_count:
-        cop_spread = snap.cop_by_head_count.get(n_spread)
-        cop_demand = snap.cop_by_head_count.get(n_demand)
-        if (
-            cop_spread is not None
-            and cop_demand is not None
-            and cop_demand > cop_spread * COP_TABLE_ADVANTAGE
-        ):
-            helpers = []
-            diag["consolidated_by_cop_table"] = True
+    cop_demand, cop_spread = _cop_n_pair(snap, n_demand, n_spread)
+    if (
+        helpers
+        and cop_spread is not None
+        and cop_demand is not None
+        and cop_demand > cop_spread * COP_TABLE_ADVANTAGE
+    ):
+        helpers = []
+        diag["consolidated_by_cop_table"] = True
     diag["demand"] = sorted(demand_ids)
     helper_ids = {z.zone_id for z in helpers}
     diag["helpers"] = sorted(helper_ids)

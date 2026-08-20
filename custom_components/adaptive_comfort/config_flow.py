@@ -30,9 +30,11 @@ from .const import (
     CONF_AREAS,
     CONF_BATTERY_POSITIVE_DISCHARGING,
     CONF_BATTERY_POWER,
+    CONF_CONSUMPTION,
     CONF_CONTRACTED_KVA,
     CONF_DEFAULT_TARGET,
     CONF_DOOR_SENSOR,
+    CONF_ENERGY_MERGE,
     CONF_GRID_POWER,
     CONF_HEADS,
     CONF_HEIGHT,
@@ -56,9 +58,13 @@ from .const import (
     SUBENTRY_ROOM,
     SUBENTRY_ZONE,
 )
+from .core.power import ENERGY_MERGE_MAX, ENERGY_MERGE_SUM
 from .core.types import ROOM_TYPE_REGULAR, ROOM_TYPE_WET
 
 POWER_SENSOR = EntitySelector(EntitySelectorConfig(domain="sensor", device_class="power"))
+ENERGY_SENSOR = EntitySelector(
+    EntitySelectorConfig(domain="sensor", device_class="energy", multiple=True)
+)
 TEMP_SENSOR = EntitySelector(EntitySelectorConfig(domain="sensor", device_class="temperature"))
 HUMIDITY_SENSOR = EntitySelector(EntitySelectorConfig(domain="sensor", device_class="humidity"))
 PRESENCE_ENTITY = EntitySelector(
@@ -90,6 +96,16 @@ def _house_schema(defaults: dict[str, Any]) -> vol.Schema:
             ): BooleanSelector(),
             vol.Optional(CONF_KNOWN_LOADS, description=d(CONF_KNOWN_LOADS)): EntitySelector(
                 EntitySelectorConfig(domain="sensor", device_class="power", multiple=True)
+            ),
+            vol.Optional(CONF_CONSUMPTION, description=d(CONF_CONSUMPTION)): ENERGY_SENSOR,
+            vol.Required(
+                CONF_ENERGY_MERGE,
+                default=defaults.get(CONF_ENERGY_MERGE, ENERGY_MERGE_MAX),
+            ): SelectSelector(
+                SelectSelectorConfig(
+                    options=[ENERGY_MERGE_MAX, ENERGY_MERGE_SUM],
+                    translation_key="energy_merge",
+                )
             ),
             vol.Optional(CONF_OUTDOOR_TEMP, description=d(CONF_OUTDOOR_TEMP)): TEMP_SENSOR,
             vol.Optional(CONF_WEATHER, description=d(CONF_WEATHER)): EntitySelector(

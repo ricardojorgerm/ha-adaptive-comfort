@@ -9,6 +9,8 @@
           "battery_power_entity": "Sensor de potência da bateria (opcional)",
           "battery_positive_discharging": "Sensor da bateria positivo quando descarrega",
           "known_load_entities": "Sensores de potência de cargas conhecidas (opcional)",
+          "consumption_entities": "Sensores de energia do AC (opcional, kWh ou Wh)",
+          "energy_merge": "Como fundir os contadores de energia das cabeças",
           "outdoor_temp_entity": "Sensor de temperatura exterior (opcional)",
           "weather_entity": "Entidade meteorológica (opcional)",
           "presence_entity": "Presença na casa (pessoa ou sensor, opcional)",
@@ -20,6 +22,8 @@
         "data_description": {
           "grid_power_entity": "Potência em tempo real da casa no contador; usada para inferir a potência do AC e limitar cargas.",
           "known_load_entities": "Eletrodomésticos monitorizados subtraídos da carga antes de isolar o AC.",
+          "consumption_entities": "Totais de energia interiores. Não os transforme em watts a 60 s. Max quando cada cabeça duplica o kWh exterior; soma quando particionam.",
+          "energy_merge": "Max: cada cabeça em marcha copia a energia exterior. Soma: energia real por cabeça.",
           "presence_entity": "Pessoa (em casa/fora) ou sensor de presença. Recorre aos sensores das zonas se indisponível.",
           "contracted_kva": "3,45 kVA convertem-se num limite de 3450 W com fator de potência 1,0."
         }
@@ -32,6 +36,8 @@
           "battery_power_entity": "Sensor de potência da bateria (opcional)",
           "battery_positive_discharging": "Sensor da bateria positivo quando descarrega",
           "known_load_entities": "Sensores de potência de cargas conhecidas (opcional)",
+          "consumption_entities": "Sensores de energia do AC (opcional, kWh ou Wh)",
+          "energy_merge": "Como fundir os contadores de energia das cabeças",
           "outdoor_temp_entity": "Sensor de temperatura exterior (opcional)",
           "weather_entity": "Entidade meteorológica (opcional)",
           "presence_entity": "Presença na casa (pessoa ou sensor, opcional)",
@@ -160,6 +166,12 @@
         "regular": "Divisão normal",
         "wet": "Divisão húmida (casa de banho / lavandaria)"
       }
+    },
+    "energy_merge": {
+      "options": {
+        "max": "Máximo (contadores que duplicam o exterior)",
+        "sum": "Soma (energia particionada por cabeça)"
+      }
     }
   },
   "entity": {
@@ -181,6 +193,7 @@
     "sensor": {
       "house_load": { "name": "Carga da casa" },
       "ac_power_estimate": { "name": "Potência estimada do AC" },
+      "ac_energy": { "name": "Energia do AC (fundida)" },
       "power_headroom": { "name": "Margem de potência" },
       "outdoor_effective": { "name": "Temperatura exterior (efetiva)" },
       "outdoor_running_mean": { "name": "Média móvel exterior (7 d)" },

@@ -247,6 +247,8 @@ class HouseSnapshot:
     shed_urgent: bool = False  # immediate shed (critical overload or known-load spike)
     forecast_hours: tuple[float, ...] = ()  # hourly outdoor forecast, aligned with free_float
     cop_by_head_count: dict[int, float] = field(default_factory=dict)  # empirical COP hints
+    # Head-count COP for the live outdoor band only (cross-N helper drop).
+    cop_by_head_count_banded: dict[int, float] = field(default_factory=dict)
     # Empirical COP by outdoor band ('mild'|'warm'|'hot') for the mode in
     # ``cop_by_band_mode`` (sample-gated, aggregated across head counts).
     # COP-timed widen: advance/defer predictive demand with a bounded wider
