@@ -39,7 +39,7 @@ def make_snapshot(zones, settings=None, now=NOW, **kw):
     return HouseSnapshot(
         now_ts=now,
         local_hour=12.0,
-        settings=settings or Settings(hvac_mode=MODE_COOL, target=23.0),
+        settings=settings or Settings(hvac_mode=MODE_COOL, target=23.0, coordination=False),
         zones=zones,
         t_out=30.0,
         **kw,
@@ -744,7 +744,7 @@ def test_heating_park_entry_and_far_edge_release():
     band hi releases immediately (symmetric to cool far-edge)."""
     from custom_components.adaptive_comfort.core.types import MODE_HEAT
 
-    settings = Settings(hvac_mode=MODE_HEAT, target=23.0)
+    settings = Settings(hvac_mode=MODE_HEAT, target=23.0, coordination=False)
     # Above center → not a heat helper; in-band → not demand → park candidate.
     satisfied = make_zone(
         "sat",
@@ -774,7 +774,7 @@ def test_heating_park_entry_and_far_edge_release():
 def test_heating_margin_escalates_while_room_keeps_warming():
     from custom_components.adaptive_comfort.core.types import MODE_HEAT
 
-    settings = Settings(hvac_mode=MODE_HEAT, target=23.0)
+    settings = Settings(hvac_mode=MODE_HEAT, target=23.0, coordination=False)
     # Stay inside band (hi = 23.7) while still rising enough to escalate.
     satisfied = make_zone(
         "sat",

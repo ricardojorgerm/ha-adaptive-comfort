@@ -202,7 +202,9 @@ def test_residual_hold_margin_aware_park_entry():
         make_zone("hot", 26.0, is_on=True, standing_load_w=200.0),
     ]
     st = warmed(zones)
-    settings = Settings(hvac_mode=MODE_COOL, target=23.0, auto_regime=False)
+    settings = Settings(
+        hvac_mode=MODE_COOL, target=23.0, auto_regime=False, coordination=False
+    )
     d = controller.tick(snap(zones, t_out=30.0, settings=settings), st)
     cmd = next((c for c in d.commands if c.zone_id == "sat" and c.park), None)
     assert cmd is not None

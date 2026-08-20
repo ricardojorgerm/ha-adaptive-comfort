@@ -1766,11 +1766,6 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 continue
             if zone.temp is None:
                 continue
-            currently = zone.is_on or state.zone_on.get(zone.zone_id, False)
-            if currently:
-                # Already-on extras stay loaded via residual park, not
-                # tracked helper setpoints (that would block park entry).
-                continue
             if _reached_far_edge(zone, *bands[zone.zone_id], mode):
                 continue
             helpers.append(zone)
@@ -2063,7 +2058,16 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         if zid not in state.zone_park_preferred:
             state.zone_park_preferred[zid] = _park_preferred(zone, state)
         parked_since = state.zone_parked_since.get(zid)
-        if parked_since is not None and desired_on and mode in (MODE_HEAT, MODE_COOL):
+        if (
+            parked_since is not None
+            and desired_on
+            and zid not in helper_ids
+            and mode
+            in (
+                MODE_HEAT,
+                MODE_COOL,
+            )
+        ):
             # Demand-side hysteresis depth: continuum adapt; still wants conditioning.
             lo_b, hi_b = bands[zid]
             preferred = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
@@ -2085,8 +2089,6 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             )
             floor = _chase_floor_k(state, zid)
             ceiling = _hysteresis_ceiling_k(zone, state)
-            if zid in helper_ids:
-                ceiling = min(ceiling, _shallow_hold_k(zone))
             depth = _sync_depth_views(state, zid, depth, now, lo=floor, hi=ceiling)
             if overcorrected or should_off:
                 _clear_park_session(state, zid, zone, now)
@@ -2102,7 +2104,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             else:
                 # Crossed into 0 / chase — fall through; demand emits continuum depth.
                 diag.setdefault("depth_continuum", []).append(zid)
-        if parked_since is not None and zid in state.zone_parked_since:
+        if parked_since is not None and zid in state.zone_parked_since and zid not in helper_ids:
             # Direction: dominant mode when conditioning, else the head's own
             # physical mode - run-out parks must survive the house going idle.
             pmode = mode if mode in (MODE_HEAT, MODE_COOL) else zone.head_mode
@@ -2473,14 +2475,19 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 track_delta = delta
                 # Continuum depth from prior adapt / residual pick.
                 if reason == "helper" and not condition_hold:
-                    # Recruited extras ease into a shallow residual hold
-                    # (0.5 K/tick). A jump to the covering park bin is deep
-                    # enough for the head's own hysteresis to shut off.
+                    # Recruited extras keep tracking, then ease into a shallow
+                    # residual hold one 0.5 K step per re-anchor. Stepping
+                    # every 60 s tick would land at the cap on the first
+                    # COMMAND_SPACING refresh and look like a park jump.
                     cap = _shallow_hold_k(zone)
                     current = state.zone_head_depth_k.get(zid)
+                    last = state.zone_last_cmd.get(zid, 0.0)
                     if current is None:
-                        current = -delta
-                    depth_k = _step_depth_toward(current, cap)
+                        depth_k = -delta
+                    elif last > 0.0 and now - last >= COMMAND_SPACING_S:
+                        depth_k = _step_depth_toward(current, cap)
+                    else:
+                        depth_k = current
                     if zone.park_current_is_fan_type is True and depth_k > 0.0:
                         depth_k = max(depth_k - DEPTH_STEP_K, 0.0)
                     floor = _chase_floor_k(state, zid)

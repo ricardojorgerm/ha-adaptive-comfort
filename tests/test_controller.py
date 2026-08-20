@@ -878,6 +878,21 @@ def test_helper_walks_into_shallow_park_not_covering_bin():
     cmd = {c.zone_id: c for c in decision.commands}["ok"]
     assert cmd.reason == "helper"
     assert cmd.head_depth_k is not None
-    # First tick: one 0.5 K step from chase, not a jump to the 2 K covering bin.
-    assert cmd.head_depth_k <= 0.0 + 1e-9
-    assert cmd.head_depth_k > -2.0
+    # First command stays on chase tracking, not a covering residual park.
+    assert cmd.head_depth_k == -controller.TRACK_DELTA_DEFAULT_K
+    ok_on = make_zone(
+        "ok",
+        22.6,
+        is_on=True,
+        park_residuals=True,
+        park_residual_max_margin_k=2.0,
+        park_residual_edge_k=2.5,
+        park_margin_bins={"2.0": [150.0, 0.8, 12.0]},
+        standing_load_w=80.0,
+    )
+    snap2 = make_snapshot([hot, ok_on], now=NOW + controller.COMMAND_SPACING_S)
+    decision = controller.tick(snap2, decision.state)
+    cmd2 = {c.zone_id: c for c in decision.commands}["ok"]
+    assert cmd2.head_depth_k == cmd.head_depth_k + controller.DEPTH_STEP_K
+    assert cmd2.head_depth_k < 2.0
+    assert cmd2.head_depth_k <= controller.PARK_MARGIN_K
