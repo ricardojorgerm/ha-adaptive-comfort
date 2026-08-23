@@ -2,8 +2,14 @@ from custom_components.adaptive_comfort.core.simulator import SimHouse, SimRoom
 from custom_components.adaptive_comfort.core.thermal import (
     COP_PRIOR,
     K_PRIOR,
+    Q_TRANSIENT_MAX,
     DiurnalModel,
     ThermalModel,
+    apply_rain_outdoor,
+    blend_outdoor_trend,
+    clearness_index,
+    precip_weight,
+    rain_sink_k_per_h,
 )
 
 STEP_H = 5.0 / 60.0
@@ -156,9 +162,11 @@ def test_thermal_roundtrip_persistence():
     model.fits[False].theta[0] = 0.6
     model.fits[False].samples = 50
     model.cop = 3.3
+    model.q_transient = -0.8
     restored = ThermalModel.from_dict(model.to_dict(), 25.0)
     assert restored.fits[False].theta[0] == 0.6
     assert restored.cop == 3.3
+    assert restored.q_transient == -0.8
 
 
 def _cool_capable_model() -> ThermalModel:
@@ -259,3 +267,80 @@ def test_zone_snapshot_defaults_door_open():
 
     z = ZoneSnapshot(zone_id="z", name="z", n_rooms=1, temp=23.0)
     assert z.door_open is True
+
+
+def _fitted_q_model() -> ThermalModel:
+    """Sunny-day Fourier fit: a0 + harmonic bulge, stable k_out."""
+    model = ThermalModel(volume_m3=30.0)
+    fit = model.fits[False]
+    fit.theta[0] = 0.07
+    fit.theta[1] = 0.0
+    fit.theta[2] = 0.8  # a0
+    fit.theta[3] = 1.2  # a1 (solar bulge at hour 0)
+    fit.samples = 200
+    return model
+
+
+def test_q_transient_from_off_innovation_cools_horizon():
+    """Wet-envelope surprise: observed dT/dt colder than q_hat-only rate."""
+    model = _fitted_q_model()
+    theta_before = list(model.fits[False].theta)
+    hour, t_in, t_out = 12.0, 23.0, 19.0
+    expected = model.free_float_rate(t_in, t_out, hour, include_transient=False)
+    assert expected is not None
+    model.update_q_transient(-2.0)
+    assert model.q_transient < 0.0
+    assert model.q_transient > -Q_TRANSIENT_MAX
+    assert model.fits[False].theta == theta_before
+    tout = [t_out] * 24
+    cool = model.predict_free(t_in, tout, hour, hours=8.0)
+    model.q_transient = 0.0
+    base = model.predict_free(t_in, tout, hour, hours=8.0)
+    assert cool[-1] < base[-1] - 0.5
+
+
+def test_q_transient_forgets_while_on_not_from_conditioning_rate():
+    model = _fitted_q_model()
+    model.q_transient = -1.2
+    # Heads on: coordinator forgets; it does not feed compressor dT/dt in.
+    model.forget_q_transient(1.0)
+    assert abs(model.q_transient) < 1.2
+    assert model.q_transient > -1.2
+    # A conditioning plunge is ignored when |innov| is absurd.
+    held = model.q_transient
+    model.update_q_transient(-12.0)
+    assert model.q_transient == held
+
+
+def test_cloud_scales_harmonic_q_missing_weather_is_identity():
+    model = _fitted_q_model()
+    hour = 0.0
+    full = model.q_eff(hour, solar_scale=1.0)
+    cloudy = model.q_eff(hour, solar_scale=0.0)
+    assert cloudy == model.q_mean()
+    assert full > cloudy
+    assert clearness_index(None, None) == 1.0
+    assert rain_sink_k_per_h(None, None) == 0.0
+    assert precip_weight(None) == 0.0
+    assert abs(clearness_index(1.0) - (1.0 - 0.85)) < 1e-9
+    assert abs(clearness_index(100) - clearness_index(1.0)) < 1e-9
+
+
+def test_rain_pulls_stale_outdoor_path_not_already_dropped():
+    stale = apply_rain_outdoor([25.0, 25.0, 25.0], [5.0, 5.0, 5.0], [80.0, 80.0, 80.0], 25.0)
+    assert stale[1] < 25.0
+    dropped = apply_rain_outdoor([25.0, 19.0, 19.0], [0.0, 5.0, 5.0], [0.0, 90.0, 90.0], 19.0)
+    assert dropped[1] == 19.0
+    assert dropped[2] == 19.0
+    sink = rain_sink_k_per_h(8.0, 90.0)
+    assert sink < 0.0
+    assert sink >= -0.8
+
+
+def test_live_outdoor_trend_blends_hours_1_and_2():
+    temps = [25.0, 24.0, 24.0, 23.0]
+    out = blend_outdoor_trend(temps, 20.0, -6.0)
+    assert out[0] == 20.0
+    assert out[1] < temps[1]
+    assert out[2] < temps[2]
+    assert out[3] == temps[3]

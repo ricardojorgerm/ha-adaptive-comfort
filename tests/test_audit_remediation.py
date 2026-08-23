@@ -382,6 +382,9 @@ def test_effective_forecast_reindexes():
 
     runtime = AdaptiveComfortRuntime.__new__(AdaptiveComfortRuntime)
     runtime.forecast = [20.0 + i for i in range(24)]
+    runtime.forecast_precip = []
+    runtime.forecast_precip_prob = []
+    runtime._t_out_hist = []
     runtime._forecast_fetched_ts = 1_000_000.0
     runtime.t_out = 21.5
     # 1.5 h after fetch: index 0 = live t_out; h=1 → pos 2.5 → blend 22/23.

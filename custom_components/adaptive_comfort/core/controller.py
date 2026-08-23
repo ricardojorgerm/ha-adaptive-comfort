@@ -1116,6 +1116,49 @@ def _hysteresis_ceiling_k(zone: ZoneSnapshot, state: ControllerState) -> float:
     return DEPTH_MAX_K
 
 
+def _unintentional_overshoot(
+    zone: ZoneSnapshot,
+    mode: str,
+    base_lo: float,
+    base_hi: float,
+    *,
+    timing: str,
+    widen_k: float,
+) -> bool:
+    """True when the room is past the unwidened far edge for no banked reason.
+
+    COP-advance sitting between the tight and widened edge is intentional.
+    Below the tight floor (cool) / above the tight ceiling (heat) by the
+    overcool buffer is not.
+    """
+    if zone.temp is None or mode not in (MODE_HEAT, MODE_COOL):
+        return False
+    if mode == MODE_COOL:
+        if zone.temp > base_lo - PARK_OVERCOOL_BUFFER_K:
+            return False
+        banked = timing == "advance" and widen_k > 0.0 and zone.temp >= base_lo - widen_k
+        return not banked
+    if zone.temp < base_hi + PARK_OVERCOOL_BUFFER_K:
+        return False
+    banked = timing == "advance" and widen_k > 0.0 and zone.temp <= base_hi + widen_k
+    return not banked
+
+
+def _overshoot_ceiling_k(
+    zone: ZoneSnapshot, state: ControllerState, depth_k: float, *, walk: bool
+) -> float:
+    """Lift the learned ceiling only while unintentional overshoot can still deepen."""
+    mapped = _hysteresis_ceiling_k(zone, state)
+    if not walk:
+        return mapped
+    # Live fan-type is the electrical stop. A mapped idle bin at this depth
+    # is why we walk — West's 0.5 K shelf was "idle" while the head still
+    # compressed as SP followed a falling internal.
+    if zone.park_current_is_fan_type is True:
+        return max(mapped, _quantize_depth(depth_k))
+    return DEPTH_MAX_K
+
+
 def _clamp_depth(depth_k: float, lo: float | None = None, hi: float | None = None) -> float:
     stepped = _quantize_depth(depth_k)
     lo_b = DEPTH_MIN_K if lo is None else float(lo)
@@ -1212,6 +1255,7 @@ def _adapt_head_depth_k(
     want_conditioning: bool,
     mixing_covered: bool = False,
     pull_down: bool = False,
+    overshoot_walk: bool = False,
 ) -> tuple[float, bool, bool]:
     """Signed depth adapt. Returns ``(depth, changed, should_off)``.
 
@@ -1223,7 +1267,7 @@ def _adapt_head_depth_k(
     work; otherwise ``should_off`` (future overcooling / no need).
     """
     floor = _chase_floor_k(state, zid)
-    ceiling = _hysteresis_ceiling_k(zone, state)
+    ceiling = _overshoot_ceiling_k(zone, state, depth_k, walk=overshoot_walk)
     depth = _clamp_depth(depth_k, floor, ceiling)
     if zone.temp is None or mode not in (MODE_HEAT, MODE_COOL):
         return depth, False, False
@@ -1258,7 +1302,10 @@ def _adapt_head_depth_k(
         if none and not _shallower_depth_useful(
             zone, depth, want_conditioning=want_conditioning, mixing_covered=mixing_covered
         ):
-            should_off = True
+            # Unintentional overshoot: stay at this depth (retrain), do not
+            # fall through into chase. Normal path may idle.
+            if not overshoot_walk:
+                should_off = True
             state.zone_park_ref[zid] = zone.temp
         else:
             new_depth = _clamp_depth(depth - DEPTH_STEP_K, floor, ceiling)
@@ -2170,6 +2217,19 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         state.shed.clear()
     diag["shed"] = sorted(state.shed)
 
+    overshoot_walk: dict[str, bool] = {}
+    if mode in (MODE_HEAT, MODE_COOL):
+        for zone in zones:
+            base_lo, base_hi = comfort.zone_band(
+                s, centers[zone.zone_id], zone.occupied, snap.house_occupied
+            )
+            overshoot_walk[zone.zone_id] = _unintentional_overshoot(
+                zone, mode, base_lo, base_hi, timing=cop_timing, widen_k=widen_k
+            )
+        walking = [zid for zid, flag in overshoot_walk.items() if flag]
+        if walking:
+            diag["depth_overshoot_walk"] = walking
+
     # 5. Emit commands with cycling guards.
     for zone in zones:
         zid = zone.zone_id
@@ -2210,6 +2270,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 else zone.temp >= hi_b + PARK_OVERCOOL_BUFFER_K
             )
             pull_down = not _park_ok_now(zone, lo_b, hi_b, mode)
+            walk = overshoot_walk.get(zid, False)
             depth, depth_changed, should_off = _adapt_head_depth_k(
                 state,
                 zid,
@@ -2218,10 +2279,17 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 depth,
                 want_conditioning=True,
                 pull_down=pull_down,
+                overshoot_walk=walk,
             )
             floor = _chase_floor_k(state, zid)
-            ceiling = _hysteresis_ceiling_k(zone, state)
+            ceiling = _overshoot_ceiling_k(zone, state, depth, walk=walk)
             depth = _sync_depth_views(state, zid, depth, now, lo=floor, hi=ceiling)
+            if walk and not should_off:
+                if _depth_command_due(state, zid, now, zone, depth, mode, force=depth_changed):
+                    commands.append(_command_with_depth(zid, mode, None, "depth_residual", depth))
+                    state.zone_last_cmd[zid] = now
+                state.zone_fan[zid] = False
+                continue
             if overcorrected or should_off:
                 _clear_park_session(state, zid, zone, now)
                 state.zone_head_depth_k.pop(zid, None)
@@ -2300,6 +2368,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 cap = _compressing_hold_k(zone)
                 depth = _sync_depth_views(state, zid, walked, now, lo=0.0, hi=max(cap, 0.0))
             elif pmode in (MODE_HEAT, MODE_COOL):
+                walk = overshoot_walk.get(zid, False)
                 depth, depth_changed, depth_exhausted = _adapt_head_depth_k(
                     state,
                     zid,
@@ -2308,22 +2377,31 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     depth,
                     want_conditioning=False,
                     mixing_covered=mixing_covered,
+                    overshoot_walk=walk,
                 )
                 floor = _chase_floor_k(state, zid)
-                ceiling = _hysteresis_ceiling_k(zone, state)
+                ceiling = _overshoot_ceiling_k(zone, state, depth, walk=walk)
                 depth = _sync_depth_views(state, zid, depth, now, lo=floor, hi=ceiling)
 
+            walk = overshoot_walk.get(zid, False)
             hold_ceiling = (
-                _hysteresis_ceiling_k(zone, state)
+                _overshoot_ceiling_k(zone, state, depth, walk=walk)
                 if pmode in (MODE_HEAT, MODE_COOL)
                 else PARK_MARGIN_MAX_K
             )
             if (overcorrected or depth_exhausted) and not off_allowed:
-                # Head cannot hold temperature, but min-runtime forbids off:
-                # hold at COP-useful ceiling (gentlest expressible residual).
-                depth = _sync_depth_views(
-                    state, zid, hold_ceiling, now, lo=_chase_floor_k(state, zid), hi=hold_ceiling
-                )
+                # Head cannot hold temperature, but min-runtime forbids off.
+                # Unintentional overshoot already stepped +0.5 this tick —
+                # keep that depth (do not slam to DEPTH_MAX).
+                if not (walk and not depth_exhausted):
+                    depth = _sync_depth_views(
+                        state,
+                        zid,
+                        hold_ceiling,
+                        now,
+                        lo=_chase_floor_k(state, zid),
+                        hi=hold_ceiling,
+                    )
                 diag.setdefault("park_overcorrected_held", []).append(zid)
                 if pmode is not None and _depth_command_due(state, zid, now, zone, depth, pmode):
                     commands.append(_command_with_depth(zid, pmode, None, "park", depth))
@@ -2534,6 +2612,37 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     continue
                 desired_on = currently_on  # guard blocks the change this tick
 
+        walk = overshoot_walk.get(zid, False)
+        if (
+            walk
+            and desired_on
+            and currently_on
+            and mode in (MODE_HEAT, MODE_COOL)
+            and zid not in helper_ids
+        ):
+            # Min-on / leftover demand while already past the unwidened far
+            # edge: raise hysteresis depth instead of tracking-chase.
+            preferred = state.zone_park_preferred.get(zid, PARK_MARGIN_K)
+            depth = state.zone_head_depth_k.get(zid, state.zone_park_margin.get(zid, preferred))
+            depth, depth_changed, should_off = _adapt_head_depth_k(
+                state,
+                zid,
+                zone,
+                mode,
+                depth,
+                want_conditioning=True,
+                overshoot_walk=True,
+            )
+            floor = _chase_floor_k(state, zid)
+            ceiling = _overshoot_ceiling_k(zone, state, depth, walk=True)
+            depth = _sync_depth_views(state, zid, depth, now, lo=floor, hi=ceiling)
+            if not should_off:
+                if _depth_command_due(state, zid, now, zone, depth, mode, force=depth_changed):
+                    commands.append(_command_with_depth(zid, mode, None, "depth_residual", depth))
+                    state.zone_last_cmd[zid] = now
+                state.zone_fan[zid] = False
+                continue
+
         if desired_on and mode not in (MODE_HEAT, MODE_COOL):
             # Zone is running out its minimum runtime while the house has
             # gone idle. Do not leave the head at a stale (possibly deep)
@@ -2637,10 +2746,11 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 state.zone_track_delta[zid] = delta
                 track_delta = delta
                 # Continuum depth from prior adapt / residual pick.
+                walk = overshoot_walk.get(zid, False)
                 if reason == "helper" and not condition_hold and helper_depth_k is not None:
                     cap = _compressing_hold_k(zone)
                     floor = 0.0
-                    ceiling = min(_hysteresis_ceiling_k(zone, state), cap)
+                    ceiling = min(_overshoot_ceiling_k(zone, state, helper_depth_k, walk=walk), cap)
                     depth_k = _sync_depth_views(
                         state, zid, helper_depth_k, now, lo=floor, hi=max(ceiling, 0.0)
                     )
@@ -2648,11 +2758,12 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                     # Already stepped into 0/chase via continuum; clamp to live
                     # chase floor after track adapt above.
                     floor = _chase_floor_k(state, zid)
-                    ceiling = _hysteresis_ceiling_k(zone, state)
+                    held = state.zone_head_depth_k[zid]
+                    ceiling = _overshoot_ceiling_k(zone, state, held, walk=walk)
                     depth_k = _sync_depth_views(
                         state,
                         zid,
-                        state.zone_head_depth_k[zid],
+                        held,
                         now,
                         lo=floor,
                         hi=ceiling,
@@ -2677,7 +2788,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                         if reason == "demand":
                             reason = depth_tag
                         floor = _chase_floor_k(state, zid)
-                        ceiling = _hysteresis_ceiling_k(zone, state)
+                        ceiling = _overshoot_ceiling_k(zone, state, depth_k, walk=walk)
                         depth_k = _sync_depth_views(state, zid, depth_k, now, lo=floor, hi=ceiling)
                         if zid not in state.zone_parked_since:
                             state.zone_park_preferred.setdefault(zid, _park_preferred(zone, state))
@@ -2688,7 +2799,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                             )
                     else:
                         floor = _chase_floor_k(state, zid)
-                        ceiling = _hysteresis_ceiling_k(zone, state)
+                        ceiling = _overshoot_ceiling_k(zone, state, depth_k, walk=walk)
                         depth_k = _sync_depth_views(state, zid, depth_k, now, lo=floor, hi=ceiling)
                         if reason == "demand":
                             reason = depth_tag

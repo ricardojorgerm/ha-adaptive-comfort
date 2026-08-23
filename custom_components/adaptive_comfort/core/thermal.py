@@ -47,6 +47,140 @@ MIN_FIT_SAMPLES = 36
 # Effective exchange boost while configured vent fans are running (identification + prediction).
 OUTDOOR_FAN_K_OUT_MULT = 2.5
 INDOOR_FAN_K_MIX_MULT = 2.0
+# Fast overlay on q(t): off-period innovation, not written into RLS.
+Q_TRANSIENT_MAX = 3.0  # K/h
+Q_TRANSIENT_ALPHA = 0.25  # EWMA on 5 min free-float steps
+Q_TRANSIENT_FORGET_TAU_H = 1.0  # e-fold toward 0 while unobservable
+# Forecast-conditioned solar / rain (continuous; missing weather → no change).
+CLOUD_DIFFUSE = 0.85  # overcast still has diffuse: scale = 1 - this * cloud
+Q_RAIN_SINK_PER_MM = 0.15  # K/h of envelope sink per mm/h
+Q_RAIN_SINK_MAX = 0.8
+RAIN_TOUT_K_PER_MM = 0.4  # extra outdoor pull-down when the temp row looks stale
+RAIN_TOUT_MAX_K = 2.0
+RAIN_ALREADY_DROPPED_K = 0.5
+RAIN_PROB_MIN = 0.4
+CONDITION_CLEARNESS = {
+    "sunny": 1.0,
+    "clear": 1.0,
+    "clear-night": 1.0,
+    "partlycloudy": 0.55,
+    "cloudy": 0.25,
+    "fog": 0.2,
+    "rainy": 0.1,
+    "pouring": 0.08,
+    "lightning": 0.1,
+    "lightning-rainy": 0.08,
+    "snowy": 0.15,
+    "snowy-rainy": 0.1,
+    "hail": 0.1,
+    "exceptional": 0.4,
+    "windy": 0.7,
+    "windy-variant": 0.7,
+}
+
+
+def _unit_interval(value: float) -> float:
+    """Accept 0-1 or 0-100 coverage / probability."""
+    v = float(value)
+    if v > 1.0:
+        v = v / 100.0
+    return min(max(v, 0.0), 1.0)
+
+
+def clearness_index(cloud_coverage: float | None = None, condition: str | None = None) -> float:
+    """Solar scale in [0, 1]. Cloud preferred; condition is a coarse prior."""
+    if cloud_coverage is not None:
+        try:
+            return max(0.0, min(1.0, 1.0 - CLOUD_DIFFUSE * _unit_interval(float(cloud_coverage))))
+        except (TypeError, ValueError):
+            pass
+    if condition:
+        return CONDITION_CLEARNESS.get(str(condition).lower(), 1.0)
+    return 1.0
+
+
+def precip_weight(precip_mm: float | None, probability: float | None = None) -> float:
+    """Effective mm/h after probability. 0 when dry, unknown, or unlikely."""
+    if precip_mm is None:
+        return 0.0
+    try:
+        mm = float(precip_mm)
+    except (TypeError, ValueError):
+        return 0.0
+    if mm <= 0.0:
+        return 0.0
+    if probability is None:
+        return mm
+    try:
+        p = _unit_interval(float(probability))
+    except (TypeError, ValueError):
+        return mm
+    if p < RAIN_PROB_MIN:
+        return 0.0
+    return mm * p
+
+
+def rain_sink_k_per_h(precip_mm: float | None = None, probability: float | None = None) -> float:
+    """Negative envelope sink (K/h) from wet mass. 0 when no usable precip."""
+    w = precip_weight(precip_mm, probability)
+    if w <= 0.0:
+        return 0.0
+    return -min(Q_RAIN_SINK_MAX, Q_RAIN_SINK_PER_MM * w)
+
+
+def blend_outdoor_trend(
+    temps: list[float],
+    live_t_out: float | None,
+    dtdt_per_h: float | None,
+) -> list[float]:
+    """Anchor hour 0 on live T_out; fade live dT_out/dt into hours 1-2."""
+    if not temps:
+        return []
+    out = list(temps)
+    if live_t_out is not None:
+        out[0] = live_t_out
+    if live_t_out is None or dtdt_per_h is None or len(out) < 2:
+        return out
+    for h in (1, 2):
+        if h >= len(out):
+            break
+        w_live = (3 - h) / 3.0
+        drifted = live_t_out + dtdt_per_h * h
+        out[h] = w_live * drifted + (1.0 - w_live) * out[h]
+    return out
+
+
+def apply_rain_outdoor(
+    temps: list[float],
+    precip_mm: list[float | None] | None,
+    probability: list[float | None] | None,
+    live_t_out: float | None = None,
+) -> list[float]:
+    """Extra outdoor pull-down only when precip is on and the temp row has not already dropped."""
+    if not temps:
+        return []
+    out = list(temps)
+    last_dry = live_t_out if live_t_out is not None else out[0]
+    for i, t in enumerate(out):
+        p = precip_mm[i] if precip_mm and i < len(precip_mm) else None
+        pr = probability[i] if probability and i < len(probability) else None
+        w = precip_weight(p, pr)
+        if w <= 0.0:
+            last_dry = t
+            continue
+        if last_dry - t >= RAIN_ALREADY_DROPPED_K:
+            continue
+        out[i] = t - min(RAIN_TOUT_MAX_K, RAIN_TOUT_K_PER_MM * w)
+    return out
+
+
+def _hourly_at(series: list[float] | None, elapsed: float, default: float) -> float:
+    if not series:
+        return default
+    idx = min(int(elapsed), len(series) - 1)
+    frac = min(elapsed - idx, 1.0)
+    nxt = min(idx + 1, len(series) - 1)
+    return series[idx] * (1.0 - frac) + series[nxt] * frac
 
 
 def house_other_temperature(
@@ -121,6 +255,8 @@ class ThermalModel:
         self.furniture_factor = 4.0
         self.cop: float | None = None
         self.cop_samples = 0
+        # Fast residual on q (K/h). Not part of the RLS Fourier fit.
+        self.q_transient = 0.0
 
     def _scaled_k(
         self,
@@ -203,6 +339,56 @@ class ThermalModel:
             q *= fit.samples / MIN_FIT_SAMPLES
         return q
 
+    def q_mean(self, door_open: bool = False) -> float:
+        """Steady (a0) part of q_hat — people / appliances, not the solar bulge."""
+        fit = self._fit(door_open)
+        if fit.samples == 0:
+            return 0.0
+        a0 = float(fit.theta[2])
+        if fit.samples < MIN_FIT_SAMPLES:
+            a0 *= fit.samples / MIN_FIT_SAMPLES
+        return a0
+
+    def q_harmonic(self, local_hour: float, door_open: bool = False) -> float:
+        return self.q_hat(local_hour, door_open) - self.q_mean(door_open)
+
+    def q_eff(
+        self,
+        local_hour: float,
+        door_open: bool = False,
+        *,
+        solar_scale: float = 1.0,
+        rain_sink_k_per_h: float = 0.0,
+        include_transient: bool = True,
+    ) -> float:
+        """q used by prediction / standing load: a0 + scaled harmonics + overlays."""
+        scale = min(max(float(solar_scale), 0.0), 1.0)
+        q = self.q_mean(door_open) + scale * self.q_harmonic(local_hour, door_open)
+        if include_transient:
+            q += self.q_transient
+        return q + float(rain_sink_k_per_h)
+
+    def update_q_transient(self, innovation_k_per_h: float) -> float:
+        """EWMA the off-period residual (observed - q_hat-only free-float rate)."""
+        try:
+            innov = float(innovation_k_per_h)
+        except (TypeError, ValueError):
+            return self.q_transient
+        if abs(innov) > 8.0:
+            return self.q_transient
+        self.q_transient += Q_TRANSIENT_ALPHA * (innov - self.q_transient)
+        self.q_transient = min(max(self.q_transient, -Q_TRANSIENT_MAX), Q_TRANSIENT_MAX)
+        return self.q_transient
+
+    def forget_q_transient(self, dt_h: float) -> float:
+        """Decay the overlay toward 0 while free-float cannot be observed."""
+        if dt_h <= 0.0 or self.q_transient == 0.0:
+            return self.q_transient
+        self.q_transient *= math.exp(-dt_h / Q_TRANSIENT_FORGET_TAU_H)
+        if abs(self.q_transient) < 1e-4:
+            self.q_transient = 0.0
+        return self.q_transient
+
     def q_coeffs(self, door_open: bool) -> dict[str, float | int] | None:
         """Raw learned harmonic coefficients for one door regime (no fallback).
 
@@ -229,6 +415,8 @@ class ThermalModel:
         return {
             "q_hat_k_per_h": round(q, 5),
             "q_hat_w": round(q * self.c_eff_wh_per_k, 1),
+            "q_transient_k_per_h": round(self.q_transient, 5),
+            "q_eff_k_per_h": round(self.q_eff(local_hour, door_open), 5),
             "local_hour": round(local_hour % 24.0, 2),
             "active_regime": "door_open" if door_open else "door_closed",
             "fallback": self.fit_is_fallback(door_open),
@@ -260,7 +448,7 @@ class ThermalModel:
         )
         if t_house_other is None:
             k_mix = 0.0
-        q = self.q_hat(local_hour, door_open)
+        q = self.q_eff(local_hour, door_open)
         denom = k_out + k_mix
         if denom <= 1e-9:
             return t_out
@@ -391,6 +579,9 @@ class ThermalModel:
         *,
         indoor_fans_on: bool = False,
         outdoor_exhaust_on: bool = False,
+        include_transient: bool = True,
+        solar_scale: float = 1.0,
+        rain_sink_k_per_h: float = 0.0,
     ) -> float:
         """No-AC dT/dt [K/h] — same rate model `predict_free` integrates."""
         k_out, k_mix = self._scaled_k(
@@ -399,7 +590,14 @@ class ThermalModel:
             outdoor_exhaust_on=outdoor_exhaust_on,
         )
         mix = k_mix * (t_house_other - t_in) if t_house_other is not None else 0.0
-        return k_out * (t_out - t_in) + mix + self.q_hat(local_hour, door_open)
+        q = self.q_eff(
+            local_hour,
+            door_open,
+            solar_scale=solar_scale,
+            rain_sink_k_per_h=rain_sink_k_per_h,
+            include_transient=include_transient,
+        )
+        return k_out * (t_out - t_in) + mix + q
 
     def sensible_power_w(
         self,
@@ -518,6 +716,8 @@ class ThermalModel:
         *,
         indoor_fans_on: bool = False,
         outdoor_exhaust_on: bool = False,
+        solar_scale_hourly: list[float] | None = None,
+        rain_sink_hourly: list[float] | None = None,
     ) -> list[float]:
         """Euler-integrated free-float trajectory; returns hourly samples."""
         if not t_out_hourly:
@@ -537,20 +737,20 @@ class ThermalModel:
             if elapsed >= next_sample - 1e-9:
                 temps.append(t)
                 next_sample += 1.0
-            idx = min(int(elapsed), len(t_out_hourly) - 1)
-            frac = min(elapsed - idx, 1.0)
-            nxt = min(idx + 1, len(t_out_hourly) - 1)
-            t_out = t_out_hourly[idx] * (1 - frac) + t_out_hourly[nxt] * frac
+            t_out = _hourly_at(t_out_hourly, elapsed, t_out_hourly[-1])
             if t_house_hourly:
-                hi = min(int(elapsed), len(t_house_hourly) - 1)
-                hf = min(elapsed - hi, 1.0)
-                hn = min(hi + 1, len(t_house_hourly) - 1)
-                t_house = t_house_hourly[hi] * (1 - hf) + t_house_hourly[hn] * hf
+                t_house = _hourly_at(t_house_hourly, elapsed, t_house_hourly[-1])
             else:
                 t_house = t_house_other
             hour = (start_hour + elapsed) % 24.0
             mix_term = k_mix * (t_house - t) if t_house is not None else 0.0
-            t += step_h * (k_out * (t_out - t) + mix_term + self.q_hat(hour, door_open))
+            q = self.q_eff(
+                hour,
+                door_open,
+                solar_scale=_hourly_at(solar_scale_hourly, elapsed, 1.0),
+                rain_sink_k_per_h=_hourly_at(rain_sink_hourly, elapsed, 0.0),
+            )
+            t += step_h * (k_out * (t_out - t) + mix_term + q)
             elapsed += step_h
         return temps
 
@@ -566,6 +766,8 @@ class ThermalModel:
         *,
         indoor_fans_on: bool = False,
         outdoor_exhaust_on: bool = False,
+        solar_scale_hourly: list[float] | None = None,
+        rain_sink_hourly: list[float] | None = None,
     ) -> dict[int, float]:
         """Predicted temperature at each of `horizons_min` minutes ahead.
 
@@ -594,21 +796,21 @@ class ThermalModel:
         while target_i < len(targets):
             target_h = targets[target_i] / 60.0
             while elapsed < target_h - 1e-9:
-                idx = min(int(elapsed), len(t_out_hourly) - 1)
-                frac = min(elapsed - idx, 1.0)
-                nxt = min(idx + 1, len(t_out_hourly) - 1)
-                t_out = t_out_hourly[idx] * (1 - frac) + t_out_hourly[nxt] * frac
+                t_out = _hourly_at(t_out_hourly, elapsed, t_out_hourly[-1])
                 if t_house_hourly:
-                    hi = min(int(elapsed), len(t_house_hourly) - 1)
-                    hf = min(elapsed - hi, 1.0)
-                    hn = min(hi + 1, len(t_house_hourly) - 1)
-                    t_house = t_house_hourly[hi] * (1 - hf) + t_house_hourly[hn] * hf
+                    t_house = _hourly_at(t_house_hourly, elapsed, t_house_hourly[-1])
                 else:
                     t_house = t_house_other
                 hour = (start_hour + elapsed) % 24.0
                 mix_term = k_mix * (t_house - t) if t_house is not None else 0.0
                 step_h = min(max_step_h, target_h - elapsed)
-                t += step_h * (k_out * (t_out - t) + mix_term + self.q_hat(hour, door_open))
+                q = self.q_eff(
+                    hour,
+                    door_open,
+                    solar_scale=_hourly_at(solar_scale_hourly, elapsed, 1.0),
+                    rain_sink_k_per_h=_hourly_at(rain_sink_hourly, elapsed, 0.0),
+                )
+                t += step_h * (k_out * (t_out - t) + mix_term + q)
                 elapsed += step_h
             out[targets[target_i]] = t
             target_i += 1
@@ -622,6 +824,7 @@ class ThermalModel:
             "furniture_factor": self.furniture_factor,
             "cop": self.cop,
             "cop_samples": self.cop_samples,
+            "q_transient": self.q_transient,
         }
 
     @classmethod
@@ -635,6 +838,13 @@ class ThermalModel:
         cop = data.get("cop")
         model.cop = float(cop) if cop is not None else None
         model.cop_samples = int(data.get("cop_samples", 0))
+        try:
+            model.q_transient = min(
+                max(float(data.get("q_transient", 0.0)), -Q_TRANSIENT_MAX),
+                Q_TRANSIENT_MAX,
+            )
+        except (TypeError, ValueError):
+            model.q_transient = 0.0
         return model
 
 

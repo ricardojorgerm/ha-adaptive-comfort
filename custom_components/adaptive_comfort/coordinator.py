@@ -65,7 +65,15 @@ from .core.drift import DriftEstimator
 from .core.power import BaselineModel, DrawEstimator, EnergyMerge
 from .core.predictor import HORIZONS_MIN, PredictorScorer
 from .core.series import TimeSeries
-from .core.thermal import DiurnalModel, ThermalModel, house_other_temperature
+from .core.thermal import (
+    DiurnalModel,
+    ThermalModel,
+    apply_rain_outdoor,
+    blend_outdoor_trend,
+    clearness_index,
+    house_other_temperature,
+    rain_sink_k_per_h,
+)
 from .core.types import (
     MODE_COOL,
     MODE_FAN,
@@ -101,6 +109,8 @@ FORECAST_INTERVAL = timedelta(minutes=30)
 FIT_STEP_S = 300.0  # 5-minute smoothed steps for the RC fit
 STABLE_STATE_S = 600.0  # drift updates need >=10 min in a stable head state
 ALL_OFF_SETTLE_S = 900.0  # free-response fit waits 15 min after heads stop
+TRANSIENT_SETTLE_S = 300.0  # q_transient may update after 5 min off
+OUTDOOR_TREND_S = 30.0 * 60.0  # live dT_out/dt window
 BASELINE_OFF_S = 600.0
 EVENT_SETTLE_S = 240.0
 QUASI_STEADY_K_H = 0.2
@@ -132,6 +142,15 @@ def _float_state(hass: HomeAssistant, entity_id: str | None) -> float | None:
     try:
         return float(state.state)
     except (ValueError, TypeError):
+        return None
+
+
+def _optional_float(value: Any) -> float | None:
+    if value is None or isinstance(value, bool):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
         return None
 
 
@@ -277,6 +296,11 @@ class AdaptiveComfortRuntime:
         self.p_load_series = TimeSeries(horizon_s=2 * 3600.0)
         self.grid_over_since: float | None = None
         self.forecast: list[float] = []
+        self.forecast_cloud: list[float | None] = []
+        self.forecast_condition: list[str | None] = []
+        self.forecast_precip: list[float | None] = []
+        self.forecast_precip_prob: list[float | None] = []
+        self._t_out_hist: list[tuple[float, float]] = []
         self._forecast_ts = 0.0
         self._forecast_fetched_ts: float = 0.0
         self._t_out_lkg: float | None = None
@@ -890,6 +914,10 @@ class AdaptiveComfortRuntime:
         self._forecast_ts = now_ts
         weather = self.entry.data.get(CONF_WEATHER)
         temps: list[float] = []
+        clouds: list[float | None] = []
+        conditions: list[str | None] = []
+        precip: list[float | None] = []
+        precip_prob: list[float | None] = []
         if weather:
             try:
                 response = await self.hass.services.async_call(
@@ -900,11 +928,19 @@ class AdaptiveComfortRuntime:
                     return_response=True,
                 )
                 forecast = (response or {}).get(weather, {}).get("forecast", [])
-                temps = [
-                    float(item["temperature"])
-                    for item in forecast[:FORECAST_HOURS]
-                    if isinstance(item.get("temperature"), (int, float))
-                ]
+                for item in forecast[:FORECAST_HOURS]:
+                    if not isinstance(item.get("temperature"), (int, float)):
+                        continue
+                    temps.append(float(item["temperature"]))
+                    clouds.append(_optional_float(item.get("cloud_coverage")))
+                    cond = item.get("condition")
+                    conditions.append(str(cond) if cond else None)
+                    precip.append(_optional_float(item.get("precipitation")))
+                    precip_prob.append(
+                        _optional_float(
+                            item.get("precipitation_probability", item.get("precip_probability"))
+                        )
+                    )
             except Exception:
                 _LOGGER.debug("Hourly forecast unavailable from %s", weather, exc_info=True)
         if not temps:
@@ -919,29 +955,120 @@ class AdaptiveComfortRuntime:
                     comfort.climatology_temp(now.month, (hour + h) % 24.0)
                     for h in range(FORECAST_HOURS)
                 ]
+            clouds = [None] * len(temps)
+            conditions = [None] * len(temps)
+            precip = [None] * len(temps)
+            precip_prob = [None] * len(temps)
         if temps and self.t_out is not None:
             temps[0] = self.t_out  # anchor the horizon on the live reading
         self.forecast = temps
+        self.forecast_cloud = clouds
+        self.forecast_condition = conditions
+        self.forecast_precip = precip
+        self.forecast_precip_prob = precip_prob
         self._forecast_fetched_ts = now_ts
 
-    def _effective_forecast(self, now_ts: float) -> list[float]:
-        """Re-index stored forecast so index 0 is 'now', anchored on live t_out."""
-        if not self.forecast:
-            return [self.t_out] * FORECAST_HOURS if self.t_out is not None else []
-        elapsed_h = 0.0
-        if self._forecast_fetched_ts > 0.0:
-            elapsed_h = max(0.0, (now_ts - self._forecast_fetched_ts) / 3600.0)
-        n = len(self.forecast)
+    def _outdoor_dtdt_per_h(self, _now_ts: float) -> float | None:
+        hist = getattr(self, "_t_out_hist", None) or []
+        if len(hist) < 2:
+            return None
+        oldest_ts, oldest_t = hist[0]
+        newest_ts, newest_t = hist[-1]
+        span_h = (newest_ts - oldest_ts) / 3600.0
+        if span_h < 10.0 / 60.0:
+            return None
+        return (newest_t - oldest_t) / span_h
+
+    def _shift_hourly_floats(self, series: list[float], elapsed_h: float) -> list[float]:
+        n = len(series)
+        if n == 0:
+            return []
         shifted: list[float] = []
         for h in range(FORECAST_HOURS):
             pos = elapsed_h + h
             idx = min(int(pos), n - 1)
             frac = min(pos - idx, 1.0)
             nxt = min(idx + 1, n - 1)
-            shifted.append(self.forecast[idx] * (1.0 - frac) + self.forecast[nxt] * frac)
-        if self.t_out is not None and shifted:
-            shifted[0] = self.t_out
+            shifted.append(series[idx] * (1.0 - frac) + series[nxt] * frac)
         return shifted
+
+    def _shift_hourly_optional(
+        self, series: list[float | None], elapsed_h: float
+    ) -> list[float | None]:
+        n = len(series)
+        if n == 0:
+            return [None] * FORECAST_HOURS
+        out: list[float | None] = []
+        for h in range(FORECAST_HOURS):
+            pos = elapsed_h + h
+            idx = min(int(pos), n - 1)
+            frac = min(pos - idx, 1.0)
+            nxt = min(idx + 1, n - 1)
+            a, b = series[idx], series[nxt]
+            if isinstance(a, (int, float)) and isinstance(b, (int, float)):
+                out.append(float(a) * (1.0 - frac) + float(b) * frac)
+            else:
+                out.append(a if frac < 0.5 else b)
+        return out
+
+    def _shift_hourly_text(self, series: list[str | None], elapsed_h: float) -> list[str | None]:
+        n = len(series)
+        if n == 0:
+            return [None] * FORECAST_HOURS
+        out: list[str | None] = []
+        for h in range(FORECAST_HOURS):
+            pos = elapsed_h + h
+            idx = min(int(pos + 0.5), n - 1)
+            out.append(series[idx])
+        return out
+
+    def _effective_forecast(self, now_ts: float) -> list[float]:
+        """Re-index stored forecast so index 0 is 'now', with live trend + rain."""
+        if not self.forecast:
+            return [self.t_out] * FORECAST_HOURS if self.t_out is not None else []
+        elapsed_h = 0.0
+        if self._forecast_fetched_ts > 0.0:
+            elapsed_h = max(0.0, (now_ts - self._forecast_fetched_ts) / 3600.0)
+        shifted = self._shift_hourly_floats(self.forecast, elapsed_h)
+        shifted = blend_outdoor_trend(shifted, self.t_out, self._outdoor_dtdt_per_h(now_ts))
+        precip = self._shift_hourly_optional(
+            getattr(self, "forecast_precip", None) or [], elapsed_h
+        )
+        precip_prob = self._shift_hourly_optional(
+            getattr(self, "forecast_precip_prob", None) or [], elapsed_h
+        )
+        return apply_rain_outdoor(shifted, precip, precip_prob, self.t_out)
+
+    def _forecast_q_hours(self, now_ts: float) -> tuple[list[float], list[float]]:
+        """Hourly solar scale and rain-sink (K/h) aligned with `_effective_forecast`."""
+        elapsed_h = 0.0
+        if self._forecast_fetched_ts > 0.0:
+            elapsed_h = max(0.0, (now_ts - self._forecast_fetched_ts) / 3600.0)
+        clouds = self._shift_hourly_optional(getattr(self, "forecast_cloud", None) or [], elapsed_h)
+        conditions = self._shift_hourly_text(
+            getattr(self, "forecast_condition", None) or [], elapsed_h
+        )
+        precip = self._shift_hourly_optional(
+            getattr(self, "forecast_precip", None) or [], elapsed_h
+        )
+        precip_prob = self._shift_hourly_optional(
+            getattr(self, "forecast_precip_prob", None) or [], elapsed_h
+        )
+        scales = [
+            clearness_index(
+                clouds[i] if i < len(clouds) else None,
+                conditions[i] if i < len(conditions) else None,
+            )
+            for i in range(FORECAST_HOURS)
+        ]
+        sinks = [
+            rain_sink_k_per_h(
+                precip[i] if i < len(precip) else None,
+                precip_prob[i] if i < len(precip_prob) else None,
+            )
+            for i in range(FORECAST_HOURS)
+        ]
+        return scales, sinks
 
     # -- main loop --------------------------------------------------------------
 
@@ -1070,6 +1197,9 @@ class AdaptiveComfortRuntime:
         if self.t_out is not None and self.outdoor_source != "climatology":
             self.t_rm = comfort.update_running_mean(self.t_rm, self.t_out, dt_h)
             self.outdoor_diurnal.update(local_hour, self.t_out)
+            self._t_out_hist.append((now_ts, self.t_out))
+            cutoff = now_ts - OUTDOOR_TREND_S
+            self._t_out_hist = [(ts, t) for ts, t in self._t_out_hist if ts >= cutoff]
         occupied = house_presence(
             self.hass,
             data.get(CONF_PRESENCE),
@@ -1334,6 +1464,27 @@ class AdaptiveComfortRuntime:
         dt_h = gap / 3600.0
         dtdt = (smoothed - prev_temp) / dt_h
 
+        off_s = None if zone.all_off_since is None else now_ts - zone.all_off_since
+        if (
+            off_s is not None
+            and off_s >= TRANSIENT_SETTLE_S
+            and self.outdoor_source != "climatology"
+        ):
+            t_house = self._house_other_temp(zone.config.zone_id)
+            expected = zone.model.free_float_rate(
+                smoothed,
+                self.t_out,
+                local_hour,
+                zone.door_open,
+                t_house,
+                indoor_fans_on=zone.indoor_fans_on,
+                outdoor_exhaust_on=zone.outdoor_exhaust_on,
+                include_transient=False,
+            )
+            zone.model.update_q_transient(dtdt - expected)
+        else:
+            zone.model.forget_q_transient(dt_h)
+
         if zone.all_off_since is not None and now_ts - zone.all_off_since >= ALL_OFF_SETTLE_S:
             # Only fit against measured outdoor data; climatology estimates
             # would corrupt the exchange-constant identification.
@@ -1546,6 +1697,7 @@ class AdaptiveComfortRuntime:
     def _build_snapshot(self, now_ts: float, local_hour: float) -> HouseSnapshot:
         zone_snaps: list[ZoneSnapshot] = []
         forecast = self._effective_forecast(now_ts)
+        solar_scale, rain_sink = self._forecast_q_hours(now_ts)
         volume_readings = self._volume_readings()
         aux_readings = self._aux_volume_readings()
         for zone in self.zones.values():
@@ -1565,6 +1717,8 @@ class AdaptiveComfortRuntime:
                     t_house_hourly=t_house_hourly,
                     indoor_fans_on=zone.indoor_fans_on,
                     outdoor_exhaust_on=zone.outdoor_exhaust_on,
+                    solar_scale_hourly=solar_scale,
+                    rain_sink_hourly=rain_sink,
                 )
                 free_float = tuple(trajectory)
                 if len(trajectory) > 1:
@@ -1573,7 +1727,14 @@ class AdaptiveComfortRuntime:
                 # Manual/adaptive conditioning just queues rows that get dropped.
                 if zone.all_off_since is not None:
                     self._record_predictions(
-                        now_ts, zone, forecast, t_house, t_house_hourly, local_hour
+                        now_ts,
+                        zone,
+                        forecast,
+                        t_house,
+                        t_house_hourly,
+                        local_hour,
+                        solar_scale,
+                        rain_sink,
                     )
             zone.free_float = free_float
             zone.pred_60m = pred_60m
@@ -1692,6 +1853,8 @@ class AdaptiveComfortRuntime:
         t_house: float | None,
         t_house_hourly: list[float] | None,
         local_hour: float,
+        solar_scale_hourly: list[float] | None = None,
+        rain_sink_hourly: list[float] | None = None,
     ) -> None:
         """Log a predicted-vs-actual sample at each scoring horizon.
 
@@ -1709,6 +1872,8 @@ class AdaptiveComfortRuntime:
             t_house_hourly=t_house_hourly,
             indoor_fans_on=zone.indoor_fans_on,
             outdoor_exhaust_on=zone.outdoor_exhaust_on,
+            solar_scale_hourly=solar_scale_hourly,
+            rain_sink_hourly=rain_sink_hourly,
         )
         if not preds:
             return

@@ -1270,3 +1270,136 @@ def test_power_debounce_ignores_brief_crossings():
     assert d.settle(t + 500.0 + PARK_DUTY_DEBOUNCE_S, 40.0) is False
     d.reset()
     assert d.above is None and d.since is None
+
+
+def test_unintentional_overshoot_walks_past_idle_shelf():
+    """Below lo lifts the mapped idle 0.5 K shelf one step (West field case)."""
+    bins = _residual_bins(**{"0.5": 20.0})
+    west = make_zone(
+        "west",
+        20.7,
+        is_on=True,
+        park_residuals=True,
+        park_extraction_w=20.0,
+        park_residual_max_margin_k=0.5,
+        park_residual_edge_k=0.5,
+        park_margin_bins=bins,
+        standing_load_w=40.0,
+        head_mode=MODE_COOL,
+        head_state="cooling",
+    )
+    hot = make_zone("hot", 26.0, is_on=True, head_mode=MODE_COOL, head_state="cooling")
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        target=23.0,
+        adaptive_blend=0.0,
+        band_k=1.0,
+        tracking=True,
+        park_learning=True,
+        multisplit=True,
+    )
+    state = warmed_state([west, hot])
+    state.zone_on["west"] = True
+    state.zone_on["hot"] = True
+    state.zone_parked_since["west"] = NOW - 600.0
+    state.zone_park_margin["west"] = 0.5
+    state.zone_head_depth_k["west"] = 0.5
+    state.zone_park_preferred["west"] = 0.5
+    state.zone_park_ref["west"] = 21.0
+    state.zone_last_cmd["west"] = NOW
+    later = NOW + controller.HEAD_REANCHOR_MIN_S + 1.0
+    # Still inside zone chatter: off is forbidden, so below-lo walks instead of
+    # releasing (the far-edge test covers off-allowed release).
+    state.zone_since["west"] = later - 60.0
+    decision = tick([west, hot], state, now=later, settings=settings)
+    assert "west" in decision.diag.get("depth_overshoot_walk", [])
+    assert decision.state.zone_head_depth_k["west"] == 1.0
+    assert "west" in decision.state.zone_parked_since
+
+
+def test_overshoot_walk_stops_at_fan_type():
+    bins = _residual_bins(**{"0.5": 10.0})
+    west = make_zone(
+        "west",
+        20.7,
+        is_on=True,
+        park_residuals=True,
+        park_extraction_w=10.0,
+        park_residual_max_margin_k=0.5,
+        park_current_is_fan_type=True,
+        park_margin_bins=bins,
+        standing_load_w=40.0,
+        head_mode=MODE_COOL,
+    )
+    hot = make_zone("hot", 26.0, is_on=True, head_mode=MODE_COOL, head_state="cooling")
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        target=23.0,
+        adaptive_blend=0.0,
+        band_k=1.0,
+        tracking=True,
+        park_learning=True,
+        multisplit=True,
+    )
+    state = warmed_state([west, hot])
+    state.zone_on["west"] = True
+    state.zone_on["hot"] = True
+    state.zone_parked_since["west"] = NOW - 600.0
+    state.zone_park_margin["west"] = 0.5
+    state.zone_head_depth_k["west"] = 0.5
+    state.zone_park_ref["west"] = 21.0
+    state.zone_last_cmd["west"] = NOW
+    later = NOW + controller.HEAD_REANCHOR_MIN_S + 1.0
+    state.zone_since["west"] = later - 60.0
+    decision = tick([west, hot], state, now=later, settings=settings)
+    assert decision.state.zone_head_depth_k["west"] == 0.5
+
+
+def test_advance_bank_is_not_unintentional_overshoot():
+    """COP-advance sitting between tight and wide lo must not walk depth."""
+    z_bank = make_zone("z", 21.4)
+    z_past = make_zone("z", 20.7)
+    assert not controller._unintentional_overshoot(
+        z_bank, MODE_COOL, 22.0, 24.0, timing="advance", widen_k=0.7
+    )
+    assert controller._unintentional_overshoot(
+        z_bank, MODE_COOL, 22.0, 24.0, timing="none", widen_k=0.0
+    )
+    assert controller._unintentional_overshoot(
+        z_past, MODE_COOL, 22.0, 24.0, timing="advance", widen_k=0.7
+    )
+
+
+def test_adapt_walk_lifts_ceiling_without_walk_stays_mapped():
+    zone = make_zone(
+        "z1",
+        20.7,
+        park_residuals=True,
+        park_extraction_w=20.0,
+        park_residual_max_margin_k=0.5,
+        park_margin_bins=_residual_bins(**{"0.5": 20.0}),
+    )
+    state = ControllerState()
+    state.zone_park_ref["z1"] = 21.0
+    walked, changed, should_off = controller._adapt_head_depth_k(
+        state,
+        "z1",
+        zone,
+        MODE_COOL,
+        0.5,
+        want_conditioning=False,
+        overshoot_walk=True,
+    )
+    assert changed and walked == 1.0 and not should_off
+    state.zone_park_ref["z1"] = 21.0
+    held, changed, _ = controller._adapt_head_depth_k(
+        state,
+        "z1",
+        zone,
+        MODE_COOL,
+        0.5,
+        want_conditioning=False,
+        overshoot_walk=False,
+    )
+    assert held == 0.5
+    assert not changed
