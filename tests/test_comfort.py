@@ -450,3 +450,13 @@ def test_uncooled_cold_room_scores_heat_while_house_is_cool():
     state.mode = MODE_COOL
     _warm, cold = comfort.demand_integrals([zone], {"north": (21.8, 23.2)}, state=state, now_ts=now)
     assert cold > 0.0
+
+
+def test_skip_manufactured_leftover_positive_depth_without_session():
+    """Hold skip must key off leftover head_depth_k, not only parked_since."""
+    zone = make_zone(zone_id="west", temp=21.0, head_mode=None)
+    state = ControllerState()
+    state.mode = MODE_COOL
+    state.zone_head_depth_k["west"] = 1.5
+    assert comfort._skip_manufactured(zone, cold=True, state=state, now_ts=1_000_000.0)
+    assert not comfort._skip_manufactured(zone, cold=False, state=state, now_ts=1_000_000.0)

@@ -63,6 +63,11 @@ def find_cmd(decision, zid):
     return next((c for c in decision.commands if c.zone_id == zid), None)
 
 
+def holding(cmd):
+    """True when a command asks for frozen positive-depth hold (was Command.park)."""
+    return cmd is not None and cmd.head_depth_k is not None and cmd.head_depth_k > 0.0
+
+
 # --- estimator -----------------------------------------------------------------
 
 
@@ -115,6 +120,32 @@ def test_park_preferred_state_round_trips():
     assert restored.zone_park_preferred == {"z1": 2.0}
     assert restored.zone_park_probe_entry == {"z1": 3}
     assert restored.zone_last_park_abort == {"z1": 123.0}
+
+
+def test_from_dict_reads_legacy_hold_session_keys():
+    """Restored dumps still populate every hold/park clock (aliases stay)."""
+    restored = ControllerState.from_dict(
+        {
+            "zone_head_depth_k": {"z1": 1.5},
+            "zone_park_margin": {"z1": 1.5},
+            "zone_track_delta": {"z1": 0.5},
+            "zone_parked_since": {"z1": 100.0},
+            "zone_park_ref": {"z1": 23.0},
+            "zone_park_preferred": {"z1": 2.0},
+            "zone_last_park_probe": {"z1": 50.0},
+            "zone_last_park_abort": {"z1": 10.0},
+            "zone_park_probe_entry": {"z1": 3},
+        }
+    )
+    assert restored.zone_head_depth_k == {"z1": 1.5}
+    assert restored.zone_park_margin == {"z1": 1.5}
+    assert restored.zone_track_delta == {"z1": 0.5}
+    assert restored.zone_parked_since == {"z1": 100.0}
+    assert restored.zone_park_ref == {"z1": 23.0}
+    assert restored.zone_park_preferred == {"z1": 2.0}
+    assert restored.zone_last_park_probe == {"z1": 50.0}
+    assert restored.zone_last_park_abort == {"z1": 10.0}
+    assert restored.zone_park_probe_entry == {"z1": 3}
 
 
 def _residual_bins(**ext_by_margin):
@@ -240,7 +271,7 @@ def test_demand_uses_residual_depth_without_want_off():
     assert "z1" in (d.diag.get("demand") or [])
     cmd = find_cmd(d, "z1")
     assert cmd is not None
-    assert cmd.park is True
+    assert holding(cmd)
     assert cmd.head_depth_k == 2.0
     assert cmd.reason == "depth_residual"
     assert "z1" in state.zone_parked_since
@@ -421,7 +452,7 @@ def test_demand_pull_down_stays_on_track_delta():
     d = tick([zone], state, settings=settings)
     cmd = find_cmd(d, "z1")
     assert cmd is not None
-    assert cmd.park is False
+    assert not holding(cmd)
     assert cmd.head_depth_k is not None and cmd.head_depth_k < 0
     assert cmd.track_delta is not None
 
@@ -458,7 +489,7 @@ def test_unclassified_satisfied_zone_gets_probe_parked():
     satisfied, hot, state = _two_zone_setup()
     decision = tick([satisfied, hot], state)
     cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is True
+    assert holding(cmd)
     assert "sat" in state.zone_parked_since
     # Probe budget is charged at release (only if observed), not at entry.
     assert "sat" not in state.zone_last_park_probe
@@ -470,14 +501,14 @@ def test_probe_rate_limited():
     state.zone_last_park_probe["sat"] = NOW - 60.0  # probed a minute ago
     decision = tick([satisfied, hot], state)
     cmd = find_cmd(decision, "sat")
-    assert cmd is None or cmd.park is False  # plain off path, no new probe
+    assert not holding(cmd)  # plain off path, no new probe
 
 
 def test_known_idler_turns_off_not_parked():
     satisfied, hot, state = _two_zone_setup(park_residuals=False)
     decision = tick([satisfied, hot], state)
     cmd = find_cmd(decision, "sat")
-    assert cmd is None or cmd.park is False
+    assert not holding(cmd)
     assert "sat" not in state.zone_parked_since
 
 
@@ -487,7 +518,7 @@ def test_known_residual_exploit_parks_when_load_covered():
     )
     decision = tick([satisfied, hot], state)
     cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is True
+    assert holding(cmd)
 
 
 def test_known_residual_not_parked_when_load_too_big():
@@ -496,7 +527,7 @@ def test_known_residual_not_parked_when_load_too_big():
     )
     decision = tick([satisfied, hot], state)
     cmd = find_cmd(decision, "sat")
-    assert cmd is None or cmd.park is False
+    assert not holding(cmd)
 
 
 def test_no_park_without_running_sibling():
@@ -545,7 +576,7 @@ def test_parked_zone_reenters_demand_when_out_of_band():
     decision = tick([warm, hot], state, now=later)
     assert "sat" not in state.zone_parked_since
     cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is False and cmd.track_delta is not None
+    assert cmd is not None and not holding(cmd) and cmd.track_delta is not None
 
 
 def test_parked_zone_does_not_refresh_from_live_internal_on_spacing():
@@ -624,7 +655,7 @@ def test_parked_zone_released_when_pushed_through_far_edge():
     decision = tick([frozen, hot], state, now=later)
     assert "sat" not in state.zone_parked_since
     cmd = find_cmd(decision, "sat")
-    assert cmd is None or cmd.park is False
+    assert not holding(cmd)
 
 
 def test_margin_escalates_while_room_keeps_cooling():
@@ -647,8 +678,8 @@ def test_margin_escalates_while_room_keeps_cooling():
     assert state.zone_park_margin["sat"] == controller.PARK_MARGIN_K + controller.PARK_MARGIN_STEP_K
     assert state.zone_park_preferred["sat"] == state.zone_park_margin["sat"]
     cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is True
-    assert cmd.park_margin == state.zone_park_margin["sat"]
+    assert holding(cmd)
+    assert cmd.head_depth_k == state.zone_park_margin["sat"]
 
 
 def test_next_park_starts_slightly_below_preferred():
@@ -661,9 +692,9 @@ def test_next_park_starts_slightly_below_preferred():
     )
     decision = tick([satisfied, hot], state)
     cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is True
+    assert holding(cmd)
     expected = 2.0 - controller.PARK_ENTRY_UNDERSHOOT_K
-    assert cmd.park_margin == expected
+    assert cmd.head_depth_k == expected
     assert state.zone_park_margin["sat"] == expected
     assert state.zone_park_preferred["sat"] == 2.0  # memory unchanged at entry
 
@@ -677,7 +708,7 @@ def test_entry_undershoot_floors_at_park_minimum():
     )
     decision = tick([satisfied, hot], state)
     cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park_margin == controller.PARK_MARGIN_K
+    assert cmd is not None and cmd.head_depth_k == controller.PARK_MARGIN_K
 
 
 def test_margin_change_refreshes_immediately():
@@ -697,8 +728,8 @@ def test_margin_change_refreshes_immediately():
     )
     decision = tick([cooler, hot], state, now=NOW + 60.0)
     cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is True
-    assert cmd.park_margin == controller.PARK_MARGIN_K + controller.PARK_MARGIN_STEP_K
+    assert holding(cmd)
+    assert cmd.head_depth_k == controller.PARK_MARGIN_K + controller.PARK_MARGIN_STEP_K
 
 
 def test_park_head_anchor_does_not_chase_positive_depth():
@@ -806,7 +837,7 @@ def test_heating_park_entry_and_far_edge_release():
     state = warmed_state([satisfied, cold])
     decision = tick([satisfied, cold], state, settings=settings)
     cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is True
+    assert holding(cmd)
     assert "sat" in state.zone_parked_since
 
     # Overheat past band hi (center 23 ± 0.7 → hi 23.7): release immediately.
@@ -816,7 +847,7 @@ def test_heating_park_entry_and_far_edge_release():
     decision = tick([hot_room, cold], state, settings=settings, now=soon)
     assert "sat" not in state.zone_parked_since
     cmd = find_cmd(decision, "sat")
-    assert cmd is None or cmd.park is False
+    assert not holding(cmd)
 
 
 def test_heating_margin_escalates_while_room_keeps_warming():
@@ -847,8 +878,8 @@ def test_heating_margin_escalates_while_room_keeps_warming():
     decision = tick([warmer, cold], state, settings=settings, now=NOW + 60.0)
     assert state.zone_park_margin["sat"] == entry + controller.PARK_MARGIN_STEP_K
     cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is True
-    assert cmd.park_margin == state.zone_park_margin["sat"]
+    assert holding(cmd)
+    assert cmd.head_depth_k == state.zone_park_margin["sat"]
 
 
 # --- field-bug regressions: floor entry, probe budget, run-out ------------------
@@ -921,7 +952,7 @@ def test_runout_zone_parks_for_free_observation():
     snap = make_snapshot([zone], now=NOW, p_ac=400.0, compression_floor_w=75.0)
     decision = controller.tick(snap, state)
     cmd = find_cmd(decision, "z1")
-    assert cmd is not None and cmd.park is True
+    assert holding(cmd)
     assert "z1" in state.zone_parked_since
     assert "z1" not in state.zone_park_probe_entry  # free: no budget involved
 
@@ -936,7 +967,7 @@ def test_runout_does_not_park_while_still_hot():
     decision = tick([zone], state)
     assert "z1" not in state.zone_parked_since
     cmd = find_cmd(decision, "z1")
-    assert cmd is None or cmd.park is False
+    assert not holding(cmd)
 
 
 def test_runout_park_survives_probe_window_while_min_on_blocks():
@@ -992,7 +1023,7 @@ def test_runout_falls_back_to_min_delta_when_park_learning_off():
         assert cmd is not None and cmd.reason == "runout"
         assert cmd.track_delta == controller.TRACK_DELTA_MIN_K
     else:
-        assert cmd is None or cmd.park is False
+        assert not holding(cmd)
 
 
 # --- power-gated observation and hysteresis learning ---------------------------
@@ -1075,7 +1106,7 @@ def test_multi_room_zone_parks_and_exploits_with_sibling():
     decision = tick([sat, hot], state)
     assert "sat" in state.zone_parked_since
     cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is True
+    assert holding(cmd)
 
 
 def test_margin_bins_learn_hysteresis_map():
@@ -1263,10 +1294,10 @@ def test_fan_type_park_steps_down_within_coil_dry():
     if "sat" in state.zone_parked_since:
         assert depth is not None and depth < controller.PARK_MARGIN_K + 1e-9
         cmd = find_cmd(decision, "sat")
-        assert cmd is not None and cmd.park is True
+        assert holding(cmd)
     else:
         cmd = find_cmd(decision, "sat")
-        assert cmd is None or cmd.park is False
+        assert not holding(cmd)
 
 
 def test_residual_live_session_ignores_coil_dry():
@@ -1550,7 +1581,7 @@ def test_stale_positive_depth_on_hot_zone_chases():
     d = tick([zone], state, settings=settings)
     cmd = find_cmd(d, "z1")
     assert cmd is not None
-    assert cmd.park is False
+    assert not holding(cmd)
     assert cmd.head_depth_k is not None and cmd.head_depth_k < 0
     assert cmd.reason != "depth_hold"
     assert "z1" not in d.diag.get("parked", [])
@@ -1593,7 +1624,7 @@ def test_park_overcorrected_held_emits():
     assert "sat" in d.diag.get("park_overcorrected_held", [])
     cmd = find_cmd(d, "sat")
     assert cmd is not None
-    assert cmd.park is True
+    assert holding(cmd)
     # Adapt stepped +0.5 this tick (do not slam to DEPTH_MAX); emit that step.
     assert cmd.head_depth_k == 1.5
 

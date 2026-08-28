@@ -377,7 +377,10 @@ def test_plant_min_on_served_by_residual_park():
     state.plant_compress_since = NOW - 300.0
     decision = controller.tick(snap, state)
     assert not any(c.hvac_mode == MODE_OFF for c in decision.commands)
-    assert any(c.park for c in decision.commands) or "bed" in decision.state.zone_parked_since
+    assert (
+        any((c.head_depth_k or 0) > 0 for c in decision.commands)
+        or "bed" in decision.state.zone_parked_since
+    )
     # After plant min_on elapses, hard off is allowed.
     state = decision.state
     state.zone_last_cmd["bed"] = 0.0
@@ -647,9 +650,15 @@ def test_prefer_continuous_elects_anchor_and_parks():
     assert decision.state.anchor_zone == "east"
     assert decision.diag["want"]["east"] == "anchor"
     # Satisfied anchor must park (residual), not track a demand setpoint.
-    assert any(c.park for c in decision.commands) or "east" in decision.state.zone_parked_since
+    assert (
+        any((c.head_depth_k or 0) > 0 for c in decision.commands)
+        or "east" in decision.state.zone_parked_since
+    )
     assert not any(
-        c.zone_id == "east" and not c.park and c.hvac_mode == MODE_COOL for c in decision.commands
+        c.zone_id == "east"
+        and (c.head_depth_k is None or c.head_depth_k <= 0)
+        and c.hvac_mode == MODE_COOL
+        for c in decision.commands
     )
 
 
@@ -742,7 +751,7 @@ def test_pack_stay_parks_two_in_band_heads():
     state.zone_on["ok"] = True
     decision = controller.tick(snap, state)
     assert set(decision.diag.get("pack_stay", [])) == {"hot", "ok"}
-    parked = {c.zone_id for c in decision.commands if c.park} | set(
+    parked = {c.zone_id for c in decision.commands if (c.head_depth_k or 0) > 0} | set(
         decision.state.zone_parked_since
     )
     assert "hot" in parked and "ok" in parked
@@ -778,7 +787,7 @@ def test_prefer_continuous_keeps_pack_not_one_leftover():
     state.zone_on["east"] = True
     state.zone_on["west"] = True
     decision = controller.tick(snap, state)
-    parked = {c.zone_id for c in decision.commands if c.park} | set(
+    parked = {c.zone_id for c in decision.commands if (c.head_depth_k or 0) > 0} | set(
         decision.state.zone_parked_since
     )
     assert "east" in parked and "west" in parked
@@ -957,7 +966,7 @@ def test_helper_walks_into_shallow_park_not_covering_bin():
     cmd = {c.zone_id: c for c in decision.commands}["ok"]
     assert cmd.reason == "helper"
     assert cmd.head_depth_k == 0.0
-    assert cmd.park is False
+    assert cmd.head_depth_k is None or cmd.head_depth_k <= 0
     assert cmd.setpoint == 22.5  # hold at live 22.6, quantized
     ok_on = make_zone(
         "ok",
@@ -973,7 +982,7 @@ def test_helper_walks_into_shallow_park_not_covering_bin():
     decision = controller.tick(snap2, decision.state)
     cmd2 = {c.zone_id: c for c in decision.commands}["ok"]
     assert cmd2.head_depth_k == 0.5
-    assert cmd2.park is True
+    assert cmd2.head_depth_k is not None and cmd2.head_depth_k > 0
     assert cmd2.head_depth_k < 2.5
     assert cmd2.setpoint == 23.0  # 22.5 + 0.5
 

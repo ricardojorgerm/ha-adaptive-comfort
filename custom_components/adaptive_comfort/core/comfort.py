@@ -317,6 +317,14 @@ def _mode_trajectory(zone: ZoneSnapshot, horizon_h: int = MODE_HORIZON_H) -> tup
     return (zone.temp,) * horizon_h
 
 
+def _zone_positive_hold(state: ControllerState, zid: str) -> bool:
+    """True when this zone is in a frozen positive-depth (park) hold."""
+    if zid in state.zone_parked_since:
+        return True
+    depth = state.zone_head_depth_k.get(zid)
+    return depth is not None and float(depth) > 0.0
+
+
 def _skip_manufactured(
     zone: ZoneSnapshot,
     *,
@@ -326,16 +334,17 @@ def _skip_manufactured(
 ) -> bool:
     """True when this zone's excursion was made by our own plant, not weather.
 
-    Per-zone only: a cooling head, a still-parked session, or a room that
-    cooled within ``MANUFACTURED_SKIP_S``. House ``state.mode`` alone must
-    not blank every zone (that latched cool through a cold snap).
+    Per-zone only: a cooling head, a still-held positive depth (session or
+    leftover ``head_depth_k``), or a room that cooled within
+    ``MANUFACTURED_SKIP_S``. House ``state.mode`` alone must not blank every
+    zone (that latched cool through a cold snap).
     """
     if cold:
         if zone.head_mode == MODE_COOL:
             return True
         if state is None:
             return False
-        if zone.zone_id in state.zone_parked_since and state.mode == MODE_COOL:
+        if _zone_positive_hold(state, zone.zone_id) and state.mode == MODE_COOL:
             return True
         last = state.zone_last_cool.get(zone.zone_id, 0.0)
         return last > 0.0 and now_ts - last < MANUFACTURED_SKIP_S
@@ -343,7 +352,7 @@ def _skip_manufactured(
         return True
     if state is None:
         return False
-    return zone.zone_id in state.zone_parked_since and state.mode == MODE_HEAT
+    return _zone_positive_hold(state, zone.zone_id) and state.mode == MODE_HEAT
 
 
 def demand_integrals(

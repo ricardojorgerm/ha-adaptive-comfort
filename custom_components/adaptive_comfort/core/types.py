@@ -287,18 +287,10 @@ class Command:
     # cooling / (internal + track_delta) in heating, falling back to the
     # drift translation of `setpoint` if the internal reading is unusable.
     track_delta: float | None = None
-    # Park the head: command a setpoint just above its internal reading
-    # while keeping the compressor mode, to observe/exploit the device's
-    # own keep-temperature behavior instead of turning off.
-    park: bool = False
-    # Adaptive park depth: setpoint rides internal + margin (cool) or
-    # internal - margin (heat). Escalated by the controller while the room
-    # keeps moving in the conditioning direction despite being parked.
-    park_margin: float | None = None
     # Signed head depth (K): cool SP = internal + head_depth_k, heat
-    # SP = internal - head_depth_k. Negative = chase track; positive =
-    # hysteresis residual hold. When set, the runtime prefers this over
-    # separate track_delta / park_margin translation.
+    # SP = internal - head_depth_k. Negative = chase track; 0 = zero-hold;
+    # positive = frozen hysteresis residual hold. HA/COP still call that
+    # hold "park"; this command no longer carries a separate park flag.
     head_depth_k: float | None = None
 
 

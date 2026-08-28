@@ -791,15 +791,7 @@ def _command_with_depth(
     """Build a Command from signed head depth (cool: SP = internal + depth)."""
     d = float(depth_k)
     if d > 0.0:
-        return Command(
-            zid,
-            mode,
-            setpoint,
-            reason,
-            park=True,
-            park_margin=d,
-            head_depth_k=d,
-        )
+        return Command(zid, mode, setpoint, reason, head_depth_k=d)
     if d < 0.0:
         return Command(
             zid,
@@ -2351,9 +2343,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 else:
                     entry = _park_entry_margin(zone, state)
                 state.zone_park_preferred[zid] = preferred
+                _sync_depth_views(state, zid, entry, now)
                 state.zone_parked_since[zid] = now
-                state.zone_park_margin[zid] = entry
-                state.zone_head_depth_k[zid] = entry
                 if zone.temp is not None:
                     state.zone_park_ref[zid] = zone.temp
                 if probe_due and not plant_hold:
@@ -2390,9 +2381,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                         entry = _helper_walk_depth(state, zone, lo_p, hi_p, zone.head_mode, now)
                     else:
                         entry = _park_entry_margin(zone, state)
+                    _sync_depth_views(state, zid, entry, now)
                     state.zone_parked_since[zid] = now
-                    state.zone_park_margin[zid] = entry
-                    state.zone_head_depth_k[zid] = entry
                     if zone.temp is not None:
                         state.zone_park_ref[zid] = zone.temp
                     commands.append(_command_with_depth(zid, zone.head_mode, None, "park", entry))

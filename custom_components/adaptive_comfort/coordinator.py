@@ -179,8 +179,6 @@ def _head_state(hass: HomeAssistant, entity_id: str) -> str:
 
 def _command_is_positive_hold(command: Command) -> bool:
     """True when this command asks for a frozen positive-depth (park) hold."""
-    if command.park:
-        return True
     d = command.head_depth_k
     return d is not None and float(d) > 0.0
 
@@ -2243,16 +2241,6 @@ class AdaptiveComfortRuntime:
                             if command.hvac_mode == MODE_COOL
                             else float(internal) - depth
                         )
-                elif command.park and isinstance(internal, (int, float)):
-                    park_expressed = True
-                    margin = command.park_margin or controller.PARK_MARGIN_K
-                    raw = controller.hold_device_setpoint(
-                        float(internal),
-                        margin,
-                        command.hvac_mode,
-                        zone.last_hold_device_sp,
-                        zone.last_hold_depth_k,
-                    )
                 elif hold:
                     # Positive hold without a usable internal must not fall
                     # through to static drift (West re-anchor / wrong frame).
@@ -2284,9 +2272,6 @@ class AdaptiveComfortRuntime:
                 )
                 if command.head_depth_k is not None and float(command.head_depth_k) > 0.0:
                     zone.last_hold_depth_k = float(command.head_depth_k)
-                    zone.last_hold_device_sp = setpoint
-                elif command.park:
-                    zone.last_hold_depth_k = float(command.park_margin or controller.PARK_MARGIN_K)
                     zone.last_hold_device_sp = setpoint
                 if state.state != command.hvac_mode:
                     await self.hass.services.async_call(

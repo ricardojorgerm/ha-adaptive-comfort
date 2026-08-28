@@ -126,17 +126,6 @@ def test_execute_hold_without_internal_does_not_drift_fallback():
     assert "z" not in rt.controller_state.zone_parked_since
 
 
-def test_execute_legacy_park_without_internal_does_not_drift_fallback():
-    rt, zone = _runtime({HEAD: _climate(None)})
-    zone.drift[HEAD].offsets[STATE_COOLING] = -3.0
-    rt.controller_state.zone_parked_since["z"] = 1_000_000.0
-    rt.controller_state.zone_head_depth_k["z"] = 1.0
-    cmd = Command("z", MODE_COOL, 23.0, "park", park=True, park_margin=1.0)
-    asyncio.run(AdaptiveComfortRuntime._async_execute(rt, cmd))
-    assert _setpoints(rt) == []
-    assert "z" not in rt.controller_state.zone_parked_since
-
-
 def test_execute_hold_uses_sibling_with_internal():
     other = "climate.b"
     climates = {HEAD: _climate(None), other: _climate(20.0)}

@@ -95,3 +95,14 @@ def test_cop_by_depth_filters_mode_and_samples():
     assert cool == {-0.5: 2.0, -2.0: 3.5, 1.0: 1.8}
     heat = power.cop_by_depth(table, "heat", min_samples=20)
     assert heat == {-0.5: 4.0}
+
+
+def test_ha_park_tokens_unchanged():
+    """Recorder/schema: ENUM and unique_id suffixes keep the token park."""
+    from custom_components.adaptive_comfort.sensor import ZONE_SENSORS
+    from custom_components.adaptive_comfort.switch import HOUSE_SWITCHES
+
+    control = next(s for s in ZONE_SENSORS if s.key == "control_state")
+    assert "park" in (control.options or [])
+    assert any(s.key == "park_learning" for s in HOUSE_SWITCHES)
+    assert power.control_state_key(False, True) == "park"
