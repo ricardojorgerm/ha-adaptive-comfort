@@ -9,13 +9,31 @@ from __future__ import annotations
 
 import math
 
-from . import comfort, power
+from . import comfort, cop_timing, plant, power, regime
+from .cop_timing import (
+    _apply_cop_widen_bands,
+    _clear_cop_widen,
+    _outside_base_band_on_widen_side,
+    _update_cop_widen,
+)
 from .park import (
     CLASSIFY_MIN_SAMPLES,
     LOAD_COVER_FRACTION,
     MARGIN_SETTLE_ALPHA,
     pick_depth_k,
     usable_residual_bin,
+)
+from .plant import (
+    _plant_min_on_active,
+    _record_transition,
+    _transition_allowed,
+    _update_plant_compress,
+)
+from .regime import (
+    NIGHT_START_H,
+    _apply_regime_dwell,
+    _is_night,
+    _select_regime,
 )
 from .types import (
     MODE_AUTO,
@@ -38,12 +56,26 @@ from .types import (
     ZoneSnapshot,
 )
 
+# Re-export extracted names so tests keep importing via controller.
+COP_ADVANTAGE_ENTER = cop_timing.COP_ADVANTAGE_ENTER
+COP_ADVANTAGE_EXIT = cop_timing.COP_ADVANTAGE_EXIT
+COP_TIMING_LOOKAHEAD_H = cop_timing.COP_TIMING_LOOKAHEAD_H
+COP_WIDEN_MAX_K = cop_timing.COP_WIDEN_MAX_K
+DEFAULT_BAND_COP_COOL = cop_timing.DEFAULT_BAND_COP_COOL
+_arbitrage_ratios = cop_timing._arbitrage_ratios
+_band_cop = cop_timing._band_cop
+_forecast_cop_arbitrage = cop_timing._forecast_cop_arbitrage
+MAX_MODE_CHANGES_PER_H = plant.MAX_MODE_CHANGES_PER_H
+ZONE_CHATTER_S = plant.ZONE_CHATTER_S
+NIGHT_END_H = regime.NIGHT_END_H
+NIGHT_SKIP_CONT_K = regime.NIGHT_SKIP_CONT_K
+NIGHT_VENT_MARGIN_K = regime.NIGHT_VENT_MARGIN_K
+REGIME_CONT_LOAD_FRACTION = regime.REGIME_CONT_LOAD_FRACTION
+REGIME_DWELL_S = regime.REGIME_DWELL_S
+REGIME_FLOOR_PER_HEAD_THERMAL_W = regime.REGIME_FLOOR_PER_HEAD_THERMAL_W
+REGIME_VENT_MARGIN_K = regime.REGIME_VENT_MARGIN_K
+
 PREDICT_MARGIN_K = 0.1
-MAX_MODE_CHANGES_PER_H = 3
-# Per-zone anti-chatter dwell (s). Plant-level min_on_min is enforced against
-# the compressor run clock, not this — zones may leave demand into residual
-# park while the plant minimum is still running.
-ZONE_CHATTER_S = 180.0
 SHED_ACTION_SPACING_S = 30.0
 SHED_URGENT_SPACING_S = 3.0
 COMMAND_SPACING_S = 180.0
@@ -77,40 +109,11 @@ PARK_MARGIN_K = 1.0
 PARK_OVERCOOL_BUFFER_K = 0.4
 # A probe that never produced an observation should be cheap to retry.
 PARK_PROBE_RETRY_S = 1800.0
-# Regime policy thresholds. The compressor cannot run below its floor; the
-# only question is who duty-cycles it. When the aggregate standing load can
-# feed a meaningful fraction of the floor, continuous (park-held) operation
-# avoids controller-imposed off/restart losses; when outdoor air beats the
-# compressor, neither should run.
-REGIME_VENT_MARGIN_K = 1.0  # outdoor must be this far below the coolest target
-# Compressor thermal floor per open head (~295 W electric solo-park median x
-# park COP ~2.5-3 ≈ 800 W thermal across the open circuits; 265 x 3 ≈ 800).
-REGIME_FLOOR_PER_HEAD_THERMAL_W = 265.0
-REGIME_CONT_LOAD_FRACTION = 0.6  # → ~160 W standing load per head
-REGIME_DWELL_S = 900.0  # hysteresis on regime switching
-# Night outdoor gating (opt-in): widen ventilate and suppress continuous
-# park-holds overnight when outdoor air is near the coolest target.
-NIGHT_START_H = 22.0
-NIGHT_END_H = 8.0
-NIGHT_VENT_MARGIN_K = 0.0  # at night, outdoor at/below coolest target is enough
-NIGHT_SKIP_CONT_K = 2.0  # outdoor within this of coolest → prefer cycling over continuous
 # Pre-sleep window: bank a quiet-night zone to the conditioning hold edge
 # of the existing band (cool lo / heat hi), then night prefers other zones.
 QUIET_NIGHT_BANK_H = 2.0
-# COP-timed efficiency band (center fixed; half grows). Field cool priors
-# (Jul 29/30): mild ~2.4 / warm ~1.6 / hot ~1.1. Heat uses learned table only.
-COP_TIMING_LOOKAHEAD_H = 6
-COP_ADVANTAGE_ENTER = 1.3
-COP_ADVANTAGE_EXIT = 1.15
-COP_WIDEN_MAX_K = 0.7
 COP_ADVANCE_HORIZON_H = 4.0  # predictive entry may look this far when advancing
 COP_DEFER_HORIZON_H = 1.0  # defer: only near breaches fire predictively
-DEFAULT_BAND_COP_COOL = {"mild": 2.4, "warm": 1.6, "hot": 1.1}
-_BAND_RANK = {"mild": 0, "warm": 1, "hot": 2}
-
-
-def _is_night(local_hour: float) -> bool:
-    return local_hour >= NIGHT_START_H or local_hour < NIGHT_END_H
 
 
 def _is_quiet_night_bank_hour(local_hour: float) -> bool:
@@ -255,266 +258,6 @@ def _apply_quiet_night(
         if cover.zone_id not in taken and cover.zone_id not in quiet_ids:
             helpers.append(cover)
     return demand, helpers, deferred, cover_id
-
-
-def _band_cop(snap: HouseSnapshot, band: str, mode: str) -> float | None:
-    """Learned COP for ``band`` in ``mode``; cool priors only as cool fallback.
-
-    ``snap.cop_by_band`` is filtered to the mode at snapshot build (prior
-    tick's controller mode). Use it only when that tag matches ``mode`` —
-    otherwise a cool↔heat flip this tick would arbitrage on the wrong
-    season's table and skip cool priors because keys exist.
-    """
-    if snap.cop_by_band_mode == mode and band in snap.cop_by_band:
-        return snap.cop_by_band[band]
-    if mode == MODE_COOL:
-        return DEFAULT_BAND_COP_COOL.get(band)
-    return None
-
-
-def _arbitrage_ratios(
-    snap: HouseSnapshot, mode: str, centers: dict[str, float]
-) -> tuple[float, float]:
-    """Return (advance_ratio, defer_ratio) from band COP vs forecast.
-
-    Either ratio is 0.0 when that direction has no signal. Callers pick a
-    winner for enter, but hold/exit must read the *latched* direction's
-    ratio so a brief flip of which side wins cannot snap the band narrow.
-    """
-    if mode not in (MODE_HEAT, MODE_COOL) or not snap.forecast_hours:
-        return 0.0, 0.0
-    if snap.t_out is None or snap.t_out_synthetic:
-        return 0.0, 0.0
-    band_now = power.outdoor_band(snap.t_out)
-    if band_now is None:
-        return 0.0, 0.0
-    # Free outdoor air: banking via widen is moot for cool.
-    if mode == MODE_COOL and centers and snap.t_out <= min(centers.values()) - REGIME_VENT_MARGIN_K:
-        return 0.0, 0.0
-
-    worst = band_now
-    best = band_now
-    for t in snap.forecast_hours[:COP_TIMING_LOOKAHEAD_H]:
-        b = power.outdoor_band(t)
-        if b is None:
-            continue
-        if _BAND_RANK[b] > _BAND_RANK[worst]:
-            worst = b
-        if _BAND_RANK[b] < _BAND_RANK[best]:
-            best = b
-
-    cop_now = _band_cop(snap, band_now, mode)
-    if cop_now is None or cop_now <= 0:
-        return 0.0, 0.0
-
-    advance_ratio = 0.0
-    defer_ratio = 0.0
-    if mode == MODE_COOL:
-        # Hotter outdoor → worse cool COP → advance when worse ahead.
-        if worst != band_now:
-            cop_w = _band_cop(snap, worst, mode)
-            if cop_w is not None and cop_w > 0:
-                advance_ratio = cop_now / cop_w
-        # Milder outdoor ahead → defer (wait for better COP).
-        if best != band_now:
-            cop_b = _band_cop(snap, best, mode)
-            if cop_b is not None and cop_b > 0:
-                defer_ratio = cop_b / cop_now
-    else:
-        # Heat: colder outdoor → worse COP. `best` is coldest band in window.
-        if _BAND_RANK[best] < _BAND_RANK[band_now]:
-            cop_c = _band_cop(snap, best, mode)
-            if cop_c is not None and cop_c > 0:
-                advance_ratio = cop_now / cop_c
-        # Warmer outdoor ahead → better heat COP later → defer.
-        if _BAND_RANK[worst] > _BAND_RANK[band_now]:
-            cop_w = _band_cop(snap, worst, mode)
-            if cop_w is not None and cop_w > 0:
-                defer_ratio = cop_w / cop_now
-    return advance_ratio, defer_ratio
-
-
-def _forecast_cop_arbitrage(
-    snap: HouseSnapshot, mode: str, centers: dict[str, float]
-) -> tuple[str, float]:
-    """Return ('advance'|'defer'|'none', advantage_ratio) from band COP vs forecast.
-
-    advance: current outdoor band beats a worse band arriving within the
-    lookahead (cool when hot ahead; heat when colder ahead).
-    defer: a better band arrives within the lookahead.
-    """
-    advance_ratio, defer_ratio = _arbitrage_ratios(snap, mode, centers)
-    if advance_ratio >= defer_ratio and advance_ratio > 0:
-        return "advance", advance_ratio
-    if defer_ratio > 0:
-        return "defer", defer_ratio
-    return "none", 0.0
-
-
-def _outside_base_band_on_widen_side(
-    zones: list[ZoneSnapshot],
-    centers: dict[str, float],
-    snap: HouseSnapshot,
-    mode: str,
-    timing: str,
-) -> bool:
-    """True if any zone still sits outside the unwidened band on the widen side.
-
-    Cool advance banks below the tight lo; heat advance above the tight hi;
-    defer floats the far edge. Until every zone has crossed back inside that
-    base edge, withdrawing widen would reclassify the bank as the opposite
-    mode's demand (summer heat after a cool bank — the field failure).
-    """
-    if timing not in ("advance", "defer") or mode not in (MODE_HEAT, MODE_COOL):
-        return False
-    s = snap.settings
-    for zone in zones:
-        if zone.temp is None or zone.zone_id not in centers:
-            continue
-        lo, hi = comfort.zone_band(s, centers[zone.zone_id], zone.occupied, snap.house_occupied)
-        if mode == MODE_COOL and timing == "advance" and zone.temp < lo:
-            return True
-        if mode == MODE_HEAT and timing == "advance" and zone.temp > hi:
-            return True
-        if mode == MODE_COOL and timing == "defer" and zone.temp > hi:
-            return True
-        if mode == MODE_HEAT and timing == "defer" and zone.temp < lo:
-            return True
-    return False
-
-
-def _clear_cop_widen(state: ControllerState) -> None:
-    state.cop_widen_k = 0.0
-    state.cop_timing = "none"
-    state.cop_widen_mode = None
-
-
-def _update_cop_widen(
-    state: ControllerState,
-    snap: HouseSnapshot,
-    mode: str,
-    centers: dict[str, float],
-    zones: list[ZoneSnapshot],
-) -> tuple[float, str]:
-    """Hysteretic efficiency-band widen. Returns (widen_k, timing).
-
-    Enter when either direction clears ENTER. Hold while the *latched*
-    direction's own ratio stays ≥ EXIT — not whichever side wins this tick
-    — so a brief advance/defer flip cannot snap the half-band narrow.
-    Even after COP advantage falls below EXIT, keep the widen until every
-    zone has crossed back inside the unwidened band on the widen side.
-    """
-    if mode not in (MODE_HEAT, MODE_COOL):
-        _clear_cop_widen(state)
-        return 0.0, "none"
-
-    advance_ratio, defer_ratio = _arbitrage_ratios(snap, mode, centers)
-    # Prefer advance on a tie (same rule as _forecast_cop_arbitrage).
-    if advance_ratio >= defer_ratio and advance_ratio >= COP_ADVANTAGE_ENTER:
-        state.cop_timing = "advance"
-        state.cop_widen_k = COP_WIDEN_MAX_K
-        state.cop_widen_mode = mode
-    elif defer_ratio > advance_ratio and defer_ratio >= COP_ADVANTAGE_ENTER:
-        state.cop_timing = "defer"
-        state.cop_widen_k = COP_WIDEN_MAX_K
-        state.cop_widen_mode = mode
-    elif state.cop_widen_k > 0.0:
-        hold_mode = state.cop_widen_mode or mode
-        if state.cop_timing == "advance":
-            hold_ratio = advance_ratio
-        elif state.cop_timing == "defer":
-            hold_ratio = defer_ratio
-        else:
-            hold_ratio = 0.0
-        # Recompute ratios for the latched widen mode when it differs from
-        # the caller mode (recovery after a false opposite-mode flip).
-        if hold_mode != mode:
-            advance_ratio, defer_ratio = _arbitrage_ratios(snap, hold_mode, centers)
-            if state.cop_timing == "advance":
-                hold_ratio = advance_ratio
-            elif state.cop_timing == "defer":
-                hold_ratio = defer_ratio
-        if hold_ratio < COP_ADVANTAGE_EXIT:
-            if _outside_base_band_on_widen_side(zones, centers, snap, hold_mode, state.cop_timing):
-                # Recovery latch: keep efficiency band until temps re-enter.
-                state.cop_widen_mode = hold_mode
-            else:
-                _clear_cop_widen(state)
-    else:
-        _clear_cop_widen(state)
-    return state.cop_widen_k, state.cop_timing
-
-
-def _apply_cop_widen_bands(
-    zones: list[ZoneSnapshot],
-    bands: dict[str, tuple[float, float]],
-    centers: dict[str, float],
-    snap: HouseSnapshot,
-    preset: str,
-    mode: str,
-    widen_k: float,
-) -> None:
-    """Mutate ``bands`` with the efficiency half-band stretch for ``mode``."""
-    if widen_k <= 0.0 or mode not in (MODE_HEAT, MODE_COOL):
-        return
-    s = snap.settings
-    boost = preset == PRESET_BOOST
-    if boost and mode == MODE_COOL:
-        extra_lo, extra_hi = widen_k, 0.0
-    elif boost and mode == MODE_HEAT:
-        extra_lo, extra_hi = 0.0, widen_k
-    else:
-        extra_lo = extra_hi = widen_k
-    for zone in zones:
-        bands[zone.zone_id] = comfort.zone_band(
-            s,
-            centers[zone.zone_id],
-            zone.occupied,
-            snap.house_occupied,
-            extra_lo_k=extra_lo,
-            extra_hi_k=extra_hi,
-        )
-
-
-def _select_regime(snap: HouseSnapshot, mode: str, centers: dict[str, float]) -> str:
-    s = snap.settings
-    if not s.auto_regime or mode not in (MODE_COOL, MODE_HEAT):
-        return "cycling"
-    # Free cooling: outdoor beats the coolest zone target. Heat has no
-    # symmetric "ventilate" (opening windows when outdoor is warm is rare
-    # and already covered by the window-suggestion path).
-    # Do not enter ventilate on climatology-after-dropout (t_out_synthetic).
-    if mode == MODE_COOL and snap.t_out is not None and not snap.t_out_synthetic and centers:
-        coolest = min(centers.values())
-        vent_margin = REGIME_VENT_MARGIN_K
-        if s.night_ventilate and _is_night(snap.local_hour):
-            vent_margin = NIGHT_VENT_MARGIN_K
-        if snap.t_out <= coolest - vent_margin:
-            return "ventilate"
-        # Overnight with outdoor near-cool: don't keep continuous park-holds
-        # chewing the compressor floor when free cooling is almost as good.
-        if (
-            s.night_ventilate
-            and _is_night(snap.local_hour)
-            and snap.t_out <= coolest + NIGHT_SKIP_CONT_K
-        ):
-            return "cycling"
-    total_load = sum(z.standing_load_w or 0.0 for z in snap.zones if z.enabled)
-    total_heads = sum(z.n_rooms for z in snap.zones if z.enabled)
-    if total_heads > 0 and total_load >= (
-        REGIME_CONT_LOAD_FRACTION * REGIME_FLOOR_PER_HEAD_THERMAL_W * total_heads
-    ):
-        return "continuous"
-    return "cycling"
-
-
-def _apply_regime_dwell(state: ControllerState, proposed: str, now: float) -> str:
-    if state.regime_since == 0.0 or (
-        proposed != state.regime and now - state.regime_since >= REGIME_DWELL_S
-    ):
-        state.regime = proposed
-        state.regime_since = now
-    return state.regime
 
 
 PARK_MARGIN_MAX_K = 3.0
@@ -1019,61 +762,6 @@ def _park_ok_now(zone: ZoneSnapshot, lo: float, hi: float, pmode: str | None) ->
     if zone.temp is None or pmode not in (MODE_HEAT, MODE_COOL):
         return False
     return zone.temp <= hi if pmode == MODE_COOL else zone.temp >= lo
-
-
-def _update_plant_compress(state: ControllerState, snap: HouseSnapshot) -> None:
-    """Track plant compression from electrical p_ac with StartCounter-class debounce.
-
-    Brief sub-floor dips (inverter modulation, baseline noise) must not clear
-    the run clock — otherwise plant min_on never completes. Same 180 s floor
-    dwell as StartCounter before we treat compression as ended.
-    """
-    compressing = snap.p_ac is not None and snap.p_ac >= snap.compression_floor_w
-    if compressing:
-        if state.plant_compress_since <= 0.0:
-            state.plant_compress_since = snap.now_ts
-        state.plant_below_since = 0.0
-        return
-    if state.plant_compress_since <= 0.0:
-        state.plant_below_since = 0.0
-        return
-    if state.plant_below_since <= 0.0:
-        state.plant_below_since = snap.now_ts
-        return
-    if snap.now_ts - state.plant_below_since >= power.START_DEBOUNCE_S:
-        state.plant_compress_since = 0.0
-        state.plant_below_since = 0.0
-
-
-def _plant_min_on_active(state: ControllerState, snap: HouseSnapshot, s) -> bool:
-    """True while a live compression run has not yet reached min_on_min."""
-    if state.plant_compress_since <= 0.0:
-        return False
-    return snap.now_ts - state.plant_compress_since < s.min_on_min * 60.0
-
-
-def _transition_allowed(
-    state: ControllerState, zone_id: str, now: float, turning_on: bool, s
-) -> bool:
-    since = state.zone_since.get(zone_id, 0.0)
-    elapsed = now - since
-    if turning_on and elapsed < s.min_off_min * 60.0:
-        return False
-    # Zone off uses a short anti-chatter dwell; plant min_on is separate
-    # (residual park / handoff keep the compressor loaded).
-    if not turning_on and elapsed < ZONE_CHATTER_S:
-        return False
-    changes = state.zone_mode_changes.get(zone_id, [])
-    recent = [t for t in changes if now - t < 3600.0]
-    return len(recent) < MAX_MODE_CHANGES_PER_H
-
-
-def _record_transition(state: ControllerState, zone_id: str, now: float, on: bool) -> None:
-    state.zone_on[zone_id] = on
-    state.zone_since[zone_id] = now
-    changes = state.zone_mode_changes.setdefault(zone_id, [])
-    changes.append(now)
-    del changes[:-10]
 
 
 def _park_exploit_ok(zone: ZoneSnapshot, mode: str) -> bool:
