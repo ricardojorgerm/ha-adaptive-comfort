@@ -46,9 +46,13 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   (supply-air contamination). Translation between frames happens **only** in
   `coordinator.py` command execution — either dynamically (signed head depth:
   cool `internal + depth`, heat `internal − depth`; negative = chase track,
-  positive = hysteresis park) re-anchored every `COMMAND_SPACING_S` **or**
-  sooner when `|device_SP − ideal| ≥ HEAD_REANCHOR_EPS_K` after
-  `HEAD_REANCHOR_MIN_S` — or statically via `DriftEstimator.offset(state)` as
+  positive = hysteresis hold). **Positive depth is a frozen device SP**: do
+  not re-anchor `SP = internal + depth` against a falling supply-air reading
+  (West 22.9 → 21.0). Depth *value* may still step (`force` when it differs
+  from last commanded); for `d > 0` the emitted SP stays monotone on the
+  satisfied side of the last commanded SP. Negative depth re-anchors every
+  `COMMAND_SPACING_S` or sooner when `|device_SP − ideal| ≥ HEAD_REANCHOR_EPS_K`
+  after `HEAD_REANCHOR_MIN_S`. Static `DriftEstimator.offset(state)` is the
   fallback. Never translate anywhere else.
 - **`sensible_power_w` is signed**: negative while cooling. It is
   `c_eff · (dT/dt − free_float_rate)` — same rates `predict_free` integrates —
@@ -192,12 +196,17 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   so advance horizons cannot keep digging past the floor — that overshoot was
   what made a later heat flip look like the bug. Cool priors fill gaps; heat
   requires learned `cop_by_band`. Diag: `cop_band_widen_k`, `cop_timing`. Park
-  overcool uses the efficiency band. See plan `cop_timed_conditioning_8f3a1c2e`.
+  overcool uses the efficiency band. Present-OOB demand uses an inaction-vs-`min_on`
+  comfort-cost comparison; in-band still uses `_prediction_justifies_run` so COP
+  advance survives. Pack extras residual-hold together so N and Tevap stay high;
+  None-preset starts at the breach and modulates (reactive-edge hold, shallow
+  chase) — Eco/Away keep `energy_wait`. Quiet night vs pack: quiet wins on the
+  sleeper; Eco/Away skip quiet. Coil temps never enter `tick`; ledgers adjudicate.
 - **Zone COP counts latent.** `update_cop` heat flow is sensible + latent; sensible-only
   samples in humid rooms undercount delivered cooling by 30–50% and can fall below
   `COP_MIN`, producing absurd or silently-rejected readings.
 - **Control history is want vs action.** Zone `want` is controller desire
-  (`off`/`demand`/`helper`); `control_state` is action (`off`/`demand`/`helper`/`park`/
+  (`off`/`demand`/`helper`/`anchor`/`free_ride`); `control_state` is action (`off`/`demand`/`helper`/`park`/
   `runout`/`manual`/…). Action attributes carry `last_reason`, park margins/classification,
   and track depth. Also chart `zone_occupied`, house `effective_preset` / `house_occupied`,
   plus `head_internal_temp`, `head_depth_k`, `track_delta`, `park_margin`,
@@ -205,7 +214,9 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   `compressor_starts_per_hour`.
 - **Mode integrals include on zones.** `demand_integrals` uses no-AC free-float (including
   while conditioning — `predict_free` is the counterfactual) over `MODE_HORIZON_H` (~8 h),
-  with temp persistence when confidence is low (for mixed houses). A cooling head does
+  with temp persistence when confidence is low (for mixed houses). Manufactured-side skip
+  is **per-zone and nick-only** (`_skip_manufactured`: recent `zone_last_cool` / parked
+  hold + 1 h clock) — not a house-wide `state.mode` blank. A cooling head does
   not add cold (overshoot ≠ heat demand); a heating head does not add warm. Seasonal
   present-excess and emergency override skip the same manufactured side. Enter cool/heat
   above `MODE_DEADBAND_KH`; hold until below `MODE_EXIT_KH` — but seasonal demotion is not
