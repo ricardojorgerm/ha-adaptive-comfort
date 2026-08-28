@@ -1227,7 +1227,7 @@ def _mapped_without_residual(zone: ZoneSnapshot) -> bool:
     return has_samples
 
 
-def _hysteresis_ceiling_k(zone: ZoneSnapshot, state: ControllerState) -> float:
+def _hysteresis_ceiling_k(zone: ZoneSnapshot) -> float:
     """Over-conditioning extreme: deepest still COP/residual-useful depth.
 
     When the residual map has a proven max (or edge), that caps escalation —
@@ -1235,7 +1235,6 @@ def _hysteresis_ceiling_k(zone: ZoneSnapshot, state: ControllerState) -> float:
     allow full ``DEPTH_MAX_K`` so a session can still learn by probing up.
     Preferred is an *entry* hint, not this ceiling.
     """
-    _ = state  # reserved for future preferred-aware soft caps
     if zone.park_residual_max_margin_k is not None:
         return min(_quantize_depth(zone.park_residual_max_margin_k), DEPTH_MAX_K)
     if _mapped_without_residual(zone):
@@ -1277,7 +1276,8 @@ def _overshoot_ceiling_k(
     zone: ZoneSnapshot, state: ControllerState, depth_k: float, *, walk: bool
 ) -> float:
     """Lift the learned ceiling only while unintentional overshoot can still deepen."""
-    mapped = _hysteresis_ceiling_k(zone, state)
+    _ = state
+    mapped = _hysteresis_ceiling_k(zone)
     if not walk:
         return mapped
     # Live fan-type is the electrical stop. A mapped idle bin at this depth
@@ -2962,7 +2962,6 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                         n_rooms=zone.n_rooms,
                         park_residuals=zone.park_residuals,
                         margin_bins=zone.park_margin_bins,
-                        residual_edge_k=zone.park_residual_edge_k,
                         track_delta=delta,
                         park_learning=s.park_learning,
                     )

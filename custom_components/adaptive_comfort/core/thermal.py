@@ -289,11 +289,13 @@ class ThermalModel:
         indoor_fans_on: bool = False,
         outdoor_exhaust_on: bool = False,
         solar_scale: float = 1.0,
+        rain_sink_k_per_h: float = 0.0,
     ) -> float | None:
         """One free-response sample (heads fully off). Returns residual [K/h]."""
         if dt_h <= 0:
             return None
         y = (t_in_now - t_in_prev) / dt_h
+        y -= float(rain_sink_k_per_h)
         if abs(y) > 8.0:
             return None
         delta_out = t_out - t_in_now
@@ -503,7 +505,11 @@ class ThermalModel:
 
     @property
     def ua_w_per_k(self) -> float:
-        """Effective outdoor UA (W/K): C_eff · k_out, fit-consistent."""
+        """Closed-door outdoor UA (W/K): C_eff · k_out(False).
+
+        Diagnostics use ``ua_out_w_per_k(door_open)`` so the published number
+        matches the active regime (door-open is the no-sensor default).
+        """
         return self.c_eff_wh_per_k * self.k(False)
 
     @property
@@ -660,6 +666,7 @@ class ThermalModel:
         indoor_fans_on: bool = False,
         outdoor_exhaust_on: bool = False,
         solar_scale: float = 1.0,
+        rain_sink_k_per_h: float = 0.0,
     ) -> None:
         if p_ac_w < 50.0:
             return
@@ -677,6 +684,7 @@ class ThermalModel:
                 indoor_fans_on=indoor_fans_on,
                 outdoor_exhaust_on=outdoor_exhaust_on,
                 solar_scale=solar_scale,
+                rain_sink_k_per_h=rain_sink_k_per_h,
             )
         ) + max(0.0, latent_w)
         cop = q_hvac / p_ac_w
@@ -703,6 +711,7 @@ class ThermalModel:
         indoor_fans_on: bool = False,
         outdoor_exhaust_on: bool = False,
         solar_scale: float = 1.0,
+        rain_sink_k_per_h: float = 0.0,
     ) -> None:
         if p_ac_w < 50.0:
             return
@@ -718,6 +727,7 @@ class ThermalModel:
             indoor_fans_on=indoor_fans_on,
             outdoor_exhaust_on=outdoor_exhaust_on,
             solar_scale=solar_scale,
+            rain_sink_k_per_h=rain_sink_k_per_h,
         )
         if abs(excess) < 0.1:
             return
@@ -726,15 +736,6 @@ class ThermalModel:
         if not (FURNITURE_MIN <= factor <= FURNITURE_MAX):
             return
         self.furniture_factor += alpha * (factor - self.furniture_factor)
-
-    @staticmethod
-    def carnot_cop(t_in: float, t_out: float, cooling: bool) -> float | None:
-        dt = (t_out - t_in) if cooling else (t_in - t_out)
-        if dt <= 0.5:
-            return None
-        cold = min(t_in, t_out) + 273.15
-        hot = max(t_in, t_out) + 273.15
-        return cold / (hot - cold) if cooling else hot / (hot - cold)
 
     def predict_free(
         self,

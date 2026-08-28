@@ -1003,7 +1003,7 @@ def test_helper_walks_into_shallow_park_not_covering_bin():
 
 def test_idle_mapped_ceiling_is_park_margin_not_depth_max():
     zone = make_zone("ok", 22.6, park_margin_bins={"3.0": [0.0, 0.5, 20.0]})
-    assert controller._hysteresis_ceiling_k(zone, ControllerState()) == controller.PARK_MARGIN_K
+    assert controller._hysteresis_ceiling_k(zone) == controller.PARK_MARGIN_K
 
 
 def test_demand_cost_skips_dying_nick_when_action_overshoots():

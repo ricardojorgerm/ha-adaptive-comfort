@@ -331,8 +331,24 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         native_unit_of_measurement="W/K",
         state_class=SensorStateClass.MEASUREMENT,
         entity_category=EntityCategory.DIAGNOSTIC,
-        value_fn=lambda z, r: _round(z.model.ua_w_per_k, 1),
-        attr_fn=lambda z, r: {"ua_mix_w_per_k": round(z.model.ua_mix_w_per_k, 1)},
+        value_fn=lambda z, r: _round(
+            z.model.ua_out_w_per_k(
+                z.door_open,
+                indoor_fans_on=z.indoor_fans_on,
+                outdoor_exhaust_on=z.outdoor_exhaust_on,
+            ),
+            1,
+        ),
+        attr_fn=lambda z, r: {
+            "ua_mix_w_per_k": round(
+                z.model.ua_mix_scaled_w_per_k(
+                    z.door_open,
+                    indoor_fans_on=z.indoor_fans_on,
+                    outdoor_exhaust_on=z.outdoor_exhaust_on,
+                ),
+                1,
+            )
+        },
     ),
     ZoneSensorDescription(
         key="c_eff",

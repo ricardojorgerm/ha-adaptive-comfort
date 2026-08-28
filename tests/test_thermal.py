@@ -47,6 +47,7 @@ def test_anchoring_chain():
     assert abs(model.c_air_wh_per_k - 0.34 * 30.0) < 1e-9
     assert abs(model.ua_w_per_k - model.c_eff_wh_per_k * 0.5) < 1e-9
     assert abs(model.ua_w_per_k - 0.34 * 15.0 * model.furniture_factor) < 1e-9
+    assert abs(model.ua_out_w_per_k(False) - model.ua_w_per_k) < 1e-9
 
 
 def test_passive_cooling_from_house_mixing():
@@ -368,3 +369,14 @@ def test_sensible_and_transient_share_live_solar_scale():
     assert p_clear != p_cloud
     # q_mean (a0) is not multiplied by scale at predict time.
     assert model.q_eff(0.0, solar_scale=0.0) == model.q_mean()
+
+
+def test_sensible_and_cop_share_rain_sink():
+    model = _fitted_q_model()
+    dry = model.sensible_power_w(22.0, 20.0, 0.0, 0.0, rain_sink_k_per_h=0.0)
+    wet = model.sensible_power_w(22.0, 20.0, 0.0, 0.0, rain_sink_k_per_h=-0.4)
+    # Rain cools the envelope; holding temp needs less AC cooling (higher signed W).
+    assert wet > dry
+    r_dry = model.free_float_rate(22.0, 20.0, 0.0, rain_sink_k_per_h=0.0)
+    r_wet = model.free_float_rate(22.0, 20.0, 0.0, rain_sink_k_per_h=-0.4)
+    assert r_wet < r_dry

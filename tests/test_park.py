@@ -142,7 +142,6 @@ def test_pick_depth_pull_down_uses_chase():
         n_rooms=1,
         park_residuals=True,
         margin_bins=bins,
-        residual_edge_k=2.0,
         track_delta=0.7,
     )
     assert depth == -0.7 and tag == "depth_track"
@@ -159,7 +158,6 @@ def test_pick_depth_residual_when_bins_cover():
         n_rooms=1,
         park_residuals=True,
         margin_bins=bins,
-        residual_edge_k=3.0,
         track_delta=0.7,
     )
     # Shallowest covering bin — not residual_edge (soft-deprecate).
@@ -177,7 +175,6 @@ def test_pick_depth_shallowest_when_edge_does_not_cover():
         n_rooms=1,
         park_residuals=True,
         margin_bins=bins,
-        residual_edge_k=3.0,  # only 40 W — insufficient
         track_delta=1.0,
     )
     assert depth == 1.5 and tag == "depth_residual"
@@ -194,7 +191,6 @@ def test_pick_depth_heat_symmetry():
         n_rooms=1,
         park_residuals=True,
         margin_bins=bins,
-        residual_edge_k=2.0,
         track_delta=0.5,
     )
     assert depth == 2.0 and tag == "depth_residual"
@@ -208,7 +204,6 @@ def test_pick_depth_heat_symmetry():
         n_rooms=1,
         park_residuals=True,
         margin_bins=bins,
-        residual_edge_k=2.0,
         track_delta=0.5,
     )
     assert depth2 == -0.5 and tag2 == "depth_track"
@@ -1596,7 +1591,6 @@ def test_pick_depth_unknown_load_duty_only_chases():
         n_rooms=1,
         park_residuals=True,
         margin_bins=bins,
-        residual_edge_k=1.5,
         track_delta=0.5,
     )
     assert depth == -0.5 and tag == "depth_track"

@@ -801,7 +801,9 @@ class AdaptiveComfortRuntime:
                 aux.append((temp, room.volume_m3))
         return aux
 
-    def _standing_load_w(self, zone, solar_scale: float = 1.0) -> float | None:
+    def _standing_load_w(
+        self, zone, solar_scale: float = 1.0, rain_sink_k_per_h: float = 0.0
+    ) -> float | None:
         """Estimated heat inflow the zone must reject to hold temperature (W).
 
         The free-float side of sensible_power_w (dT/dt = 0, no AC term) at
@@ -824,6 +826,7 @@ class AdaptiveComfortRuntime:
             indoor_fans_on=zone.indoor_fans_on,
             outdoor_exhaust_on=zone.outdoor_exhaust_on,
             solar_scale=solar_scale,
+            rain_sink_k_per_h=rain_sink_k_per_h,
         )
         # Cooling must reject heat coming in; heating must replace heat
         # going out. Same free-float number, opposite sign of interest.
@@ -1402,10 +1405,13 @@ class AdaptiveComfortRuntime:
         self._conditioning_fit_refreshed = False
         total_sensible = 0.0
         total_latent = 0.0
-        scales, _sinks = self._forecast_q_hours(now_ts)
+        scales, sinks = self._forecast_q_hours(now_ts)
         solar_scale = scales[0] if scales else 1.0
+        rain_sink = sinks[0] if sinks else 0.0
         for zone in self.zones.values():
-            self._update_zone_estimators(zone, now_ts, local_hour, solar_scale=solar_scale)
+            self._update_zone_estimators(
+                zone, now_ts, local_hour, solar_scale=solar_scale, rain_sink_k_per_h=rain_sink
+            )
             if zone.is_on:
                 total_sensible += abs(zone.sensible_w) * zone.config.n_rooms
                 total_latent += zone.latent_w * zone.config.n_rooms
@@ -1490,6 +1496,7 @@ class AdaptiveComfortRuntime:
         local_hour: float,
         *,
         solar_scale: float = 1.0,
+        rain_sink_k_per_h: float = 0.0,
     ) -> None:
         if zone.temp is None:
             return
@@ -1529,6 +1536,7 @@ class AdaptiveComfortRuntime:
                 outdoor_exhaust_on=zone.outdoor_exhaust_on,
                 include_transient=False,
                 solar_scale=solar_scale,
+                rain_sink_k_per_h=rain_sink_k_per_h,
             )
             zone.model.update_q_transient(dtdt - expected)
         else:
@@ -1549,6 +1557,7 @@ class AdaptiveComfortRuntime:
                     indoor_fans_on=zone.indoor_fans_on,
                     outdoor_exhaust_on=zone.outdoor_exhaust_on,
                     solar_scale=solar_scale,
+                    rain_sink_k_per_h=rain_sink_k_per_h,
                 )
             zone.sensible_w = 0.0
             zone.sensible_ts = now_ts
@@ -1577,6 +1586,7 @@ class AdaptiveComfortRuntime:
                     indoor_fans_on=zone.indoor_fans_on,
                     outdoor_exhaust_on=zone.outdoor_exhaust_on,
                     solar_scale=solar_scale,
+                    rain_sink_k_per_h=rain_sink_k_per_h,
                 )
             elif abs(dtdt) <= TRANSIENT_K_H:
                 # Moderate transient: small rooms on short cycles are never
@@ -1596,6 +1606,7 @@ class AdaptiveComfortRuntime:
                     indoor_fans_on=zone.indoor_fans_on,
                     outdoor_exhaust_on=zone.outdoor_exhaust_on,
                     solar_scale=solar_scale,
+                    rain_sink_k_per_h=rain_sink_k_per_h,
                 )
             else:
                 zone.model.update_c_eff(
@@ -1610,6 +1621,7 @@ class AdaptiveComfortRuntime:
                     indoor_fans_on=zone.indoor_fans_on,
                     outdoor_exhaust_on=zone.outdoor_exhaust_on,
                     solar_scale=solar_scale,
+                    rain_sink_k_per_h=rain_sink_k_per_h,
                 )
         zone.sensible_w = zone.model.sensible_power_w(
             smoothed,
@@ -1621,6 +1633,7 @@ class AdaptiveComfortRuntime:
             indoor_fans_on=zone.indoor_fans_on,
             outdoor_exhaust_on=zone.outdoor_exhaust_on,
             solar_scale=solar_scale,
+            rain_sink_k_per_h=rain_sink_k_per_h,
         )
         zone.sensible_ts = now_ts
         if zone.config.zone_id not in self.controller_state.zone_parked_since:
@@ -1800,7 +1813,9 @@ class AdaptiveComfortRuntime:
             zone.free_float = free_float
             zone.pred_60m = pred_60m
             zone.standing_load_w = self._standing_load_w(
-                zone, solar_scale=solar_scale[0] if solar_scale else 1.0
+                zone,
+                solar_scale=solar_scale[0] if solar_scale else 1.0,
+                rain_sink_k_per_h=rain_sink[0] if rain_sink else 0.0,
             )
             mixing_gain_w = None
             mixing_coupling = None
@@ -2251,16 +2266,11 @@ class AdaptiveComfortRuntime:
                 setpoint = controller.quantize_setpoint(
                     raw, float(minimum), float(maximum), step=step_f
                 )
-                if (
-                    command.head_depth_k is not None
-                    and float(command.head_depth_k) > 0.0
-                ):
+                if command.head_depth_k is not None and float(command.head_depth_k) > 0.0:
                     zone.last_hold_depth_k = float(command.head_depth_k)
                     zone.last_hold_device_sp = setpoint
                 elif command.park:
-                    zone.last_hold_depth_k = float(
-                        command.park_margin or controller.PARK_MARGIN_K
-                    )
+                    zone.last_hold_depth_k = float(command.park_margin or controller.PARK_MARGIN_K)
                     zone.last_hold_device_sp = setpoint
                 if state.state != command.hvac_mode:
                     await self.hass.services.async_call(
@@ -2393,12 +2403,26 @@ class AdaptiveComfortRuntime:
         return {
             "outdoor": {
                 "k_out_h": round(model.k(active), 4),
-                "ua_w_per_k": round(model.ua_w_per_k, 2),
+                "ua_w_per_k": round(
+                    model.ua_out_w_per_k(
+                        active,
+                        indoor_fans_on=zone.indoor_fans_on,
+                        outdoor_exhaust_on=zone.outdoor_exhaust_on,
+                    ),
+                    2,
+                ),
                 "description": "envelope exchange with outside air",
             },
             "house_mixing": {
                 "k_mix_h": round(model.k_mix(active), 4),
-                "ua_mix_w_per_k": round(model.ua_mix_w_per_k, 2),
+                "ua_mix_w_per_k": round(
+                    model.ua_mix_scaled_w_per_k(
+                        active,
+                        indoor_fans_on=zone.indoor_fans_on,
+                        outdoor_exhaust_on=zone.outdoor_exhaust_on,
+                    ),
+                    2,
+                ),
                 "t_house_other": self._house_other_temp(zone.config.zone_id),
                 "description": "air mixing with other zones and unconditioned rooms",
             },

@@ -60,7 +60,6 @@ from .types import MODE_COOL, MODE_HEAT
 # Fan electronics alone are typically 60-130 W electric and must not be
 # read as these numbers.
 RESIDUAL_MIN_W = 60.0
-TRICKLE_MIN_W = RESIDUAL_MIN_W  # deprecated alias; remove next release
 IDLE_MAX_W = 25.0
 CLASSIFY_MIN_SAMPLES = 6
 # Electrical truth: below this AC draw there is no compression - just fans
@@ -147,7 +146,6 @@ def pick_depth_k(
     n_rooms: int,
     park_residuals: bool | None,
     margin_bins: dict[str, list[float]] | None,
-    residual_edge_k: float | None,
     track_delta: float,
     park_learning: bool = True,
 ) -> tuple[float, str]:
@@ -177,10 +175,6 @@ def pick_depth_k(
     covering = shallowest_covering_margin_k(bins, required)
     if covering is None:
         return chase, "depth_track"
-    # Shallowest covering bin (COP-friendly). residual_edge remains an entry
-    # hint for want-off probes / preferred learning, not a demand re-pick
-    # floor — forcing the edge blocked stepping down into chase.
-    _ = residual_edge_k
     covering = min(max(covering, MARGIN_MIN_K), MARGIN_MAX_K)
     return covering, "depth_residual"
 
@@ -356,18 +350,6 @@ class ParkEstimator:
                     best = m
         return best
 
-    def fan_park_margin_k(self) -> float | None:
-        """Deprecated alias for fan_type_min_margin_k()."""
-        return self.fan_type_min_margin_k()
-
-    def coast_margin_k(self) -> float | None:
-        """Deprecated alias for fan_type_min_margin_k()."""
-        return self.fan_type_min_margin_k()
-
-    def fan_type_margin_k(self) -> float | None:
-        """Deprecated alias for fan_type_min_margin_k()."""
-        return self.fan_type_min_margin_k()
-
     def residual_max_margin_k(self) -> float | None:
         """Deepest margin (K) that is still residual: compressing and moving heat.
 
@@ -382,10 +364,6 @@ class ParkEstimator:
                 if best is None or m > best:
                     best = m
         return best
-
-    def residual_hold_margin_k(self) -> float | None:
-        """Deprecated alias for residual_max_margin_k()."""
-        return self.residual_max_margin_k()
 
     def residual_edge_k(self) -> float | None:
         """Residual↔fan-type edge (K), finer than the 0.5 K bin grid.
@@ -416,21 +394,12 @@ class ParkEstimator:
             return None
         return entry[1] < RESIDUAL_HOLD_DUTY_MIN
 
-    def is_fan_type_at(self, margin_k: float | None) -> bool | None:
-        """Deprecated alias for current_is_fan_type()."""
-        return self.current_is_fan_type(margin_k)
-
     @property
     def residuals(self) -> bool | None:
         cls = self.classification
         if cls == "unknown":
             return None
         return cls == "residual"
-
-    @property
-    def trickles(self) -> bool | None:
-        """Deprecated alias for residuals."""
-        return self.residuals
 
     def to_dict(self) -> dict:
         return {
