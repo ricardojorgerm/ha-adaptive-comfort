@@ -17,6 +17,7 @@ from custom_components.adaptive_comfort.core.thermal import ThermalModel
 from custom_components.adaptive_comfort.core.types import (
     MODE_AUTO,
     MODE_COOL,
+    MODE_HEAT,
     ControllerState,
     Settings,
 )
@@ -152,6 +153,8 @@ def test_controller_state_persists_restart_fields():
     st.zone_fan["a"] = True
     st.window_suggest_since["a"] = 50.0
     st.window_suggest_out_since["a"] = 60.0
+    st.override_mode = MODE_HEAT
+    st.override_since = 999.0
     restored = ControllerState.from_dict(st.to_dict())
     assert restored.zone_last_cool["a"] == 123.0
     assert restored.zone_mode_changes["a"] == [1.0, 2.0]
@@ -159,6 +162,8 @@ def test_controller_state_persists_restart_fields():
     assert restored.zone_fan["a"] is True
     assert restored.window_suggest_since["a"] == 50.0
     assert restored.window_suggest_out_since["a"] == 60.0
+    assert restored.override_mode == MODE_HEAT
+    assert restored.override_since == 999.0
 
 
 def test_process_power_events_drops_concurrent_same_ts():
@@ -295,9 +300,8 @@ def test_park_learners_solo_stale_sensible_still_duty_samples():
 def test_park_learners_solo_stale_above_floor_does_not_write_fake_active():
     """Electrically compressing + stale sensible must not record ext=0/active.
 
-    Duty still samples (bin n/duty move) without touching extraction EWMA.
-    That (0 W, duty high, samples++) signature is how West's +3 K idle bin
-    became residual_max when residual_max keyed off duty alone.
+    Duty-only samples must not create a virgin bin (that (0 W, duty high,
+    samples++) signature is how West's +3 K idle bin became residual_max).
     """
     from custom_components.adaptive_comfort.coordinator import (
         FIT_STEP_S,
@@ -341,10 +345,8 @@ def test_park_learners_solo_stale_above_floor_does_not_write_fake_active():
     samples_before = zone.park.samples
     AdaptiveComfortRuntime._update_park_learners(rt, NOW, 12.0)
     assert zone.park.samples == samples_before
-    bin3 = zone.park.margin_bins.get("3.0")
-    assert bin3 is not None
-    assert bin3[0] == 0.0
-    assert bin3[1] > 0.0
+    assert "3.0" not in zone.park.margin_bins
+    assert zone.park.extraction_w is None
 
 
 def test_park_learners_nonsolo_skips_stale_sensible():

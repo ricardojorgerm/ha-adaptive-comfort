@@ -445,7 +445,7 @@ ZONE_SENSORS: tuple[ZoneSensorDescription, ...] = (
         key="want",
         translation_key="zone_want",
         device_class=SensorDeviceClass.ENUM,
-        options=["off", "demand", "helper"],
+        options=["off", "demand", "helper", "anchor", "free_ride"],
         entity_category=EntityCategory.DIAGNOSTIC,
         value_fn=lambda z, r: r.zone_want(z),
     ),

@@ -337,7 +337,9 @@
         "state": {
           "off": "Off",
           "demand": "Demand",
-          "helper": "Helper"
+          "helper": "Helper",
+          "anchor": "Anchor",
+          "free_ride": "Free ride"
         }
       }
     },

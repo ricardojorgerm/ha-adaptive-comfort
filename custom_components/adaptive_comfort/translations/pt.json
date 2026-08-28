@@ -248,7 +248,13 @@
       "head_internal_temp": { "name": "Temperatura interna da cabeça" },
       "zone_want": {
         "name": "Desejo",
-        "state": { "off": "Desligado", "demand": "Procura", "helper": "Auxiliar" }
+        "state": {
+          "off": "Desligado",
+          "demand": "Procura",
+          "helper": "Auxiliar",
+          "anchor": "Âncora",
+          "free_ride": "Boleia"
+        }
       },
       "control_state": {
         "name": "Ação",

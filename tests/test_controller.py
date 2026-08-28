@@ -1055,3 +1055,63 @@ def test_present_oob_wrong_sign_q_hvac_still_starts():
         q_hvac_k_per_h=2.0,
     )
     assert controller._wants_conditioning(zone, 21.8, 23.2, MODE_COOL, 20.0)
+
+
+def test_eco_quiet_night_does_not_condition_hold():
+    """Eco/Away/Boost skip quiet-night; Eco must not bank the cold edge."""
+    from custom_components.adaptive_comfort.core.types import PRESET_ECO, PRESET_NONE
+
+    eco = Settings(
+        hvac_mode=MODE_COOL,
+        preset=PRESET_ECO,
+        zone_quiet_night={"bed": True},
+        adaptive_blend=0.0,
+    )
+    none = Settings(
+        hvac_mode=MODE_COOL,
+        preset=PRESET_NONE,
+        zone_quiet_night={"bed": True},
+        adaptive_blend=0.0,
+    )
+    bed = make_zone("bed", 22.8, occupied=True)
+    east = make_zone("east", 22.6, occupied=False)
+    eco_d = controller.tick(
+        make_snapshot([bed, east], eco, local_hour=20.5), warmed_state([bed, east])
+    )
+    none_d = controller.tick(
+        make_snapshot([bed, east], none, local_hour=20.5), warmed_state([bed, east])
+    )
+    assert "bed" in none_d.diag.get("quiet_night_bank", [])
+    assert not eco_d.diag.get("quiet_night_bank")
+    assert not eco_d.diag.get("quiet_night_deferred")
+    eco_cmd = next((c for c in eco_d.commands if c.zone_id == "bed"), None)
+    none_cmd = next((c for c in none_d.commands if c.zone_id == "bed"), None)
+    assert none_cmd is not None and none_cmd.setpoint is not None
+    if eco_cmd is not None and eco_cmd.setpoint is not None:
+        assert eco_cmd.setpoint > none_cmd.setpoint
+
+
+def test_shed_sole_demand_does_not_recruit_helpers():
+    """A latched-shed demand zone must not keep recruiting in-band helpers."""
+    hot = make_zone("hot", 25.0, occupied=True, draw_w=700.0)
+    ok = make_zone("ok", 22.6, occupied=True)
+    settings = Settings(hvac_mode=MODE_COOL, coordination=True)
+    snap = make_snapshot([hot, ok], settings, p_demand=3000.0, p_grid=3000.0)
+    state = warmed_state([hot, ok])
+    state.shed["hot"] = NOW - 600.0
+    decision = controller.tick(snap, state)
+    assert "hot" in state.shed
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert "ok" not in by_zone or by_zone["ok"].hvac_mode == MODE_OFF
+    assert "ok" not in decision.diag.get("helpers", [])
+    assert not any(c.reason == "helper" for c in decision.commands)
+
+
+def test_want_tokens_match_sensor_enum():
+    allowed = {"off", "demand", "helper", "anchor", "free_ride"}
+    hot = make_zone("hot", 25.0)
+    ok = make_zone("ok", 22.6)
+    snap = make_snapshot([hot, ok])
+    state = warmed_state([hot, ok])
+    decision = controller.tick(snap, state)
+    assert set(decision.diag["want"].values()) <= allowed

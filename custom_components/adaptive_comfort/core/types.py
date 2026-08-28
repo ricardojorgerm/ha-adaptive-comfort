@@ -403,6 +403,8 @@ class ControllerState:
             "cop_widen_k": self.cop_widen_k,
             "cop_timing": self.cop_timing,
             "cop_widen_mode": self.cop_widen_mode,
+            "override_mode": self.override_mode,
+            "override_since": self.override_since,
             "sibling_sustain": {
                 rider: {sib: [ratio, samples] for sib, (ratio, samples) in subs.items()}
                 for rider, subs in self.sibling_sustain.items()
@@ -468,6 +470,14 @@ class ControllerState:
         st.cop_widen_mode = str(wmode) if wmode in (MODE_HEAT, MODE_COOL) else None
         if st.cop_widen_k <= 0.0 or st.cop_timing == "none":
             st.cop_widen_mode = None
+        omode = data.get("override_mode")
+        st.override_mode = str(omode) if omode in (MODE_HEAT, MODE_COOL) else None
+        try:
+            st.override_since = float(data.get("override_since", 0.0))
+        except (TypeError, ValueError):
+            st.override_since = 0.0
+        if st.override_mode is None:
+            st.override_since = 0.0
         for rider, subs in data.get("sibling_sustain", {}).items():
             entry: dict[str, tuple[float, int]] = {}
             for sib, value in subs.items():

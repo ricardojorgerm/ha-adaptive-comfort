@@ -248,7 +248,13 @@
       "head_internal_temp": { "name": "Head internal temperature" },
       "zone_want": {
         "name": "Want",
-        "state": { "off": "Off", "demand": "Demand", "helper": "Helper" }
+        "state": {
+          "off": "Off",
+          "demand": "Demand",
+          "helper": "Helper",
+          "anchor": "Anchor",
+          "free_ride": "Free ride"
+        }
       },
       "control_state": {
         "name": "Action",

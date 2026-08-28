@@ -1494,3 +1494,124 @@ def test_adapt_walk_lifts_ceiling_without_walk_stays_mapped():
     )
     assert held == 0.5
     assert not changed
+
+
+# --- B1-B5: leftover depth, frozen hold emit, duty-only bins -------------------
+
+
+def test_clear_park_session_pops_head_depth():
+    state = ControllerState()
+    state.zone_parked_since["z1"] = NOW
+    state.zone_park_margin["z1"] = 1.5
+    state.zone_park_ref["z1"] = 23.0
+    state.zone_head_depth_k["z1"] = 1.5
+    controller._clear_park_session(state, "z1")
+    assert "z1" not in state.zone_head_depth_k
+    assert "z1" not in state.zone_parked_since
+    assert "z1" not in state.zone_park_margin
+
+
+def test_stale_positive_depth_on_hot_zone_chases():
+    """Leftover +depth without a park session must not hold a hot room."""
+    bins = _residual_bins(**{"2.0": 200.0})
+    zone = make_zone(
+        "z1",
+        26.0,
+        is_on=True,
+        park_residuals=True,
+        park_extraction_w=200.0,
+        park_margin_bins=bins,
+        standing_load_w=100.0,
+    )
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        target=23.0,
+        adaptive_blend=0.0,
+        band_k=1.0,
+        tracking=True,
+        park_learning=True,
+    )
+    state = warmed_state([zone])
+    state.zone_on["z1"] = True
+    state.zone_head_depth_k["z1"] = 1.5
+    d = tick([zone], state, settings=settings)
+    cmd = find_cmd(d, "z1")
+    assert cmd is not None
+    assert cmd.park is False
+    assert cmd.head_depth_k is not None and cmd.head_depth_k < 0
+    assert cmd.reason != "depth_hold"
+    assert "z1" not in d.diag.get("parked", [])
+
+
+def test_hold_device_setpoint_monotone_on_falling_internal():
+    first = controller.hold_device_setpoint(22.9, 1.5, MODE_COOL, None, None)
+    assert first == 24.4
+    # Supply-air falls; depth unchanged → frozen last SP (not 21.0+1.5).
+    held = controller.hold_device_setpoint(21.0, 1.5, MODE_COOL, first, 1.5)
+    assert held == first
+    stepped = controller.hold_device_setpoint(21.0, 2.0, MODE_COOL, first, 1.5)
+    assert stepped == first + 0.5
+    heat = controller.hold_device_setpoint(20.0, 2.0, MODE_HEAT, 18.0, 1.5)
+    assert heat == 17.5
+
+
+def test_park_overcorrected_held_emits():
+    """min-on forbids off: rewrite to hold_ceiling must emit (force on rewrite)."""
+    satisfied, hot, state = _two_zone_setup(
+        park_residuals=True, park_extraction_w=200.0, standing_load_w=100.0
+    )
+    tick([satisfied, hot], state)
+    assert "sat" in state.zone_parked_since
+    state.zone_since["sat"] = NOW
+    state.zone_head_depth_k["sat"] = 1.0
+    state.zone_park_margin["sat"] = 1.0
+    cooler = make_zone(
+        "sat",
+        21.0,
+        is_on=True,
+        park_residuals=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+        park_residual_max_margin_k=2.0,
+        park_margin_bins=_residual_bins(**{"1.0": 80.0, "2.0": 200.0}),
+    )
+    later = NOW + 60.0
+    d = tick([cooler, hot], state, now=later)
+    assert "sat" in d.diag.get("park_overcorrected_held", [])
+    cmd = find_cmd(d, "sat")
+    assert cmd is not None
+    assert cmd.park is True
+    # Adapt stepped +0.5 this tick (do not slam to DEPTH_MAX); emit that step.
+    assert cmd.head_depth_k == 1.5
+
+
+def test_pick_depth_unknown_load_duty_only_chases():
+    bins = {"1.5": [0.0, 1.0, CLASSIFY_MIN_SAMPLES]}
+    depth, tag = pick_depth_k(
+        mode=MODE_COOL,
+        temp=23.2,
+        lo=22.5,
+        hi=23.9,
+        standing_load_w=None,
+        n_rooms=1,
+        park_residuals=True,
+        margin_bins=bins,
+        residual_edge_k=1.5,
+        track_delta=0.5,
+    )
+    assert depth == -0.5 and tag == "depth_track"
+
+
+def test_update_duty_skips_virgin_bin_and_keeps_thermal_n():
+    est = ParkEstimator()
+    est.update_duty(True, margin_k=3.0)
+    assert "3.0" not in est.margin_bins
+    assert est.samples == 0
+    for _ in range(CLASSIFY_MIN_SAMPLES):
+        est.update(100.0, True, margin_k=1.5)
+    n_before = est.margin_bins["1.5"][2]
+    ext_before = est.margin_bins["1.5"][0]
+    est.update_duty(False, margin_k=1.5)
+    assert est.margin_bins["1.5"][2] == n_before
+    assert est.margin_bins["1.5"][0] == ext_before
+    assert est.samples == CLASSIFY_MIN_SAMPLES

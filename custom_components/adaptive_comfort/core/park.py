@@ -170,7 +170,8 @@ def pick_depth_k(
         return chase, "depth_track"
     bins = margin_bins or {}
     if standing_load_w is None:
-        required = 0.0
+        # Unknown load: only a proven residual bin may hold (not duty-only).
+        required = RESIDUAL_MIN_W
     else:
         required = LOAD_COVER_FRACTION * standing_load_w / max(1, int(n_rooms))
     covering = shallowest_covering_margin_k(bins, required)
@@ -292,14 +293,15 @@ class ParkEstimator:
         """Electrical sample when thermal extraction is unknown (stale sensible).
 
         Does not touch extraction EWMA / classification — a compressing tick
-        with no room-rate must not write ext=0 / active=True.
+        with no room-rate must not write ext=0 / active=True. Duty-only
+        samples must not create a virgin bin or increment thermal ``n``.
         """
         b = margin_bin(margin_k)
-        if b is None:
+        if b is None or b not in self.margin_bins:
             return
-        ext, duty, n = self.margin_bins.get(b, [0.0, 1.0 if action_active else 0.0, 0])
+        ext, duty, n = self.margin_bins[b]
         duty += self.alpha * ((1.0 if action_active else 0.0) - duty)
-        self.margin_bins[b] = [ext, duty, n + 1]
+        self.margin_bins[b] = [ext, duty, n]
 
     def raise_preferred(self, margin_k: float) -> None:
         """High-water mark: session needed at least this depth to hold."""

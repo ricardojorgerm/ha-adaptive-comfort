@@ -213,6 +213,9 @@ class ZoneRuntime:
         # Live head-frame readings (for tracking/park diagnostics).
         self.head_internal_temp: float | None = None
         self.device_setpoint: float | None = None
+        # Frozen hold: last executed positive-depth device SP (not live internal).
+        self.last_hold_depth_k: float | None = None
+        self.last_hold_device_sp: float | None = None
         # Last controller command reason for this zone (demand/helper/park/…).
         self.last_control_reason: str | None = None
 
@@ -1636,6 +1639,8 @@ class AdaptiveComfortRuntime:
         """
         if self.manual_control:
             # Not commanding: never attribute user/remote setpoints to park learning.
+            for zone in self.zones.values():
+                zone.park_power.reset()
             return
         parked_ids = set(self.controller_state.zone_parked_since)
         park_pac = self._park_p_ac(local_hour)
@@ -1977,6 +1982,9 @@ class AdaptiveComfortRuntime:
         for zid in list(self.controller_state.zone_parked_since):
             # zone=None: drop session without charging probe spacing.
             _clear_park_session(self.controller_state, zid, None, now)
+            zone = self.zones.get(zid)
+            if zone is not None:
+                zone.park_power.reset()
 
     def set_preset(self, preset: str) -> None:
         """Apply a climate preset; Manual clears track/park and remembers prior preset."""
@@ -2097,14 +2105,8 @@ class AdaptiveComfortRuntime:
         zid = zone.config.zone_id
         st = self.controller_state
         parked = zid in st.zone_parked_since
-        depth = st.zone_park_margin.get(zid)
+        head_depth = self._zone_head_depth_k(zid)
         track = st.zone_track_delta.get(zid)
-        if parked and depth is not None:
-            head_depth = float(depth)
-        elif track is not None:
-            head_depth = -float(track)
-        else:
-            head_depth = None
         attrs: dict = {
             "last_reason": zone.last_control_reason or "none",
             "parked": parked,
@@ -2155,6 +2157,10 @@ class AdaptiveComfortRuntime:
         if zone is None:
             return
         park_expressed = False
+        if command.hvac_mode == MODE_OFF:
+            zone.last_hold_depth_k = None
+            zone.last_hold_device_sp = None
+            zone.last_on_sensible_w = None
         for head in zone.config.heads:
             state = self.hass.states.get(head)
             if state is None:
@@ -2191,22 +2197,31 @@ class AdaptiveComfortRuntime:
                     if command.park or command.head_depth_k > 0.0:
                         park_expressed = True
                     depth = float(command.head_depth_k)
-                    raw = (
-                        float(internal) + depth
-                        if command.hvac_mode == MODE_COOL
-                        else float(internal) - depth
-                    )
+                    if depth > 0.0:
+                        raw = controller.hold_device_setpoint(
+                            float(internal),
+                            depth,
+                            command.hvac_mode,
+                            zone.last_hold_device_sp,
+                            zone.last_hold_depth_k,
+                        )
+                    else:
+                        zone.last_hold_depth_k = None
+                        zone.last_hold_device_sp = None
+                        raw = (
+                            float(internal) + depth
+                            if command.hvac_mode == MODE_COOL
+                            else float(internal) - depth
+                        )
                 elif command.park and isinstance(internal, (int, float)):
                     park_expressed = True
                     margin = command.park_margin or controller.PARK_MARGIN_K
-                    # Park: ride just above the internal reading, keeping the
-                    # compressor mode, so the device's own above-setpoint
-                    # policy (idle vs keep-temperature residual) expresses
-                    # itself and can be measured. Never used for shed zones.
-                    raw = (
-                        float(internal) + margin
-                        if command.hvac_mode == MODE_COOL
-                        else float(internal) - margin
+                    raw = controller.hold_device_setpoint(
+                        float(internal),
+                        margin,
+                        command.hvac_mode,
+                        zone.last_hold_device_sp,
+                        zone.last_hold_depth_k,
                     )
                 elif command.park:
                     # This head has no internal reading; try sibling heads.
@@ -2236,6 +2251,17 @@ class AdaptiveComfortRuntime:
                 setpoint = controller.quantize_setpoint(
                     raw, float(minimum), float(maximum), step=step_f
                 )
+                if (
+                    command.head_depth_k is not None
+                    and float(command.head_depth_k) > 0.0
+                ):
+                    zone.last_hold_depth_k = float(command.head_depth_k)
+                    zone.last_hold_device_sp = setpoint
+                elif command.park:
+                    zone.last_hold_depth_k = float(
+                        command.park_margin or controller.PARK_MARGIN_K
+                    )
+                    zone.last_hold_device_sp = setpoint
                 if state.state != command.hvac_mode:
                     await self.hass.services.async_call(
                         "climate",
