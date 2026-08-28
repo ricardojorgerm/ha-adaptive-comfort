@@ -228,6 +228,9 @@ class ZoneSnapshot:
     # instantaneous ΔT - a "how thermally central is this room to the rest
     # of the house" proxy (used as an anchor-selection tie-break).
     mixing_coupling_w_per_k: float | None = None
+    # AC overlay for demand cost (K/h): last on-period sensible / c_eff, else
+    # ± standing/c_eff (hold). None → controller keeps the pre-cost OOB rule.
+    q_hvac_k_per_h: float | None = None
 
 
 @dataclass

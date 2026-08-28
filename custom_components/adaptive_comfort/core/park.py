@@ -238,6 +238,11 @@ class PowerDebounce:
         return above
 
 
+def usable_residual_bin(ext: float, duty: float, n: float) -> bool:
+    """Compressing electrically and thermally residual (not idle / unknown)."""
+    return n >= CLASSIFY_MIN_SAMPLES and duty >= RESIDUAL_HOLD_DUTY_MIN and ext >= RESIDUAL_MIN_W
+
+
 class ParkEstimator:
     """EWMA of parked thermal extraction, idle/residual class, preferred margin.
 
@@ -282,6 +287,19 @@ class ParkEstimator:
         else:
             self.active_ratio += self.alpha * (a - self.active_ratio)
         self.samples += 1
+
+    def update_duty(self, action_active: bool, margin_k: float | None = None) -> None:
+        """Electrical sample when thermal extraction is unknown (stale sensible).
+
+        Does not touch extraction EWMA / classification — a compressing tick
+        with no room-rate must not write ext=0 / active=True.
+        """
+        b = margin_bin(margin_k)
+        if b is None:
+            return
+        ext, duty, n = self.margin_bins.get(b, [0.0, 1.0 if action_active else 0.0, 0])
+        duty += self.alpha * ((1.0 if action_active else 0.0) - duty)
+        self.margin_bins[b] = [ext, duty, n + 1]
 
     def raise_preferred(self, margin_k: float) -> None:
         """High-water mark: session needed at least this depth to hold."""
@@ -349,15 +367,15 @@ class ParkEstimator:
         return self.fan_type_min_margin_k()
 
     def residual_max_margin_k(self) -> float | None:
-        """Deepest margin (K) that is still residual: mode on, compressing.
+        """Deepest margin (K) that is still residual: compressing and moving heat.
 
-        Walks margin_bins from the compressing side (duty >= threshold) and
-        returns the deepest such bin — the hold just before the fan-type shelf.
-        Pair with fan_type_min_margin_k() to bracket the dead-band edge.
+        Duty alone is not enough: house p_ac from a sibling can mark every
+        depth as compressing while extraction is 0 W (idle). 25-60 W stays
+        unknown and is not this ceiling.
         """
         best = None
-        for bin_key, (_ext, duty, n) in self.margin_bins.items():
-            if n >= CLASSIFY_MIN_SAMPLES and duty >= RESIDUAL_HOLD_DUTY_MIN:
+        for bin_key, (ext, duty, n) in self.margin_bins.items():
+            if usable_residual_bin(ext, duty, n):
                 m = float(bin_key)
                 if best is None or m > best:
                     best = m
@@ -371,15 +389,15 @@ class ParkEstimator:
         """Residual↔fan-type edge (K), finer than the 0.5 K bin grid.
 
         Bisects residual_max_margin_k() and fan_type_min_margin_k() when both
-        are known; otherwise returns whichever bound exists. This is the
-        park *entry* target.
+        are known. Fan-type alone is not an entry target (no residual hold).
         """
         hold = self.residual_max_margin_k()
         fan = self.fan_type_min_margin_k()
         if hold is not None and fan is not None and fan > hold:
             midpoint = (hold + fan) / 2.0
             return round(midpoint / EDGE_STEP_K) * EDGE_STEP_K
-        return hold if hold is not None else fan
+        # Fan-type alone is not a residual entry target.
+        return hold
 
     def current_is_fan_type(self, margin_k: float | None) -> bool | None:
         """Live electrical read for a session currently parked at margin_k.
@@ -431,11 +449,17 @@ class ParkEstimator:
         est.samples = int(data.get("samples", 0))
         for k, v in data.get("margin_bins", {}).items():
             try:
-                est.margin_bins[str(k)] = [float(v[0]), float(v[1]), int(v[2])]
+                ext, duty, n = float(v[0]), float(v[1]), int(v[2])
             except (TypeError, ValueError, IndexError):
                 continue
+            est.margin_bins[str(k)] = [ext, duty, n]
         if data.get("preferred_margin_k") is not None:
             est.preferred_margin_k = min(
                 max(float(data["preferred_margin_k"]), MARGIN_MIN_K), MARGIN_MAX_K
             )
+        # Idle-only map: a latched 3.0 preferred would re-enter at 2.5.
+        # Keep the bins (ceiling evidence) and cap preferred until residual
+        # extraction exists.
+        if est.residual_max_margin_k() is None and est.margin_bins:
+            est.preferred_margin_k = min(est.preferred_margin_k, DEFAULT_MARGIN_K)
         return est

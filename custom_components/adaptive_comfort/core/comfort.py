@@ -59,6 +59,8 @@ MODE_HORIZON_H = 8  # near-term hours for mode arbitration (not full 24 h)
 MODE_DWELL_S = 6.0 * 3600.0
 OVERRIDE_DELTA_K = 2.0
 OVERRIDE_SUSTAIN_S = 30.0 * 60.0
+# Skip manufactured undershoot after a cool run (idle heads, last_cool clock).
+MANUFACTURED_SKIP_S = 3600.0
 MIN_MODEL_CONFIDENCE = 0.3
 UNOCCUPIED_WIDEN_K = 1.5
 UNOCCUPIED_WEIGHT = 0.3
@@ -315,18 +317,50 @@ def _mode_trajectory(zone: ZoneSnapshot, horizon_h: int = MODE_HORIZON_H) -> tup
     return (zone.temp,) * horizon_h
 
 
+def _skip_manufactured(
+    zone: ZoneSnapshot,
+    *,
+    cold: bool,
+    state: ControllerState | None = None,
+    now_ts: float = 0.0,
+) -> bool:
+    """True when this zone's excursion was made by our own plant, not weather.
+
+    Per-zone only: a cooling head, a still-parked session, or a room that
+    cooled within ``MANUFACTURED_SKIP_S``. House ``state.mode`` alone must
+    not blank every zone (that latched cool through a cold snap).
+    """
+    if cold:
+        if zone.head_mode == MODE_COOL:
+            return True
+        if state is None:
+            return False
+        if zone.zone_id in state.zone_parked_since and state.mode == MODE_COOL:
+            return True
+        last = state.zone_last_cool.get(zone.zone_id, 0.0)
+        return last > 0.0 and now_ts - last < MANUFACTURED_SKIP_S
+    if zone.head_mode == MODE_HEAT:
+        return True
+    if state is None:
+        return False
+    return zone.zone_id in state.zone_parked_since and state.mode == MODE_HEAT
+
+
 def demand_integrals(
     zones: list[ZoneSnapshot],
     bands: dict[str, tuple[float, float]],
     horizon_h: int = MODE_HORIZON_H,
     settings: Settings | None = None,
+    state: ControllerState | None = None,
+    now_ts: float = 0.0,
 ) -> tuple[float, float]:
     """Occupancy-weighted (warm excess, cold deficit) in K*h over the horizon.
 
     Integrates each zone's no-AC counterfactual vs its comfort band. Conditioning
     zones are included: predict_free is already "if this zone gets no AC."
     A cooling head does not add cold (it manufactured the undershoot); a heating
-    head does not add warm.
+    head does not add warm. Recently cooled / parked zones skip the same way
+    after heads go idle.
     """
     warm = 0.0
     cold = 0.0
@@ -347,8 +381,8 @@ def demand_integrals(
         # Active cooling made the room cold; that is not a heat request.
         # Active heating made it hot; that is not a cool request. Manual
         # pulldown (SP 18 overnight) must not elect heat at 25 °C outdoor.
-        skip_warm = zone.head_mode == MODE_HEAT
-        skip_cold = zone.head_mode == MODE_COOL
+        skip_warm = _skip_manufactured(zone, cold=False, state=state, now_ts=now_ts)
+        skip_cold = _skip_manufactured(zone, cold=True, state=state, now_ts=now_ts)
         for temp in trajectory:
             if not skip_warm:
                 warm += weight * max(0.0, temp - hi)  # 1 h per sample
@@ -420,6 +454,8 @@ def _max_present_excess(
     bands: dict[str, tuple[float, float]],
     *,
     cool: bool,
+    state: ControllerState | None = None,
+    now_ts: float = 0.0,
 ) -> float | None:
     """Largest current out-of-band excursion (K) on the cool or heat side.
 
@@ -429,9 +465,9 @@ def _max_present_excess(
     for zone in zones:
         if zone.temp is None or zone.zone_id not in bands:
             continue
-        if cool and zone.head_mode == MODE_HEAT:
+        if cool and _skip_manufactured(zone, cold=False, state=state, now_ts=now_ts):
             continue
-        if not cool and zone.head_mode == MODE_COOL:
+        if not cool and _skip_manufactured(zone, cold=True, state=state, now_ts=now_ts):
             continue
         lo, hi = bands[zone.zone_id]
         excess = zone.temp - hi if cool else lo - zone.temp
@@ -474,13 +510,13 @@ def dominant_mode(
             state.mode_since = now
         return ModeDecision(mode, "fallback")
 
-    warm, cold = demand_integrals(zones, bands, settings=snap.settings)
+    warm, cold = demand_integrals(zones, bands, settings=snap.settings, state=state, now_ts=now)
     season_heat = snap.t_rm is not None and snap.t_rm < FALLBACK_HEAT_BELOW_C
     season_cool = snap.t_rm is not None and snap.t_rm > FALLBACK_COOL_ABOVE_C
     # Per-zone present excursion (not house-mean): a single hot room must not
     # be silenced by cooler siblings in the seasonal guard.
-    max_hot_k = _max_present_excess(zones, bands, cool=True)
-    max_cold_k = _max_present_excess(zones, bands, cool=False)
+    max_hot_k = _max_present_excess(zones, bands, cool=True, state=state, now_ts=now)
+    max_cold_k = _max_present_excess(zones, bands, cool=False, state=state, now_ts=now)
 
     seasonally_demoted = False
     if warm - cold > MODE_DEADBAND_KH:

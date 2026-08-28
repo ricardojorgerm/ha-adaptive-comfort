@@ -87,7 +87,7 @@ def test_cold_start_summer_day_controls_decently():
             if cmd.hvac_mode == MODE_OFF:
                 active[cmd.zone_id] = None
                 if was_on:
-                    transitions[cmd.zone_id].append((now, False))
+                    transitions[cmd.zone_id].append((now, False, cmd.reason))
             else:
                 sp = cmd.setpoint
                 if sp is None and cmd.track_delta is not None:
@@ -96,7 +96,7 @@ def test_cold_start_summer_day_controls_decently():
                     sp = room.temp - cmd.track_delta
                 active[cmd.zone_id] = (cmd.hvac_mode, sp)
                 if not was_on:
-                    transitions[cmd.zone_id].append((now, True))
+                    transitions[cmd.zone_id].append((now, True, cmd.reason))
 
     # 1. It actually cooled: every room ends inside a generous comfort range.
     for room in rooms:
@@ -109,8 +109,11 @@ def test_cold_start_summer_day_controls_decently():
 
     # 3. Cycling guards: off respects min_off; on uses the short zone chatter
     # dwell (plant-level min_on is electrical and not asserted here).
+    # Fan assist is not compressor runtime — fan_off→helper is not min_off.
     for name, events in transitions.items():
-        for (t1, on1), (t2, _on2) in itertools.pairwise(events):
+        for (t1, on1, reason1), (t2, _on2, reason2) in itertools.pairwise(events):
+            if reason1 in ("fan_assist", "fan_off") or reason2 in ("fan_assist", "fan_off"):
+                continue
             gap_min = (t2 - t1) / 60.0
             minimum = settings.min_off_min if not on1 else controller.ZONE_CHATTER_S / 60.0
             assert gap_min >= minimum - 1e-6, f"{name}: {gap_min:.1f} min violates guard"

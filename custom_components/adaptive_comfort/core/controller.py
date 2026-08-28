@@ -7,8 +7,16 @@ device setpoints via the per-head drift offsets.
 
 from __future__ import annotations
 
+import math
+
 from . import comfort, power
-from .park import LOAD_COVER_FRACTION, MARGIN_SETTLE_ALPHA, pick_depth_k
+from .park import (
+    CLASSIFY_MIN_SAMPLES,
+    LOAD_COVER_FRACTION,
+    MARGIN_SETTLE_ALPHA,
+    pick_depth_k,
+    usable_residual_bin,
+)
 from .types import (
     MODE_AUTO,
     MODE_COOL,
@@ -41,9 +49,9 @@ SHED_URGENT_SPACING_S = 3.0
 COMMAND_SPACING_S = 180.0
 SETPOINT_EPSILON_K = 0.25
 # Re-anchor head depth when live internal drifts vs the device setpoint.
-# Routine refresh stays at COMMAND_SPACING_S; drift may fire as often as one
-# control tick so a collapsing head sensor (27→24 after airflow) does not
-# leave SP stranded at the inflated entry for minutes.
+# Chase (negative depth) follows the sensor; positive park depth must not —
+# re-issuing SP = internal + margin on a falling supply-air reading is a
+# descending ladder (West 22.9→21.0), including the 180 s spacing refresh.
 HEAD_REANCHOR_MIN_S = 60.0
 HEAD_REANCHOR_EPS_K = 0.5
 # Tracking setpoint control: the commanded device setpoint follows the head's
@@ -845,6 +853,17 @@ def _predicted_breach(
     return ttb, peak
 
 
+def _prediction_horizon_h(min_on_min: float, cop_timing: str = "none") -> float:
+    """How far inaction is scored (h). COP advance/defer stretch this only."""
+    min_on_h = max(min_on_min / 60.0, 1.0 / 60.0)
+    horizon = max(1.0, 2.0 * min_on_h)
+    if cop_timing == "advance":
+        horizon = max(horizon, COP_ADVANCE_HORIZON_H)
+    elif cop_timing == "defer":
+        horizon = min(horizon, max(min_on_h, COP_DEFER_HORIZON_H))
+    return horizon
+
+
 def _prediction_justifies_run(
     zone: ZoneSnapshot,
     lo: float,
@@ -862,13 +881,57 @@ def _prediction_justifies_run(
     ttb_h, peak = _predicted_breach(zone, lo, hi, mode)
     if ttb_h is None or peak < PREDICT_MARGIN_K:
         return False
-    min_on_h = max(min_on_min / 60.0, 1.0 / 60.0)
-    horizon = max(1.0, 2.0 * min_on_h)
-    if cop_timing == "advance":
-        horizon = max(horizon, COP_ADVANCE_HORIZON_H)
-    elif cop_timing == "defer":
-        horizon = min(horizon, max(min_on_h, COP_DEFER_HORIZON_H))
-    return ttb_h <= horizon
+    return ttb_h <= _prediction_horizon_h(min_on_min, cop_timing)
+
+
+def _hourly_at_path(temps: tuple[float, ...] | list[float], hour: float) -> float:
+    """Linear interpolate an hourly trajectory (index 0 = now)."""
+    if not temps:
+        return 0.0
+    if hour <= 0.0:
+        return float(temps[0])
+    i = int(hour)
+    if i >= len(temps) - 1:
+        return float(temps[-1])
+    frac = hour - i
+    return float(temps[i]) * (1.0 - frac) + float(temps[i + 1]) * frac
+
+
+def _oob_k(temp: float, lo: float, hi: float) -> float:
+    return max(0.0, temp - hi) + max(0.0, lo - temp)
+
+
+def _path_comfort_cost(
+    temps: tuple[float, ...] | list[float],
+    lo: float,
+    hi: float,
+    horizon_h: float,
+    q_hvac_k_per_h: float = 0.0,
+    q_on_h: float | None = None,
+) -> tuple[float, float]:
+    """(K·h outside [lo, hi], peak OOB K) over the horizon.
+
+    Optional ``q_hvac_k_per_h`` overlays AC for the first ``q_on_h`` hours
+    (default: the whole horizon). After that the offset holds so a min_on
+    pull-down is scored against the same window as inaction.
+    """
+    if not temps or horizon_h <= 0.0:
+        return 0.0, 0.0
+    on_h = horizon_h if q_on_h is None else max(0.0, q_on_h)
+    steps = max(1, math.ceil(horizon_h * 6.0))
+    dt = horizon_h / steps
+    peak = 0.0
+    cost = 0.0
+    prev = None
+    for i in range(steps + 1):
+        h = i * dt
+        temp = _hourly_at_path(temps, h) + q_hvac_k_per_h * min(h, on_h)
+        oob = _oob_k(temp, lo, hi)
+        peak = max(peak, oob)
+        if prev is not None:
+            cost += 0.5 * (prev + oob) * dt
+        prev = oob
+    return cost, peak
 
 
 def _wants_conditioning(
@@ -879,28 +942,44 @@ def _wants_conditioning(
     min_on_min: float = 20.0,
     cop_timing: str = "none",
 ) -> bool:
-    """Demand: out of band now, or prediction justifies a plant-minimum run.
+    """Demand: in-band uses prediction (COP advance); present OOB may nick.
 
-    Predictive entry only while approaching the near edge. Past the far edge
-    (cool temp≤lo / heat temp≥hi), more of the same mode is overshoot —
-    advance horizons must not keep digging (Aug 3: West cooled to ~20.4°C
-    while still want=demand). Helpers already use ``_reached_far_edge``.
+    Far-edge (cool temp≤lo / heat temp≥hi) is already overshoot — do not keep
+    digging. In-band never cost-compares a min_on overlay (that killed COP
+    advance once the runtime always set q_hvac). Present OOB starts unless a
+    same-sign q_hvac shows a min_on run costs more comfort than riding the
+    nick. Wrong-sign / missing q_hvac honors the breach.
     """
     if zone.temp is None:
         return False
     if mode == MODE_COOL:
-        if zone.temp > hi:
-            return True
         if zone.temp <= lo:
             return False
-        return _prediction_justifies_run(zone, lo, hi, mode, min_on_min, cop_timing)
-    if mode == MODE_HEAT:
-        if zone.temp < lo:
-            return True
+        present_oob = zone.temp > hi
+    elif mode == MODE_HEAT:
         if zone.temp >= hi:
             return False
+        present_oob = zone.temp < lo
+    else:
+        return False
+    if not zone.free_float:
+        return present_oob
+    if not present_oob:
         return _prediction_justifies_run(zone, lo, hi, mode, min_on_min, cop_timing)
-    return False
+    q_hvac = zone.q_hvac_k_per_h
+    if q_hvac is None:
+        return True
+    if mode == MODE_COOL and q_hvac >= 0.0:
+        return True
+    if mode == MODE_HEAT and q_hvac <= 0.0:
+        return True
+    min_on_h = max(min_on_min / 60.0, 1.0 / 60.0)
+    horizon_h = max(1.0, 2.0 * min_on_h)
+    cost_in, peak_in = _path_comfort_cost(zone.free_float, lo, hi, horizon_h)
+    if peak_in < PREDICT_MARGIN_K:
+        return False
+    cost_act, _peak_act = _path_comfort_cost(zone.free_float, lo, hi, horizon_h, q_hvac, min_on_h)
+    return cost_in > cost_act
 
 
 def _predicted_oob_duration_s(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> float:
@@ -1074,15 +1153,23 @@ def _depth_command_due(
     *,
     force: bool = False,
 ) -> bool:
-    """Emit a depth command on spacing, forced change, or head-anchor drift."""
+    """Emit a depth command on spacing (chase only), forced change, or chase drift.
+
+    Positive park depth is a frozen hold: coordinator would rebuild
+    ``SP = internal + depth`` from a falling supply-air reading. Depth
+    steps still emit via ``force`` (margin escalate, coil-wet walk).
+    """
     if force:
         return True
+    if depth_k is not None and depth_k > 0.0:
+        return False
     last = state.zone_last_cmd.get(zid, 0.0)
     elapsed = now - last
     if elapsed >= COMMAND_SPACING_S:
         return True
     return (
         depth_k is not None
+        and depth_k < 0.0
         and mode in (MODE_HEAT, MODE_COOL)
         and elapsed >= HEAD_REANCHOR_MIN_S
         and _head_anchor_drifted(zone, depth_k, mode)
@@ -1100,6 +1187,20 @@ def _chase_floor_k(state: ControllerState, zid: str) -> float:
     return -_quantize_depth(chase)
 
 
+def _mapped_without_residual(zone: ZoneSnapshot) -> bool:
+    """Hysteresis map has samples but no residual bin (idle / unknown only)."""
+    if zone.park_residual_max_margin_k is not None:
+        return False
+    has_samples = False
+    for entry in (zone.park_margin_bins or {}).values():
+        if len(entry) < 3 or int(entry[2]) < CLASSIFY_MIN_SAMPLES:
+            continue
+        has_samples = True
+        if usable_residual_bin(float(entry[0]), float(entry[1]), float(entry[2])):
+            return False
+    return has_samples
+
+
 def _hysteresis_ceiling_k(zone: ZoneSnapshot, state: ControllerState) -> float:
     """Over-conditioning extreme: deepest still COP/residual-useful depth.
 
@@ -1111,6 +1212,8 @@ def _hysteresis_ceiling_k(zone: ZoneSnapshot, state: ControllerState) -> float:
     _ = state  # reserved for future preferred-aware soft caps
     if zone.park_residual_max_margin_k is not None:
         return min(_quantize_depth(zone.park_residual_max_margin_k), DEPTH_MAX_K)
+    if _mapped_without_residual(zone):
+        return PARK_MARGIN_K
     if zone.park_residual_edge_k is not None:
         return min(_quantize_depth(zone.park_residual_edge_k), DEPTH_MAX_K)
     return DEPTH_MAX_K
@@ -1329,12 +1432,19 @@ def _park_preferred(zone: ZoneSnapshot, state: ControllerState) -> float:
     """
     zid = zone.zone_id
     if zid in state.zone_park_preferred:
-        return state.zone_park_preferred[zid]
-    if zone.park_residual_edge_k is not None:
-        return min(max(zone.park_residual_edge_k, PARK_MARGIN_K), PARK_MARGIN_MAX_K)
-    if zone.park_preferred_margin_k is not None:
-        return zone.park_preferred_margin_k
-    return PARK_MARGIN_K
+        pref = state.zone_park_preferred[zid]
+    elif zone.park_residual_edge_k is not None:
+        pref = min(max(zone.park_residual_edge_k, PARK_MARGIN_K), PARK_MARGIN_MAX_K)
+    elif zone.park_preferred_margin_k is not None:
+        pref = zone.park_preferred_margin_k
+    else:
+        pref = PARK_MARGIN_K
+    cap = zone.park_residual_max_margin_k
+    if cap is not None:
+        pref = min(pref, max(float(cap), PARK_MARGIN_K))
+    elif _mapped_without_residual(zone):
+        pref = min(pref, PARK_MARGIN_K)
+    return pref
 
 
 def _park_entry_margin(zone: ZoneSnapshot, state: ControllerState) -> float:
@@ -2502,8 +2612,9 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 state.zone_head_depth_k.pop(zid, None)
                 desired_on = False
             else:
-                # Stay parked / continuum: refresh on spacing, depth move, or
-                # head-anchor drift. Weak residual cover stays here so adapt
+                # Stay parked / continuum: refresh on depth move only while
+                # depth is positive (frozen hold). Chase/zero-hold still
+                # follows spacing. Weak residual cover stays here so adapt
                 # can step depth down rather than soft-releasing to off.
                 if depth <= 0.0:
                     # Stepped into chase while want-off — idle if allowed.
@@ -2664,6 +2775,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
             condition_hold = False
             quiet_cover = diag.get("quiet_cover_extended") == zid
             helper_depth_k: float | None = None
+            helper_prev_d: float | None = None
             if zid in demand_ids:
                 condition_hold = _quiet_night_condition_hold(s, zid, snap.local_hour, mode)
                 if (
@@ -2697,8 +2809,9 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 # Hold at live room temp (depth 0), then SP follows 0.5 K
                 # park steps: 21 → 21.5 → 22 … while still compressing.
                 reason = "helper"
-                prev_d = state.zone_head_depth_k.get(zid, 0.0)
+                helper_prev_d = state.zone_head_depth_k.get(zid, 0.0)
                 helper_depth_k = _helper_walk_depth(state, zone, lo, hi, mode, now)
+                prev_d = helper_prev_d
                 hold = quantize_setpoint(zone.temp) if zone.temp is not None else center
                 hold = min(max(hold, lo), hi)
                 last_sp = state.zone_last_setpoint.get(zid)
@@ -2808,17 +2921,24 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
             last_sp = state.zone_last_setpoint.get(zid)
             setpoint_changed = last_sp is None or abs(setpoint - last_sp) >= SETPOINT_EPSILON_K
-            # Re-anchor on spacing, room-setpoint change, or head-internal drift
-            # vs the live device SP (chase and hysteresis share this path).
+            # Re-anchor on spacing (chase only), room-setpoint change, helper
+            # depth step, or head-internal drift vs the live device SP.
             depth_for_anchor = depth_k
             if depth_for_anchor is None and track_delta is not None:
                 depth_for_anchor = -float(track_delta)
             has_depth = depth_for_anchor is not None
             spacing_ok = now - state.zone_last_cmd.get(zid, 0.0) >= COMMAND_SPACING_S
+            depth_stepped = (
+                helper_depth_k is not None
+                and helper_prev_d is not None
+                and abs(helper_depth_k - helper_prev_d) > 1e-9
+            )
             depth_due = (
                 has_depth
                 and zone.is_on
-                and _depth_command_due(state, zid, now, zone, depth_for_anchor, mode)
+                and _depth_command_due(
+                    state, zid, now, zone, depth_for_anchor, mode, force=depth_stepped
+                )
             )
             if transitioned or not zone.is_on or (setpoint_changed and spacing_ok) or depth_due:
                 if depth_k is not None:

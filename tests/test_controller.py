@@ -936,7 +936,11 @@ def test_compressing_hold_stays_below_fan_type_shelf():
 
 
 def test_helper_walks_into_shallow_park_not_covering_bin():
-    """Recruited helpers hold at live temp (depth 0), then +0.5 K per re-anchor."""
+    """Recruited helpers hold at live temp (depth 0), then +0.5 K per re-anchor.
+
+    Once depth is stable and positive, spacing does not re-issue the park
+    command (frozen hold — not the descending-internal ladder).
+    """
     hot = make_zone("hot", 25.0)
     ok = make_zone(
         "ok",
@@ -975,8 +979,9 @@ def test_helper_walks_into_shallow_park_not_covering_bin():
 
     snap3 = make_snapshot([hot, ok_on], now=NOW + 2 * controller.COMMAND_SPACING_S)
     decision = controller.tick(snap3, decision.state)
-    cmd3 = {c.zone_id: c for c in decision.commands}["ok"]
-    assert cmd3.head_depth_k == 0.5  # stable: stop deepening
+    # Frozen park hold: spacing must not re-issue SP = internal + depth.
+    assert not any(c.zone_id == "ok" for c in decision.commands)
+    assert decision.state.zone_head_depth_k["ok"] == 0.5
 
     racing = make_zone(
         "ok",
@@ -994,3 +999,59 @@ def test_helper_walks_into_shallow_park_not_covering_bin():
     cmd4 = {c.zone_id: c for c in decision.commands}["ok"]
     assert cmd4.head_depth_k == 1.0
     assert cmd4.head_depth_k < 2.5
+
+
+def test_idle_mapped_ceiling_is_park_margin_not_depth_max():
+    zone = make_zone("ok", 22.6, park_margin_bins={"3.0": [0.0, 0.5, 20.0]})
+    assert controller._hysteresis_ceiling_k(zone, ControllerState()) == controller.PARK_MARGIN_K
+
+
+def test_demand_cost_skips_dying_nick_when_action_overshoots():
+    """0.28 K over hi that free-float returns, while min_on would cross lo."""
+    lo, hi = 23.01, 24.21
+    zone = make_zone(
+        "east",
+        24.49,
+        free_float=[24.49, 24.10, 23.90] + [23.80] * 21,
+        q_hvac_k_per_h=-4.0,
+    )
+    assert not controller._wants_conditioning(zone, lo, hi, MODE_COOL, 30.0)
+
+
+def test_demand_cost_starts_when_inaction_stays_hot():
+    lo, hi = 23.01, 24.21
+    zone = make_zone(
+        "east",
+        24.49,
+        free_float=[24.49, 24.70, 25.00] + [25.20] * 21,
+        q_hvac_k_per_h=-1.0,
+    )
+    assert controller._wants_conditioning(zone, lo, hi, MODE_COOL, 30.0)
+
+
+def test_demand_present_oob_without_q_hvac_still_starts():
+    zone = make_zone("bed", 25.0)
+    assert controller._wants_conditioning(zone, 21.8, 23.2, MODE_COOL, 20.0)
+
+
+def test_in_band_advance_still_fires_when_q_hvac_is_set():
+    """Cost-compare used to run in-band and killed COP advance."""
+    zone_in = make_zone(
+        "z1",
+        23.2,
+        free_float=(23.2, 23.5, 24.5, 25.0) + (25.0,) * 20,
+        q_hvac_k_per_h=-4.0,
+    )
+    assert controller._wants_conditioning(
+        zone_in, 22.5, 23.9, MODE_COOL, 20.0, cop_timing="advance"
+    )
+
+
+def test_present_oob_wrong_sign_q_hvac_still_starts():
+    zone = make_zone(
+        "east",
+        25.0,
+        free_float=[25.0] * 24,
+        q_hvac_k_per_h=2.0,
+    )
+    assert controller._wants_conditioning(zone, 21.8, 23.2, MODE_COOL, 20.0)

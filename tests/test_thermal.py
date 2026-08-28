@@ -344,3 +344,27 @@ def test_live_outdoor_trend_blends_hours_1_and_2():
     assert out[1] < temps[1]
     assert out[2] < temps[2]
     assert out[3] == temps[3]
+
+
+def test_phi_scales_harmonics_not_a0():
+    from custom_components.adaptive_comfort.core.thermal import _phi
+
+    full = _phi(1.0, 0.5, 0.0, 1.0)
+    overcast = _phi(1.0, 0.5, 0.0, 0.0)
+    assert full[0] == overcast[0] == 1.0
+    assert full[1] == overcast[1] == 0.5
+    assert full[2] == overcast[2] == 1.0  # a0 column
+    assert overcast[3] == overcast[4] == overcast[5] == overcast[6] == 0.0
+    assert full[3] != 0.0
+
+
+def test_sensible_and_transient_share_live_solar_scale():
+    model = _fitted_q_model()
+    r_clear = model.free_float_rate(22.0, 20.0, 0.0, solar_scale=1.0)
+    r_cloud = model.free_float_rate(22.0, 20.0, 0.0, solar_scale=0.0)
+    assert r_clear != r_cloud
+    p_clear = model.sensible_power_w(22.0, 20.0, 0.0, 0.0, solar_scale=1.0)
+    p_cloud = model.sensible_power_w(22.0, 20.0, 0.0, 0.0, solar_scale=0.0)
+    assert p_clear != p_cloud
+    # q_mean (a0) is not multiplied by scale at predict time.
+    assert model.q_eff(0.0, solar_scale=0.0) == model.q_mean()

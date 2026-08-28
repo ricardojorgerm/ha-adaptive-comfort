@@ -193,6 +193,7 @@ class ZoneRuntime:
         self.last_fit_temp: float | None = None
         self.sensible_w = 0.0  # sensed room, signed
         self.sensible_ts: float | None = None  # when sensible_w was last fitted
+        self.last_on_sensible_w: float | None = None  # last non-park conditioning (signed)
         self.latent_w = 0.0  # sensed room
         # Zone-total free-float heat that must be rejected/supplied to hold T (W).
         self.standing_load_w: float | None = None
@@ -797,7 +798,7 @@ class AdaptiveComfortRuntime:
                 aux.append((temp, room.volume_m3))
         return aux
 
-    def _standing_load_w(self, zone) -> float | None:
+    def _standing_load_w(self, zone, solar_scale: float = 1.0) -> float | None:
         """Estimated heat inflow the zone must reject to hold temperature (W).
 
         The free-float side of sensible_power_w (dT/dt = 0, no AC term) at
@@ -811,13 +812,48 @@ class AdaptiveComfortRuntime:
         # sensible_power_w returns heat *added by the AC*; with dtdt=0 its
         # negation is the standing inflow the AC must remove to hold temp.
         inflow = -zone.model.sensible_power_w(
-            zone.temp, self.t_out, 0.0, local_hour, zone.door_open, t_house
+            zone.temp,
+            self.t_out,
+            0.0,
+            local_hour,
+            zone.door_open,
+            t_house,
+            indoor_fans_on=zone.indoor_fans_on,
+            outdoor_exhaust_on=zone.outdoor_exhaust_on,
+            solar_scale=solar_scale,
         )
         # Cooling must reject heat coming in; heating must replace heat
         # going out. Same free-float number, opposite sign of interest.
         if self.controller_state.mode == MODE_HEAT:
             return max(0.0, -inflow) * zone.config.n_rooms
         return max(0.0, inflow) * zone.config.n_rooms
+
+    def _q_hvac_k_per_h(self, zone: ZoneRuntime) -> float | None:
+        """AC overlay (K/h) for dying-nick cost: last on-period excess, else hold.
+
+        Sign must match the live plant mode. Park-idle ~0 W and a leftover
+        cooling overlay while heating are not a pull-down rate.
+        """
+        c = zone.model.c_eff_wh_per_k
+        if c <= 0.0:
+            return None
+        last = zone.last_on_sensible_w
+        mode = self.controller_state.mode
+        q = None
+        if last is not None and abs(last) > park.IDLE_MAX_W:
+            q = last / c
+            if (mode == MODE_HEAT and q <= 0.0) or (mode == MODE_COOL and q >= 0.0):
+                q = None
+        if q is not None:
+            return q
+        if zone.standing_load_w is None:
+            return None
+        per_head = zone.standing_load_w / max(1, zone.config.n_rooms)
+        if mode == MODE_HEAT:
+            return per_head / c
+        if mode == MODE_COOL:
+            return -per_head / c
+        return None
 
     def _house_other_temp(self, zone_id: str) -> float | None:
         return house_other_temperature(
@@ -1363,8 +1399,10 @@ class AdaptiveComfortRuntime:
         self._conditioning_fit_refreshed = False
         total_sensible = 0.0
         total_latent = 0.0
+        scales, _sinks = self._forecast_q_hours(now_ts)
+        solar_scale = scales[0] if scales else 1.0
         for zone in self.zones.values():
-            self._update_zone_estimators(zone, now_ts, local_hour)
+            self._update_zone_estimators(zone, now_ts, local_hour, solar_scale=solar_scale)
             if zone.is_on:
                 total_sensible += abs(zone.sensible_w) * zone.config.n_rooms
                 total_latent += zone.latent_w * zone.config.n_rooms
@@ -1442,7 +1480,14 @@ class AdaptiveComfortRuntime:
             return -float(st.zone_track_delta[zid])
         return None
 
-    def _update_zone_estimators(self, zone: ZoneRuntime, now_ts: float, local_hour: float) -> None:
+    def _update_zone_estimators(
+        self,
+        zone: ZoneRuntime,
+        now_ts: float,
+        local_hour: float,
+        *,
+        solar_scale: float = 1.0,
+    ) -> None:
         if zone.temp is None:
             return
         # 5-minute smoothed temperature step.
@@ -1480,6 +1525,7 @@ class AdaptiveComfortRuntime:
                 indoor_fans_on=zone.indoor_fans_on,
                 outdoor_exhaust_on=zone.outdoor_exhaust_on,
                 include_transient=False,
+                solar_scale=solar_scale,
             )
             zone.model.update_q_transient(dtdt - expected)
         else:
@@ -1499,6 +1545,7 @@ class AdaptiveComfortRuntime:
                     self._house_other_temp(zone.config.zone_id),
                     indoor_fans_on=zone.indoor_fans_on,
                     outdoor_exhaust_on=zone.outdoor_exhaust_on,
+                    solar_scale=solar_scale,
                 )
             zone.sensible_w = 0.0
             zone.sensible_ts = now_ts
@@ -1524,6 +1571,9 @@ class AdaptiveComfortRuntime:
                     zone.door_open,
                     t_house,
                     latent_w=latent_w,
+                    indoor_fans_on=zone.indoor_fans_on,
+                    outdoor_exhaust_on=zone.outdoor_exhaust_on,
+                    solar_scale=solar_scale,
                 )
             elif abs(dtdt) <= TRANSIENT_K_H:
                 # Moderate transient: small rooms on short cycles are never
@@ -1540,6 +1590,9 @@ class AdaptiveComfortRuntime:
                     t_house,
                     dtdt_per_h=dtdt,
                     latent_w=latent_w,
+                    indoor_fans_on=zone.indoor_fans_on,
+                    outdoor_exhaust_on=zone.outdoor_exhaust_on,
+                    solar_scale=solar_scale,
                 )
             else:
                 zone.model.update_c_eff(
@@ -1553,6 +1606,7 @@ class AdaptiveComfortRuntime:
                     t_house,
                     indoor_fans_on=zone.indoor_fans_on,
                     outdoor_exhaust_on=zone.outdoor_exhaust_on,
+                    solar_scale=solar_scale,
                 )
         zone.sensible_w = zone.model.sensible_power_w(
             smoothed,
@@ -1563,8 +1617,11 @@ class AdaptiveComfortRuntime:
             t_house,
             indoor_fans_on=zone.indoor_fans_on,
             outdoor_exhaust_on=zone.outdoor_exhaust_on,
+            solar_scale=solar_scale,
         )
         zone.sensible_ts = now_ts
+        if zone.config.zone_id not in self.controller_state.zone_parked_since:
+            zone.last_on_sensible_w = zone.sensible_w
         zone.latent_w = self._latent_power(zone, dt_h)
         self._conditioning_fit_refreshed = True
 
@@ -1601,9 +1658,7 @@ class AdaptiveComfortRuntime:
                 raw_extraction = max(0.0, -zone.sensible_w)
             n_heads = zone.config.n_rooms
             solo = not any(
-                other.is_on
-                and other.config.zone_id != zid
-                and other.config.zone_id not in parked_ids
+                other.config.zone_id != zid and (other.is_on or other.config.zone_id in parked_ids)
                 for other in self.zones.values()
             )
             if solo:
@@ -1620,13 +1675,14 @@ class AdaptiveComfortRuntime:
                 )
                 if settled is None:
                     continue
-                # Solo: electrical gate is authoritative. Stale thermal magnitude
-                # must not drop the observation (idler classification needs it)
-                # and must not feed frozen full-conditioning watts.
                 if not settled:
                     extraction, active = 0.0, False
                 elif stale_sensible:
-                    extraction, active = 0.0, True
+                    # Compression is real; room-rate is unknown. Duty-only so
+                    # we do not write ext=0 / active=True (West +3 K poison).
+                    margin = self.controller_state.zone_park_margin.get(zid)
+                    zone.park.update_duty(True, margin_k=margin)
+                    continue
                 else:
                     extraction, active = max(0.0, raw_extraction), True
             else:
@@ -1738,7 +1794,9 @@ class AdaptiveComfortRuntime:
                     )
             zone.free_float = free_float
             zone.pred_60m = pred_60m
-            zone.standing_load_w = self._standing_load_w(zone)
+            zone.standing_load_w = self._standing_load_w(
+                zone, solar_scale=solar_scale[0] if solar_scale else 1.0
+            )
             mixing_gain_w = None
             mixing_coupling = None
             if zone.temp is not None and t_house is not None:
@@ -1789,6 +1847,7 @@ class AdaptiveComfortRuntime:
                     standing_load_w=zone.standing_load_w,
                     mixing_gain_w=mixing_gain_w,
                     mixing_coupling_w_per_k=mixing_coupling,
+                    q_hvac_k_per_h=self._q_hvac_k_per_h(zone),
                 )
             )
         mode_hint = self.controller_state.mode

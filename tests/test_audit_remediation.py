@@ -292,6 +292,61 @@ def test_park_learners_solo_stale_sensible_still_duty_samples():
     assert (zone.park.extraction_w or 0.0) < 60.0
 
 
+def test_park_learners_solo_stale_above_floor_does_not_write_fake_active():
+    """Electrically compressing + stale sensible must not record ext=0/active.
+
+    Duty still samples (bin n/duty move) without touching extraction EWMA.
+    That (0 W, duty high, samples++) signature is how West's +3 K idle bin
+    became residual_max when residual_max keyed off duty alone.
+    """
+    from custom_components.adaptive_comfort.coordinator import (
+        FIT_STEP_S,
+        PARK_OBS_DELAY_S,
+        AdaptiveComfortRuntime,
+        ZoneRuntime,
+    )
+    from custom_components.adaptive_comfort.core.types import (
+        ControllerState,
+        RoomConfig,
+        Settings,
+        ZoneConfig,
+    )
+
+    cfg = ZoneConfig(
+        zone_id="z",
+        name="z",
+        heads=("climate.a",),
+        rooms=(RoomConfig(12.0, 2.5),),
+    )
+    zone = ZoneRuntime(cfg)
+    zone.sensible_w = -500.0
+    zone.sensible_ts = NOW - FIT_STEP_S - 10.0
+    rt = AdaptiveComfortRuntime.__new__(AdaptiveComfortRuntime)
+    rt.settings = Settings()
+    rt.controller_state = ControllerState()
+    rt.controller_state.zone_parked_since["z"] = NOW - PARK_OBS_DELAY_S - 10.0
+    rt.controller_state.zone_park_margin["z"] = 3.0
+    rt.controller_state.mode = MODE_COOL
+    rt.zones = {"z": zone}
+    rt.p_load = 400.0
+    rt.baseline = power.BaselineModel()
+    rt.baseline.update(12.0, 40.0)
+    from custom_components.adaptive_comfort.core import park as park_mod
+
+    floor = park_mod.fan_floor_w(1, per_head_w=rt.settings.fan_floor_per_head_w)
+    pac = power.estimate_ac_power(400.0, 40.0)
+    assert pac is not None and pac >= floor
+    zone.park_power.settle(NOW - 120.0, pac, floor_w=floor)
+    zone.park_power.settle(NOW - 60.0, pac, floor_w=floor)
+    samples_before = zone.park.samples
+    AdaptiveComfortRuntime._update_park_learners(rt, NOW, 12.0)
+    assert zone.park.samples == samples_before
+    bin3 = zone.park.margin_bins.get("3.0")
+    assert bin3 is not None
+    assert bin3[0] == 0.0
+    assert bin3[1] > 0.0
+
+
 def test_park_learners_nonsolo_skips_stale_sensible():
     from custom_components.adaptive_comfort.coordinator import (
         FIT_STEP_S,

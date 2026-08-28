@@ -553,15 +553,51 @@ def test_parked_zone_reenters_demand_when_out_of_band():
     assert cmd is not None and cmd.park is False and cmd.track_delta is not None
 
 
-def test_parked_zone_refreshes_park_command_on_spacing():
+def test_parked_zone_does_not_refresh_from_live_internal_on_spacing():
+    """Park hold is frozen; spacing must not re-ride a falling internal sensor.
+
+    Old contract expected ``setpoint re-rides internal`` every 180 s — that
+    is the West 22.9→21.0 descending ladder. Depth steps still emit via
+    force (see test_margin_escalates_while_room_keeps_cooling).
+    """
     satisfied, hot, state = _two_zone_setup(
         park_residuals=True, park_extraction_w=200.0, standing_load_w=100.0
     )
     tick([satisfied, hot], state)
     later = NOW + controller.COMMAND_SPACING_S + 10.0
-    decision = tick([satisfied, hot], state, now=later)
-    cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is True  # setpoint re-rides internal
+    drifted = make_zone(
+        "sat",
+        23.0,
+        is_on=True,
+        park_residuals=True,
+        park_extraction_w=200.0,
+        standing_load_w=100.0,
+        head_internal_temp=24.0,
+    )
+    decision = tick([drifted, hot], state, now=later)
+    assert find_cmd(decision, "sat") is None
+
+
+def test_park_hold_survives_three_spacing_ticks_with_falling_internal():
+    satisfied, hot, state = _two_zone_setup(
+        park_residuals=True, park_extraction_w=200.0, standing_load_w=100.0
+    )
+    tick([satisfied, hot], state)
+    internal = 27.0
+    for i in range(1, 4):
+        internal -= 1.0
+        later = NOW + i * (controller.COMMAND_SPACING_S + 10.0)
+        drifted = make_zone(
+            "sat",
+            23.0,
+            is_on=True,
+            park_residuals=True,
+            park_extraction_w=200.0,
+            standing_load_w=100.0,
+            head_internal_temp=internal,
+        )
+        decision = tick([drifted, hot], state, now=later)
+        assert find_cmd(decision, "sat") is None
 
 
 # --- overcorrection, margin escalation, heating symmetry -----------------------
@@ -670,14 +706,18 @@ def test_margin_change_refreshes_immediately():
     assert cmd.park_margin == controller.PARK_MARGIN_K + controller.PARK_MARGIN_STEP_K
 
 
-def test_park_head_anchor_drift_refreshes_before_spacing():
-    """Park SP must follow a collapsing head internal (27→24) within one tick min."""
+def test_park_head_anchor_does_not_chase_positive_depth():
+    """Positive park depth must not re-anchor to a falling internal sensor.
+
+    Old contract followed internal 27->24 within a tick; that descending
+    ladder is what took West 22.9->21.0 in 8 min (a fan cannot do -14 K/h).
+    Chase (negative depth) still re-anchors - see test_chase_head_anchor.
+    """
     satisfied, hot, state = _two_zone_setup(
         park_residuals=True, park_extraction_w=200.0, standing_load_w=100.0
     )
     tick([satisfied, hot], state)
     margin = state.zone_park_margin["sat"]
-    # Entry commanded SP≈29 at internal 27; head has since fallen to 24.
     drifted = make_zone(
         "sat",
         23.0,
@@ -691,9 +731,22 @@ def test_park_head_anchor_drift_refreshes_before_spacing():
     later = NOW + controller.HEAD_REANCHOR_MIN_S + 1.0
     state.zone_last_cmd["sat"] = NOW  # well inside COMMAND_SPACING_S
     decision = tick([drifted, hot], state, now=later)
-    cmd = find_cmd(decision, "sat")
-    assert cmd is not None and cmd.park is True
-    assert cmd.park_margin == margin
+    assert find_cmd(decision, "sat") is None
+
+
+def test_chase_head_anchor_drift_refreshes_before_spacing():
+    zone = make_zone(
+        "hot",
+        25.0,
+        is_on=True,
+        head_internal_temp=24.0,
+        device_setpoint=24.0,
+    )
+    state = ControllerState()
+    state.zone_last_cmd["hot"] = NOW
+    later = NOW + controller.HEAD_REANCHOR_MIN_S + 1.0
+    assert controller._depth_command_due(state, "hot", later, zone, -0.5, MODE_COOL)
+    assert not controller._depth_command_due(state, "hot", later, zone, 3.0, MODE_COOL)
 
 
 def test_margin_exhaustion_holds_at_ceiling():
@@ -1104,6 +1157,44 @@ def test_residual_hold_margin_prefers_deepest_compressing_bin():
     assert est.fan_type_min_margin_k() == 3.0
     # Edge bisects between the two to finer-than-0.5 K resolution.
     assert est.residual_edge_k() == 2.75
+
+
+def test_residual_max_ignores_duty_high_idle_extraction():
+    """Sibling house duty must not make a 0 W bin the residual ceiling."""
+    est = ParkEstimator()
+    for _ in range(CLASSIFY_MIN_SAMPLES):
+        est.update(0.0, True, margin_k=3.0)
+    for _ in range(CLASSIFY_MIN_SAMPLES):
+        est.update(370.0, True, margin_k=0.5)
+    assert est.residual_max_margin_k() == 0.5
+
+
+def test_unknown_extraction_is_not_residual_max():
+    est = ParkEstimator()
+    for _ in range(CLASSIFY_MIN_SAMPLES):
+        est.update(40.0, True, margin_k=1.5)
+    assert est.residual_max_margin_k() is None
+
+
+def test_from_dict_keeps_idle_bins_and_caps_preferred():
+    """Idle high-duty bins are ceiling evidence, not deleted on restore.
+
+    Dropping them made ``_mapped_without_residual`` false after restart and
+    the hysteresis ceiling returned to DEPTH_MAX (3.0). A latched 3.0
+    preferred on an idle-only map would re-enter at 2.5.
+    """
+    idle_only = ParkEstimator.from_dict(
+        {"margin_bins": {"3.0": [0.0, 0.9, 20]}, "preferred_margin_k": 3.0}
+    )
+    assert "3.0" in idle_only.margin_bins
+    assert idle_only.residual_max_margin_k() is None
+    assert idle_only.preferred_margin_k == 1.0
+
+    mixed = ParkEstimator.from_dict(
+        {"margin_bins": {"3.0": [0.0, 0.38, 20], "0.5": [370.0, 0.9, 20]}}
+    )
+    assert "3.0" in mixed.margin_bins
+    assert mixed.residual_max_margin_k() == 0.5
 
 
 def test_residual_edge_falls_back_without_a_clean_pair():

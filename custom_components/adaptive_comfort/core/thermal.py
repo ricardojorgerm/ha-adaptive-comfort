@@ -210,16 +210,23 @@ def house_other_temperature(
     return total / weight
 
 
-def _phi(delta_out_in: float, delta_house_in: float, local_hour: float) -> list[float]:
+def _phi(
+    delta_out_in: float,
+    delta_house_in: float,
+    local_hour: float,
+    solar_scale: float = 1.0,
+) -> list[float]:
+    """Regressors: k_out, k_mix, a0, then clear-sky harmonics * contemporaneous clearness."""
+    scale = min(max(float(solar_scale), 0.0), 1.0)
     wt = OMEGA * local_hour
     return [
         delta_out_in,
         delta_house_in,
         1.0,
-        math.cos(wt),
-        math.sin(wt),
-        math.cos(2 * wt),
-        math.sin(2 * wt),
+        scale * math.cos(wt),
+        scale * math.sin(wt),
+        scale * math.cos(2 * wt),
+        scale * math.sin(2 * wt),
     ]
 
 
@@ -281,6 +288,7 @@ class ThermalModel:
         *,
         indoor_fans_on: bool = False,
         outdoor_exhaust_on: bool = False,
+        solar_scale: float = 1.0,
     ) -> float | None:
         """One free-response sample (heads fully off). Returns residual [K/h]."""
         if dt_h <= 0:
@@ -295,7 +303,7 @@ class ThermalModel:
         if indoor_fans_on:
             delta_house *= INDOOR_FAN_K_MIX_MULT
         fit = self.fits[door_open]
-        residual = fit.update(_phi(delta_out, delta_house, local_hour), y)
+        residual = fit.update(_phi(delta_out, delta_house, local_hour, solar_scale), y)
         fit.theta[0] = min(max(fit.theta[0], K_MIN), K_MAX)
         fit.theta[1] = min(max(fit.theta[1], K_MIX_MIN), K_MIX_MAX)
         return residual
@@ -582,8 +590,13 @@ class ThermalModel:
         include_transient: bool = True,
         solar_scale: float = 1.0,
         rain_sink_k_per_h: float = 0.0,
+        q_hvac_k_per_h: float = 0.0,
     ) -> float:
-        """No-AC dT/dt [K/h] — same rate model `predict_free` integrates."""
+        """No-AC dT/dt [K/h] — same rate model `predict_free` integrates.
+
+        ``q_hvac_k_per_h`` is an optional AC overlay (Q_ac / c_eff) used to
+        score a min_on run against free-float. Default 0 is free-float.
+        """
         k_out, k_mix = self._scaled_k(
             door_open,
             indoor_fans_on=indoor_fans_on,
@@ -597,7 +610,7 @@ class ThermalModel:
             rain_sink_k_per_h=rain_sink_k_per_h,
             include_transient=include_transient,
         )
-        return k_out * (t_out - t_in) + mix + q
+        return k_out * (t_out - t_in) + mix + q + float(q_hvac_k_per_h)
 
     def sensible_power_w(
         self,
@@ -610,6 +623,8 @@ class ThermalModel:
         *,
         indoor_fans_on: bool = False,
         outdoor_exhaust_on: bool = False,
+        solar_scale: float = 1.0,
+        rain_sink_k_per_h: float = 0.0,
     ) -> float:
         """Heat added by the AC (signed W; negative while cooling).
 
@@ -625,6 +640,8 @@ class ThermalModel:
             t_house_other,
             indoor_fans_on=indoor_fans_on,
             outdoor_exhaust_on=outdoor_exhaust_on,
+            solar_scale=solar_scale,
+            rain_sink_k_per_h=rain_sink_k_per_h,
         )
         return self.c_eff_wh_per_k * excess
 
@@ -639,6 +656,10 @@ class ThermalModel:
         alpha: float = 0.05,
         dtdt_per_h: float = 0.0,
         latent_w: float = 0.0,
+        *,
+        indoor_fans_on: bool = False,
+        outdoor_exhaust_on: bool = False,
+        solar_scale: float = 1.0,
     ) -> None:
         if p_ac_w < 50.0:
             return
@@ -646,7 +667,17 @@ class ThermalModel:
         # compressor work (omitting it undercounted COP by the latent share,
         # ~30-50% in humid rooms).
         q_hvac = abs(
-            self.sensible_power_w(t_in, t_out, dtdt_per_h, local_hour, door_open, t_house_other)
+            self.sensible_power_w(
+                t_in,
+                t_out,
+                dtdt_per_h,
+                local_hour,
+                door_open,
+                t_house_other,
+                indoor_fans_on=indoor_fans_on,
+                outdoor_exhaust_on=outdoor_exhaust_on,
+                solar_scale=solar_scale,
+            )
         ) + max(0.0, latent_w)
         cop = q_hvac / p_ac_w
         if not (COP_MIN <= cop <= COP_MAX):
@@ -671,6 +702,7 @@ class ThermalModel:
         *,
         indoor_fans_on: bool = False,
         outdoor_exhaust_on: bool = False,
+        solar_scale: float = 1.0,
     ) -> None:
         if p_ac_w < 50.0:
             return
@@ -685,6 +717,7 @@ class ThermalModel:
             t_house_other,
             indoor_fans_on=indoor_fans_on,
             outdoor_exhaust_on=outdoor_exhaust_on,
+            solar_scale=solar_scale,
         )
         if abs(excess) < 0.1:
             return
@@ -718,6 +751,7 @@ class ThermalModel:
         outdoor_exhaust_on: bool = False,
         solar_scale_hourly: list[float] | None = None,
         rain_sink_hourly: list[float] | None = None,
+        q_hvac_k_per_h: float = 0.0,
     ) -> list[float]:
         """Euler-integrated free-float trajectory; returns hourly samples."""
         if not t_out_hourly:
@@ -750,7 +784,7 @@ class ThermalModel:
                 solar_scale=_hourly_at(solar_scale_hourly, elapsed, 1.0),
                 rain_sink_k_per_h=_hourly_at(rain_sink_hourly, elapsed, 0.0),
             )
-            t += step_h * (k_out * (t_out - t) + mix_term + q)
+            t += step_h * (k_out * (t_out - t) + mix_term + q + q_hvac_k_per_h)
             elapsed += step_h
         return temps
 
@@ -768,6 +802,7 @@ class ThermalModel:
         outdoor_exhaust_on: bool = False,
         solar_scale_hourly: list[float] | None = None,
         rain_sink_hourly: list[float] | None = None,
+        q_hvac_k_per_h: float = 0.0,
     ) -> dict[int, float]:
         """Predicted temperature at each of `horizons_min` minutes ahead.
 
@@ -810,7 +845,7 @@ class ThermalModel:
                     solar_scale=_hourly_at(solar_scale_hourly, elapsed, 1.0),
                     rain_sink_k_per_h=_hourly_at(rain_sink_hourly, elapsed, 0.0),
                 )
-                t += step_h * (k_out * (t_out - t) + mix_term + q)
+                t += step_h * (k_out * (t_out - t) + mix_term + q + q_hvac_k_per_h)
                 elapsed += step_h
             out[targets[target_i]] = t
             target_i += 1

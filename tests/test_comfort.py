@@ -208,10 +208,11 @@ def test_dominant_mode_deadband_idles():
 
 
 def test_dominant_mode_dwell_blocks_flip():
+    """A cold room while already cool must not become heat inside MODE_DWELL."""
     state = ControllerState()
     state.mode = MODE_COOL
     state.mode_since = 1_000_000.0 - 3600.0  # only 1 h in cool
-    zone = make_zone(free_float=[19.0] * 24)  # now demands heat
+    zone = make_zone(free_float=[19.0] * 24)  # now looks like heat
     snap = make_snapshot([zone])
     decision = comfort.dominant_mode(snap, state, {"z1": (21.8, 23.2)})
     assert decision.mode == MODE_COOL
@@ -408,3 +409,44 @@ def test_indoor_deviation_aux_weighting():
     dev = comfort.indoor_deviation(zones, bands, aux_indoor=((26.0, 1.0),))
     # zone dev = +0.5, aux dev = +3.5 equally weighted -> 2.0
     assert abs(dev - 2.0) < 1e-9
+
+
+def test_recently_cooled_zone_skips_cold_after_idle():
+    """West 27 Aug: heads idle after park, last_cool still recent → not heat.
+
+    House ``state.mode == cool`` must not blank every zone (a never-cooled
+    19 °C room while the plant is cool still scores cold so dwell can hold).
+    """
+    now = 1_000_000.0
+    zone = make_zone(
+        zone_id="west",
+        temp=21.0,
+        free_float=[21.0] * 24,
+        head_mode=None,
+        is_on=False,
+    )
+    bands = {"west": (21.8, 23.2)}
+    state = ControllerState()
+    state.mode = MODE_COOL
+    state.zone_last_cool["west"] = now - 600.0
+    _warm, cold = comfort.demand_integrals([zone], bands, state=state, now_ts=now)
+    assert cold == 0.0
+    state.zone_last_cool["west"] = now - 7200.0
+    _w2, cold2 = comfort.demand_integrals([zone], bands, state=state, now_ts=now)
+    assert cold2 > 0.0
+
+
+def test_uncooled_cold_room_scores_heat_while_house_is_cool():
+    """Plant-wide skip was wrong: a room we never cooled must still score cold."""
+    now = 1_000_000.0
+    zone = make_zone(
+        zone_id="north",
+        temp=19.0,
+        free_float=[19.0] * 24,
+        head_mode=None,
+        is_on=False,
+    )
+    state = ControllerState()
+    state.mode = MODE_COOL
+    _warm, cold = comfort.demand_integrals([zone], {"north": (21.8, 23.2)}, state=state, now_ts=now)
+    assert cold > 0.0
