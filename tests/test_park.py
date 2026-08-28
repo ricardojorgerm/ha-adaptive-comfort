@@ -1506,6 +1506,24 @@ def test_clear_park_session_pops_head_depth():
     assert "z1" not in state.zone_park_margin
 
 
+def test_head_depth_keeps_chase_floor_distinct_from_hold():
+    from custom_components.adaptive_comfort.core.head_depth import HeadDepth
+
+    state = ControllerState()
+    hd = HeadDepth(state, "z1")
+    state.zone_track_delta["z1"] = 0.7
+    assert hd.chase_floor == -0.5
+    synced = hd.sync(1.5, NOW)
+    assert synced == 1.5
+    assert hd.current == 1.5
+    assert hd.hold_since == NOW
+    assert state.zone_park_margin["z1"] == 1.5
+    assert state.zone_track_delta["z1"] >= controller.TRACK_DELTA_MIN_K
+    hd.clear_hold()
+    assert hd.current is None
+    assert hd.hold_since is None
+
+
 def test_stale_positive_depth_on_hot_zone_chases():
     """Leftover +depth without a park session must not hold a hot room."""
     bins = _residual_bins(**{"2.0": 200.0})

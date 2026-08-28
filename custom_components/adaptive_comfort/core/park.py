@@ -74,7 +74,7 @@ FAN_FLOOR_PER_HEAD_W = 55.0
 # not flip duty.
 PARK_DUTY_DEBOUNCE_S = 60.0
 MARGIN_BIN_K = 0.5
-# Default / bounds kept in sync with controller.PARK_MARGIN_* .
+# Default / bounds re-exported as controller.PARK_MARGIN_* from MARGIN_*.
 DEFAULT_MARGIN_K = 1.0
 MARGIN_MIN_K = 1.0
 MARGIN_MAX_K = 3.0

@@ -16,6 +16,22 @@ from .cop_timing import (
     _outside_base_band_on_widen_side,
     _update_cop_widen,
 )
+from .head_depth import (
+    DEPTH_MAX_K,
+    DEPTH_STEP_K,
+    PARK_MARGIN_K,
+    PARK_MARGIN_MAX_K,
+    PARK_MARGIN_STEP_K,
+    TRACK_DELTA_DEFAULT_K,
+    TRACK_DELTA_MAX_K,
+    TRACK_DELTA_MIN_K,
+    TRACK_DELTA_STEP_K,
+    _chase_floor_k,
+    _clamp_depth,
+    _clear_park_session,
+    _quantize_depth,
+    _sync_depth_views,
+)
 from .park import (
     CLASSIFY_MIN_SAMPLES,
     LOAD_COVER_FRACTION,
@@ -86,22 +102,6 @@ SETPOINT_EPSILON_K = 0.25
 # descending ladder (West 22.9→21.0), including the 180 s spacing refresh.
 HEAD_REANCHOR_MIN_S = 60.0
 HEAD_REANCHOR_EPS_K = 0.5
-# Tracking setpoint control: the commanded device setpoint follows the head's
-# internal sensor at a small depth below it (cooling), keeping the inverter's
-# perceived error small and constant. The depth adapts to room-frame progress.
-TRACK_DELTA_MIN_K = 0.5  # aligned to half-degree depth grid (was 0.3)
-TRACK_DELTA_MAX_K = 2.5
-TRACK_DELTA_STEP_K = 0.5
-TRACK_DELTA_DEFAULT_K = 0.5
-# Signed head-depth continuum (cool SP = internal + depth_k).
-# Absolute hard rails; live adapt clamps to chase-floor / COP-useful ceiling.
-DEPTH_STEP_K = 0.5
-DEPTH_MAX_K = 3.0  # = PARK_MARGIN_MAX_K
-DEPTH_MIN_K = -TRACK_DELTA_MAX_K
-# Parked-head characterization/exploitation: setpoint margin above the
-# internal reading, minimum dwell in/out of the parked state, probe length
-# and per-zone probe spacing while behavior is still unclassified.
-PARK_MARGIN_K = 1.0
 # Zones normally exit demand at the band floor, so a freshly parked room sits
 # AT lo by construction. The overcorrection release must therefore sit a
 # buffer BELOW the floor - otherwise every park dies on its first tick (as
@@ -260,8 +260,6 @@ def _apply_quiet_night(
     return demand, helpers, deferred, cover_id
 
 
-PARK_MARGIN_MAX_K = 3.0
-PARK_MARGIN_STEP_K = 0.5
 # Enter each park one step below the learned preferred depth (still >=
 # PARK_MARGIN_K so the setpoint stays on the park side of the internal
 # reading). Re-proves the hold without overshooting from a stale high-water.
@@ -890,17 +888,6 @@ def _depth_command_due(
     )
 
 
-def _quantize_depth(depth_k: float) -> float:
-    return round(float(depth_k) / DEPTH_STEP_K) * DEPTH_STEP_K
-
-
-def _chase_floor_k(state: ControllerState, zid: str) -> float:
-    """Under-conditioning extreme: -tracking chase on the 0.5 K grid."""
-    chase = state.zone_track_delta.get(zid, TRACK_DELTA_DEFAULT_K)
-    chase = min(max(float(chase), TRACK_DELTA_MIN_K), TRACK_DELTA_MAX_K)
-    return -_quantize_depth(chase)
-
-
 def _mapped_without_residual(zone: ZoneSnapshot) -> bool:
     """Hysteresis map has samples but no residual bin (idle / unknown only)."""
     if zone.park_residual_max_margin_k is not None:
@@ -974,45 +961,6 @@ def _overshoot_ceiling_k(
     if zone.park_current_is_fan_type is True:
         return max(mapped, _quantize_depth(depth_k))
     return DEPTH_MAX_K
-
-
-def _clamp_depth(depth_k: float, lo: float | None = None, hi: float | None = None) -> float:
-    stepped = _quantize_depth(depth_k)
-    lo_b = DEPTH_MIN_K if lo is None else float(lo)
-    hi_b = DEPTH_MAX_K if hi is None else float(hi)
-    if lo_b > hi_b:
-        lo_b, hi_b = hi_b, lo_b
-    return min(max(stepped, lo_b), hi_b)
-
-
-def _sync_depth_views(
-    state: ControllerState,
-    zid: str,
-    depth_k: float,
-    now: float,
-    *,
-    lo: float | None = None,
-    hi: float | None = None,
-) -> float:
-    """Persist signed depth and mirror park_margin / track_delta views."""
-    depth = _clamp_depth(depth_k, lo, hi)
-    state.zone_head_depth_k[zid] = depth
-    if depth > 0.0:
-        state.zone_park_margin[zid] = depth
-        if zid not in state.zone_parked_since:
-            state.zone_parked_since[zid] = now
-        # Positive hold: keep chase target at least the grid default.
-        state.zone_track_delta[zid] = max(
-            state.zone_track_delta.get(zid, TRACK_DELTA_DEFAULT_K), TRACK_DELTA_MIN_K
-        )
-    else:
-        state.zone_track_delta[zid] = abs(depth) if depth < 0.0 else TRACK_DELTA_MIN_K
-        if zid in state.zone_parked_since:
-            # Left positive hysteresis — drop learning session without probe charge.
-            state.zone_park_probe_entry.pop(zid, None)
-            state.zone_parked_since.pop(zid, None)
-            state.zone_park_margin.pop(zid, None)
-    return depth
 
 
 def _extraction_none_at_depth(zone: ZoneSnapshot, depth_k: float) -> bool:
@@ -1190,26 +1138,6 @@ def _settle_park_preferred(state: ControllerState, zid: str, margin: float) -> N
     state.zone_park_preferred[zid] = min(
         max(prev + MARGIN_SETTLE_ALPHA * (m - prev), PARK_MARGIN_K), PARK_MARGIN_MAX_K
     )
-
-
-def _clear_park_session(
-    state: ControllerState, zid: str, zone: ZoneSnapshot | None = None, now: float = 0.0
-) -> None:
-    # Probe bookkeeping: the 6 h probe spacing is only charged when the probe
-    # produced at least one observation; a stillborn / unexpressible probe
-    # (zone is None, or no new samples) gets the short retry clock instead.
-    entry_samples = state.zone_park_probe_entry.pop(zid, None)
-    if entry_samples is not None:
-        if zone is not None and zone.park_samples > entry_samples:
-            state.zone_last_park_probe[zid] = now
-            state.zone_last_park_abort.pop(zid, None)
-        else:
-            state.zone_last_park_abort[zid] = now
-            state.zone_last_park_probe.pop(zid, None)
-    state.zone_parked_since.pop(zid, None)
-    state.zone_park_ref.pop(zid, None)
-    state.zone_park_margin.pop(zid, None)
-    state.zone_head_depth_k.pop(zid, None)
 
 
 def _opposite_deviation(zone: ZoneSnapshot, lo: float, hi: float, mode: str) -> float:
@@ -2659,13 +2587,7 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                         floor = _chase_floor_k(state, zid)
                         ceiling = _overshoot_ceiling_k(zone, state, depth_k, walk=walk)
                         depth_k = _sync_depth_views(state, zid, depth_k, now, lo=floor, hi=ceiling)
-                        if zid not in state.zone_parked_since:
-                            state.zone_park_preferred.setdefault(zid, _park_preferred(zone, state))
-                            diag.setdefault("depth_residual", []).append(zid)
-                        else:
-                            depth_k = state.zone_head_depth_k.get(
-                                zid, state.zone_park_margin.get(zid, depth_k)
-                            )
+                        state.zone_park_preferred.setdefault(zid, _park_preferred(zone, state))
                     else:
                         floor = _chase_floor_k(state, zid)
                         ceiling = _overshoot_ceiling_k(zone, state, depth_k, walk=walk)
