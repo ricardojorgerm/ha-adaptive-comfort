@@ -177,6 +177,14 @@ def _head_state(hass: HomeAssistant, entity_id: str) -> str:
     return STATE_STANDBY
 
 
+def _command_is_positive_hold(command: Command) -> bool:
+    """True when this command asks for a frozen positive-depth (park) hold."""
+    if command.park:
+        return True
+    d = command.head_depth_k
+    return d is not None and float(d) > 0.0
+
+
 class ZoneRuntime:
     """Live state for one zone."""
 
@@ -1990,16 +1998,22 @@ class AdaptiveComfortRuntime:
         self.controller_state.zone_track_delta.clear()
 
     def _clear_park_sessions(self) -> None:
-        """Drop in-flight parks (Manual enter — not commanding)."""
+        """Drop in-flight holds (Manual enter — not commanding)."""
         from .core.controller import _clear_park_session
 
         now = time.time()
-        for zid in list(self.controller_state.zone_parked_since):
+        st = self.controller_state
+        # Leftover positive depth without parked_since is the B1 restart
+        # hazard; chase depth also goes so Manual does not resume a hold.
+        zids = set(st.zone_parked_since) | set(st.zone_head_depth_k)
+        for zid in zids:
             # zone=None: drop session without charging probe spacing.
-            _clear_park_session(self.controller_state, zid, None, now)
+            _clear_park_session(st, zid, None, now)
             zone = self.zones.get(zid)
             if zone is not None:
                 zone.park_power.reset()
+                zone.last_hold_depth_k = None
+                zone.last_hold_device_sp = None
 
     def set_preset(self, preset: str) -> None:
         """Apply a climate preset; Manual clears track/park and remembers prior preset."""
@@ -2171,6 +2185,7 @@ class AdaptiveComfortRuntime:
         zone = self.zones.get(command.zone_id)
         if zone is None:
             return
+        hold = _command_is_positive_hold(command)
         park_expressed = False
         if command.hvac_mode == MODE_OFF:
             zone.last_hold_depth_k = None
@@ -2209,7 +2224,7 @@ class AdaptiveComfortRuntime:
                 # Signed head depth: cool SP = internal + depth, heat =
                 # internal - depth. Positive = hysteresis hold; negative = chase.
                 if command.head_depth_k is not None and isinstance(internal, (int, float)):
-                    if command.park or command.head_depth_k > 0.0:
+                    if hold:
                         park_expressed = True
                     depth = float(command.head_depth_k)
                     if depth > 0.0:
@@ -2238,8 +2253,9 @@ class AdaptiveComfortRuntime:
                         zone.last_hold_device_sp,
                         zone.last_hold_depth_k,
                     )
-                elif command.park:
-                    # This head has no internal reading; try sibling heads.
+                elif hold:
+                    # Positive hold without a usable internal must not fall
+                    # through to static drift (West re-anchor / wrong frame).
                     continue
                 elif command.track_delta is not None and isinstance(internal, (int, float)):
                     # Tracking control: anchor to the live internal reading so
@@ -2287,12 +2303,14 @@ class AdaptiveComfortRuntime:
                 )
             except Exception:
                 _LOGGER.exception("Failed to command %s", head)
-        if command.park and not park_expressed:
-            # No head could express the park — drop session so the learner does
+        if hold and not park_expressed:
+            # No head could express the hold — drop session so the learner does
             # not attribute observations to a park that never executed.
             from .core.controller import _clear_park_session
 
             _clear_park_session(self.controller_state, command.zone_id, None, time.time())
+            zone.last_hold_depth_k = None
+            zone.last_hold_device_sp = None
 
     # -- entity-facing helpers ------------------------------------------------------
 
