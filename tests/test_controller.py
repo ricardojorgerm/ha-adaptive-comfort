@@ -1068,11 +1068,21 @@ def test_present_oob_wrong_sign_q_hvac_still_starts():
 
 def test_eco_quiet_night_does_not_condition_hold():
     """Eco/Away/Boost skip quiet-night; Eco must not bank the cold edge."""
-    from custom_components.adaptive_comfort.core.types import PRESET_ECO, PRESET_NONE
+    from custom_components.adaptive_comfort.core.types import (
+        PRESET_AWAY,
+        PRESET_ECO,
+        PRESET_NONE,
+    )
 
     eco = Settings(
         hvac_mode=MODE_COOL,
         preset=PRESET_ECO,
+        zone_quiet_night={"bed": True},
+        adaptive_blend=0.0,
+    )
+    away = Settings(
+        hvac_mode=MODE_COOL,
+        preset=PRESET_AWAY,
         zone_quiet_night={"bed": True},
         adaptive_blend=0.0,
     )
@@ -1087,12 +1097,17 @@ def test_eco_quiet_night_does_not_condition_hold():
     eco_d = controller.tick(
         make_snapshot([bed, east], eco, local_hour=20.5), warmed_state([bed, east])
     )
+    away_d = controller.tick(
+        make_snapshot([bed, east], away, local_hour=20.5), warmed_state([bed, east])
+    )
     none_d = controller.tick(
         make_snapshot([bed, east], none, local_hour=20.5), warmed_state([bed, east])
     )
     assert "bed" in none_d.diag.get("quiet_night_bank", [])
     assert not eco_d.diag.get("quiet_night_bank")
     assert not eco_d.diag.get("quiet_night_deferred")
+    assert not away_d.diag.get("quiet_night_bank")
+    assert not away_d.diag.get("quiet_night_deferred")
     eco_cmd = next((c for c in eco_d.commands if c.zone_id == "bed"), None)
     none_cmd = next((c for c in none_d.commands if c.zone_id == "bed"), None)
     assert none_cmd is not None and none_cmd.setpoint is not None

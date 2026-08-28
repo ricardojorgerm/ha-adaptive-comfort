@@ -55,11 +55,20 @@ class HeadDepth:
         *,
         lo: float | None = None,
         hi: float | None = None,
+        zone: ZoneSnapshot | None = None,
     ) -> float:
-        """Persist signed depth and mirror park_margin / track_delta views."""
+        """Persist signed depth and mirror park_margin / track_delta views.
+
+        Leaving a hold (``depth <= 0`` while ``parked_since`` is set) goes
+        through ``clear_hold`` so probe budget / abort clocks fire. A bare
+        pop of ``zone_parked_since`` would skip those clocks and leak
+        ``zone_park_ref``.
+        """
         depth = clamp_depth(depth_k, lo, hi)
         zid = self.zid
         state = self.state
+        if depth <= 0.0 and zid in state.zone_parked_since:
+            self.clear_hold(zone, now)
         state.zone_head_depth_k[zid] = depth
         if depth > 0.0:
             state.zone_park_margin[zid] = depth
@@ -70,10 +79,6 @@ class HeadDepth:
             )
         else:
             state.zone_track_delta[zid] = abs(depth) if depth < 0.0 else TRACK_DELTA_MIN_K
-            if zid in state.zone_parked_since:
-                state.zone_park_probe_entry.pop(zid, None)
-                state.zone_parked_since.pop(zid, None)
-                state.zone_park_margin.pop(zid, None)
         return depth
 
     def clear_hold(self, zone: ZoneSnapshot | None = None, now: float = 0.0) -> None:
@@ -127,8 +132,9 @@ def _sync_depth_views(
     *,
     lo: float | None = None,
     hi: float | None = None,
+    zone: ZoneSnapshot | None = None,
 ) -> float:
-    return HeadDepth(state, zid).sync(depth_k, now, lo=lo, hi=hi)
+    return HeadDepth(state, zid).sync(depth_k, now, lo=lo, hi=hi, zone=zone)
 
 
 def _clear_park_session(

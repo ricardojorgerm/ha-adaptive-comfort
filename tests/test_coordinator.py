@@ -140,6 +140,35 @@ def test_execute_hold_uses_sibling_with_internal():
     assert temps == {(other, 21.5)}
 
 
+def test_execute_both_heads_step_depth_from_frozen_sp():
+    """Both heads share the zone's last commanded SP; Δdepth steps that freeze."""
+    other = "climate.b"
+    climates = {HEAD: _climate(20.0), other: _climate(20.0)}
+    rt, _zone = _runtime(climates, heads=(HEAD, other))
+    cmd = Command("z", MODE_COOL, 23.0, "park", head_depth_k=1.0)
+    asyncio.run(AdaptiveComfortRuntime._async_execute(rt, cmd))
+    assert sorted(_setpoints(rt)) == [21.0, 21.0]
+
+    rt.hass.states.get = {HEAD: _climate(18.0), other: _climate(18.0)}.get
+    rt._calls.clear()
+    cmd = Command("z", MODE_COOL, 23.0, "park", head_depth_k=1.5)
+    asyncio.run(AdaptiveComfortRuntime._async_execute(rt, cmd))
+    assert sorted(_setpoints(rt)) == [21.5, 21.5]
+
+
+def test_execute_hold_survives_when_two_of_three_heads_express():
+    other, third = "climate.b", "climate.c"
+    climates = {HEAD: _climate(None), other: _climate(20.0), third: _climate(20.0)}
+    rt, _zone = _runtime(climates, heads=(HEAD, other, third))
+    rt.controller_state.zone_parked_since["z"] = 1.0
+    rt.controller_state.zone_head_depth_k["z"] = 1.5
+    cmd = Command("z", MODE_COOL, 23.0, "park", head_depth_k=1.5)
+    asyncio.run(AdaptiveComfortRuntime._async_execute(rt, cmd))
+    entities = {data["entity_id"] for _d, svc, data in rt._calls if svc == "set_temperature"}
+    assert entities == {other, third}
+    assert "z" in rt.controller_state.zone_parked_since
+
+
 def test_manual_enter_clears_leftover_depth_without_session():
     """B1 leftover: positive depth with no parked_since still drops on Manual."""
     rt, zone = _runtime()

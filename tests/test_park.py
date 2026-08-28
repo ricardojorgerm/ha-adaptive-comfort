@@ -1555,6 +1555,41 @@ def test_head_depth_keeps_chase_floor_distinct_from_hold():
     assert hd.hold_since is None
 
 
+def test_sync_to_chase_charges_observed_probe_and_clears_ref():
+    """Leaving hold via sync must use clear_hold (probe budget + park_ref)."""
+    from custom_components.adaptive_comfort.core.head_depth import HeadDepth
+
+    state = ControllerState()
+    zone = make_zone("z1", 23.0, park_samples=4)
+    hd = HeadDepth(state, "z1")
+    hd.sync(1.5, NOW, zone=zone)
+    state.zone_park_probe_entry["z1"] = 0
+    state.zone_park_ref["z1"] = 23.0
+    later = NOW + 60.0
+    hd.sync(-0.5, later, zone=zone)
+    assert hd.current == -0.5
+    assert hd.hold_since is None
+    assert "z1" not in state.zone_park_ref
+    assert "z1" not in state.zone_park_probe_entry
+    assert state.zone_last_park_probe["z1"] == later
+    assert "z1" not in state.zone_last_park_abort
+
+
+def test_sync_to_chase_aborts_stillborn_probe():
+    from custom_components.adaptive_comfort.core.head_depth import HeadDepth
+
+    state = ControllerState()
+    zone = make_zone("z1", 23.0, park_samples=0)
+    hd = HeadDepth(state, "z1")
+    hd.sync(1.5, NOW, zone=zone)
+    state.zone_park_probe_entry["z1"] = 0
+    later = NOW + 60.0
+    hd.sync(-0.5, later, zone=zone)
+    assert hd.current == -0.5
+    assert state.zone_last_park_abort["z1"] == later
+    assert "z1" not in state.zone_last_park_probe
+
+
 def test_stale_positive_depth_on_hot_zone_chases():
     """Leftover +depth without a park session must not hold a hot room."""
     bins = _residual_bins(**{"2.0": 200.0})
@@ -1587,6 +1622,35 @@ def test_stale_positive_depth_on_hot_zone_chases():
     assert "z1" not in d.diag.get("parked", [])
 
 
+def test_stale_positive_depth_in_band_does_not_resurrect_session():
+    """Leftover +depth without parked_since must not recreate a hold in-band."""
+    zone = replace(
+        make_zone(
+            "z1",
+            22.6,
+            is_on=True,
+            park_residuals=False,
+            standing_load_w=100.0,
+        ),
+        free_float=tuple([24.5] * 24),
+    )
+    settings = Settings(
+        hvac_mode=MODE_COOL,
+        target=23.0,
+        adaptive_blend=0.0,
+        band_k=1.0,
+        tracking=True,
+        park_learning=True,
+    )
+    state = warmed_state([zone])
+    state.zone_on["z1"] = True
+    state.zone_head_depth_k["z1"] = 1.5
+    d = tick([zone], state, settings=settings)
+    assert "z1" not in state.zone_parked_since
+    cmd = find_cmd(d, "z1")
+    assert not holding(cmd)
+
+
 def test_hold_device_setpoint_monotone_on_falling_internal():
     first = controller.hold_device_setpoint(22.9, 1.5, MODE_COOL, None, None)
     assert first == 24.4
@@ -1595,6 +1659,8 @@ def test_hold_device_setpoint_monotone_on_falling_internal():
     assert held == first
     stepped = controller.hold_device_setpoint(21.0, 2.0, MODE_COOL, first, 1.5)
     assert stepped == first + 0.5
+    stepped_down = controller.hold_device_setpoint(21.0, 1.0, MODE_COOL, first, 1.5)
+    assert stepped_down == first - 0.5
     heat = controller.hold_device_setpoint(20.0, 2.0, MODE_HEAT, 18.0, 1.5)
     assert heat == 17.5
 

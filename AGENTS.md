@@ -52,9 +52,10 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   cool `internal + depth`, heat `internal − depth`; negative = chase track,
   positive = hysteresis hold). **Positive depth is a frozen device SP**: do
   not re-anchor `SP = internal + depth` against a falling supply-air reading
-  (West 22.9 → 21.0). Depth *value* may still step (`force` when it differs
-  from last commanded); for `d > 0` the emitted SP stays monotone on the
-  satisfied side of the last commanded SP. Negative depth re-anchors every
+  (West 22.9 → 21.0). While depth is unchanged the emitted device SP stays at
+  the last commanded value. When depth steps (`force`), SP moves by Δdepth from
+  that last commanded SP (cool: `last_sp + Δd`; a step-down can move toward
+  internal). Negative depth re-anchors every
   `COMMAND_SPACING_S` or sooner when `|device_SP − ideal| ≥ HEAD_REANCHOR_EPS_K`
   after `HEAD_REANCHOR_MIN_S`. Static `DriftEstimator.offset(state)` is the
   fallback. Never translate anywhere else.
