@@ -112,6 +112,9 @@ PARK_PROBE_RETRY_S = 1800.0
 # Pre-sleep window: bank a quiet-night zone to the conditioning hold edge
 # of the existing band (cool lo / heat hi), then night prefers other zones.
 QUIET_NIGHT_BANK_H = 2.0
+# Sleeper-only extra half-band while deferred (center fixed). Cover and
+# pre-sleep bank keep the tight band; 0.5 K is the missing-coil slack.
+QUIET_NIGHT_WIDEN_K = 0.5
 COP_ADVANCE_HORIZON_H = 4.0  # predictive entry may look this far when advancing
 COP_DEFER_HORIZON_H = 1.0  # defer: only near breaches fire predictively
 
@@ -208,7 +211,7 @@ def _apply_quiet_night(
     *,
     energy_save: bool,
 ) -> tuple[list[ZoneSnapshot], list[ZoneSnapshot], list[str], str | None]:
-    """Prefer other zones at night. Same comfort band as everyone else.
+    """Prefer other zones at night. Sleeper band is slightly wider.
 
     Cover may run to the extended far edge (vacant-widen slack on the
     conditioning side even if occupied). Quiet rooms stay off that path
@@ -260,6 +263,31 @@ def _apply_quiet_night(
     return demand, helpers, deferred, cover_id
 
 
+def _apply_quiet_night_bands(
+    zones: list[ZoneSnapshot],
+    bands: dict[str, tuple[float, float]],
+    s: Settings,
+    snap: HouseSnapshot,
+    mode: str,
+) -> bool:
+    """Widen the sleeper's comfort band while quiet-night is deferring.
+
+    Extra half-band on both edges, center unchanged. Not applied during
+    the pre-sleep bank (that still targets the tight conditioning edge).
+    """
+    if mode not in (MODE_HEAT, MODE_COOL) or QUIET_NIGHT_WIDEN_K <= 0.0:
+        return False
+    changed = False
+    extra = QUIET_NIGHT_WIDEN_K
+    for zone in zones:
+        if not _quiet_night_active(s, zone.zone_id, snap.local_hour, mode):
+            continue
+        lo, hi = bands[zone.zone_id]
+        bands[zone.zone_id] = comfort.clamp_to_envelope(lo - extra, hi + extra, s)
+        changed = True
+    return changed
+
+
 # Enter each park one step below the learned preferred depth (still >=
 # PARK_MARGIN_K so the setpoint stays on the park side of the internal
 # reading). Re-proves the hold without overshooting from a stale high-water.
@@ -274,6 +302,12 @@ PARK_PROBE_SPACING_S = 6.0 * 3600.0
 # exploitation-parking instead of a plain off.
 PARK_LOAD_COVER_FRACTION = LOAD_COVER_FRACTION
 COP_TABLE_ADVANTAGE = 1.05
+# Tevap-loading extra coils: need a clear banded COP gain vs N, not the
+# weaker consolidate/spread 1.05. Missing keys → do not recruit.
+COP_TEVAP_ADVANTAGE = 1.15
+TEVAP_STARTS_MAX = 1.5
+# Zero-hold then one park step. Never chase — the coil is the point.
+TEVAP_HOLD_MAX_K = DEPTH_STEP_K
 
 
 def _cop_n_pair(
@@ -288,6 +322,139 @@ def _cop_n_pair(
     if not banded:
         return None, None
     return banded.get(n_demand), banded.get(n_spread)
+
+
+def _cop_tevap_gate(snap: HouseSnapshot, n_from: int, n_to: int) -> bool:
+    """True when live-band COP at n_to beats n_from by COP_TEVAP_ADVANTAGE."""
+    if n_to <= n_from:
+        return False
+    cop_from, cop_to = _cop_n_pair(snap, n_from, n_to)
+    return (
+        cop_from is not None
+        and cop_to is not None
+        and cop_from > 0.0
+        and cop_to >= cop_from * COP_TEVAP_ADVANTAGE
+    )
+
+
+def _zone_head_count(zones: list[ZoneSnapshot], ids: set[str]) -> int:
+    return sum(z.n_rooms for z in zones if z.zone_id in ids)
+
+
+def _tevap_coil_ok(
+    zone: ZoneSnapshot,
+    lo: float,
+    hi: float,
+    mode: str,
+    *,
+    base_lo: float,
+    base_hi: float,
+    timing: str,
+    widen_k: float,
+) -> bool:
+    """In-band including at-floor; skip rooms already past the overcool buffer."""
+    if zone.temp is None or not zone.enabled:
+        return False
+    if not _park_ok_now(zone, lo, hi, mode):
+        return False
+    return not _unintentional_overshoot(
+        zone, mode, base_lo, base_hi, timing=timing, widen_k=widen_k
+    )
+
+
+def _residual_hold_ids(zones: list[ZoneSnapshot], state: ControllerState) -> set[str]:
+    """Parked coils that still look like compression (not fan-type / idle)."""
+    ids: set[str] = set()
+    for zone in zones:
+        if zone.zone_id in state.shed:
+            continue
+        if zone.zone_id not in state.zone_parked_since:
+            continue
+        if zone.park_current_is_fan_type is True or zone.park_residuals is False:
+            continue
+        ids.add(zone.zone_id)
+    return ids
+
+
+def _tevap_sibling_loaded(
+    live_demand: list[ZoneSnapshot],
+    pack_ids: set[str],
+    helpers: list[ZoneSnapshot],
+    zones: list[ZoneSnapshot],
+    state: ControllerState,
+) -> bool:
+    """True when a sibling is in demand, helper, or residual (compressing) hold."""
+    return bool(live_demand or pack_ids or helpers or _residual_hold_ids(zones, state))
+
+
+def _pick_tevap_helpers(
+    zones: list[ZoneSnapshot],
+    taken: set[str],
+    n_now: int,
+    snap: HouseSnapshot,
+    state: ControllerState,
+    s: Settings,
+    mode: str,
+    bands: dict[str, tuple[float, float]],
+    centers: dict[str, float],
+    *,
+    quiet_ids: set[str],
+    timing: str,
+    widen_k: float,
+    energy_save: bool,
+    energy_wait: bool,
+) -> list[ZoneSnapshot]:
+    """Off (or already Tevap-on) coils whose job is evaporator area, not the room.
+
+    Eligible at the far edge and despite free-ride. Quiet-night zones stay
+    out. Missing banded COP keys, Eco/Away, and the starts/overshoot
+    rollback all refuse.
+    """
+    if (
+        not s.coordination
+        or energy_save
+        or energy_wait
+        or snap.settings.hvac_mode not in (MODE_AUTO, mode)
+        or mode not in (MODE_HEAT, MODE_COOL)
+        or state.tevap_blocked
+    ):
+        return []
+    if snap.starts_per_hour is not None and snap.starts_per_hour > TEVAP_STARTS_MAX:
+        return []
+    candidates: list[ZoneSnapshot] = []
+    for zone in zones:
+        if zone.zone_id in taken or zone.zone_id in quiet_ids or zone.zone_id in state.shed:
+            continue
+        lo, hi = bands[zone.zone_id]
+        base_lo, base_hi = comfort.zone_band(
+            s, centers[zone.zone_id], zone.occupied, snap.house_occupied
+        )
+        if not _tevap_coil_ok(
+            zone,
+            lo,
+            hi,
+            mode,
+            base_lo=base_lo,
+            base_hi=base_hi,
+            timing=timing,
+            widen_k=widen_k,
+        ):
+            continue
+        candidates.append(zone)
+    if not candidates:
+        return []
+    candidates.sort(key=lambda z: (not (z.is_on or state.zone_on.get(z.zone_id, False)), z.zone_id))
+    extra = sum(z.n_rooms for z in candidates)
+    if _cop_tevap_gate(snap, n_now, n_now + extra):
+        return candidates
+    picked: list[ZoneSnapshot] = []
+    n = n_now
+    for zone in candidates:
+        nxt = n + zone.n_rooms
+        if _cop_tevap_gate(snap, n, nxt):
+            picked.append(zone)
+            n = nxt
+    return picked
 
 
 def _energy_save_preset(preset: str) -> bool:
@@ -424,6 +591,8 @@ def _helper_walk_depth(
     hi: float,
     mode: str,
     now: float,
+    *,
+    max_depth_k: float | None = None,
 ) -> float:
     """0, then +0.5 K per re-anchor while useful; hold when stable.
 
@@ -431,12 +600,18 @@ def _helper_walk_depth(
     enters park at +0.5 K. Further steps only if the room is still moving
     toward the far edge (or arriving too fast) and the next bin should
     still compress. Stable in-band helpers stay put so the pack can linger.
+    Tevap-loading helpers pass ``max_depth_k=TEVAP_HOLD_MAX_K`` so they
+    never chase and never walk past one park step.
     """
     zid = zone.zone_id
     cap = _compressing_hold_k(zone)
+    if max_depth_k is not None:
+        cap = min(cap, max(0.0, float(max_depth_k)))
     current = state.zone_head_depth_k.get(zid)
     last = state.zone_last_cmd.get(zid, 0.0)
     ref = state.zone_park_ref.get(zid)
+    if current is not None and max_depth_k is not None:
+        current = min(max(current, 0.0), cap)
     if current is None:
         if zone.temp is not None:
             state.zone_park_ref[zid] = zone.temp
@@ -452,7 +627,7 @@ def _helper_walk_depth(
     if not _helper_still_compressing(zone, current) and current > 0.0:
         stepped = max(current - DEPTH_STEP_K, 0.0)
     elif current < DEPTH_STEP_K - 1e-9 and _helper_still_compressing(zone, DEPTH_STEP_K):
-        stepped = DEPTH_STEP_K
+        stepped = min(DEPTH_STEP_K, cap)
     elif stable and not too_fast:
         stepped = current
     elif _helper_still_compressing(zone, nxt):
@@ -1618,6 +1793,9 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         diag["cop_band_widen_k"] = widen_k
         diag["cop_timing"] = cop_timing
 
+    if _apply_quiet_night_bands(zones, bands, s, snap, mode):
+        diag["bands"] = {z: bands[z] for z in bands}
+
     # Plant compression clock (min_on keys off this, not zone_since).
     _update_plant_compress(state, snap)
     plant_min_on = _plant_min_on_active(state, snap, s)
@@ -1772,11 +1950,84 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         energy_save=energy_save,
     )
 
+    # Tevap-loading: extra coils for evaporator area while a sibling is in
+    # demand or residual hold. Quiet-night already stripped sleepers; no
+    # extra hour gate. Far-edge and free-ride do not disqualify.
+    tevap_ids: set[str] = set()
+    if state.tevap_blocked:
+        still_over = False
+        for zone in zones:
+            blo, bhi = comfort.zone_band(
+                s, centers[zone.zone_id], zone.occupied, snap.house_occupied
+            )
+            if _unintentional_overshoot(zone, mode, blo, bhi, timing=cop_timing, widen_k=widen_k):
+                still_over = True
+                break
+        if not still_over:
+            state.tevap_blocked = False
+    if not state.tevap_blocked and state.tevap_active:
+        for zone in zones:
+            if zone.zone_id not in state.tevap_active:
+                continue
+            blo, bhi = comfort.zone_band(
+                s, centers[zone.zone_id], zone.occupied, snap.house_occupied
+            )
+            if _unintentional_overshoot(zone, mode, blo, bhi, timing=cop_timing, widen_k=widen_k):
+                state.tevap_blocked = True
+                break
+    live_demand_now = [z for z in demand if z.zone_id not in state.shed]
+    sibling_loaded = _tevap_sibling_loaded(live_demand_now, pack_ids, helpers, zones, state)
+    if sibling_loaded:
+        residual_ids = _residual_hold_ids(zones, state)
+        taken = (
+            {z.zone_id for z in demand}
+            | {z.zone_id for z in helpers}
+            | pack_ids
+            | residual_ids
+            | set(state.shed)
+        )
+        quiet_now = {
+            z.zone_id for z in zones if _quiet_night_active(s, z.zone_id, snap.local_hour, mode)
+        } | set(quiet_deferred)
+        loaded = (
+            {z.zone_id for z in live_demand_now}
+            | {z.zone_id for z in helpers}
+            | pack_ids
+            | residual_ids
+        )
+        n_now = _zone_head_count(zones, loaded)
+        tevap = _pick_tevap_helpers(
+            zones,
+            taken,
+            n_now,
+            snap,
+            state,
+            s,
+            mode,
+            bands,
+            centers,
+            quiet_ids=quiet_now,
+            timing=cop_timing,
+            widen_k=widen_k,
+            energy_save=energy_save,
+            energy_wait=energy_wait,
+        )
+        if tevap:
+            helpers.extend(tevap)
+            helper_ids = {z.zone_id for z in helpers}
+            tevap_ids = {z.zone_id for z in tevap}
+            diag["tevap_gate"] = True
+        elif not state.tevap_blocked and not energy_save and not energy_wait:
+            diag["tevap_gate"] = False
+    state.tevap_active = set(tevap_ids)
+
     diag["demand"] = sorted(demand_ids)
     diag["helpers"] = sorted(helper_ids)
     diag["quiet_night_deferred"] = sorted(quiet_deferred)
     diag["n_heads"] = sum(z.n_rooms for z in demand) + sum(z.n_rooms for z in helpers)
     diag["spread_prior"] = diag.get("cop_n_source") == "prior" and bool(helpers)
+    diag["tevap_helpers"] = sorted(tevap_ids)
+    diag["tevap_blocked"] = state.tevap_blocked
     if quiet_cover_id:
         diag["quiet_cover_extended"] = quiet_cover_id
     if pack_ids:
@@ -1784,7 +2035,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
 
     want_on = {z.zone_id: (z.zone_id in demand_ids or z.zone_id in helper_ids) for z in zones}
     for zid in free_riders:
-        want_on[zid] = False
+        if zid not in helper_ids and zid not in demand_ids:
+            want_on[zid] = False
 
     # Plant min_on handoff: while the compressor still owes runtime, a zone
     # that is satisfied may recruit another head only when that zone's
@@ -1977,12 +2229,15 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         helpers = [z for z in helpers if z.zone_id not in shed_ids]
         demand_ids = {z.zone_id for z in demand}
         helper_ids = {z.zone_id for z in helpers}
+        tevap_ids -= shed_ids
         pack_ids -= shed_ids
         for zid in shed_ids:
             want_on[zid] = False
         diag["demand"] = sorted(demand_ids)
         diag["helpers"] = sorted(helper_ids)
         diag["n_heads"] = sum(z.n_rooms for z in demand) + sum(z.n_rooms for z in helpers)
+        diag["tevap_helpers"] = sorted(tevap_ids)
+        state.tevap_active = set(tevap_ids)
         if pack_ids:
             diag["pack_stay"] = sorted(pack_ids)
         elif "pack_stay" in diag:
@@ -2000,6 +2255,18 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
         walking = [zid for zid, flag in overshoot_walk.items() if flag]
         if walking:
             diag["depth_overshoot_walk"] = walking
+        if tevap_ids and any(overshoot_walk.get(zid) for zid in tevap_ids):
+            state.tevap_blocked = True
+            helpers = [z for z in helpers if z.zone_id not in tevap_ids]
+            helper_ids = {z.zone_id for z in helpers}
+            for zid in tevap_ids:
+                want_on[zid] = False
+            tevap_ids = set()
+            diag["helpers"] = sorted(helper_ids)
+            diag["n_heads"] = sum(z.n_rooms for z in demand) + sum(z.n_rooms for z in helpers)
+            diag["tevap_helpers"] = []
+            diag["tevap_blocked"] = True
+            state.tevap_active = set()
 
     # 5. Emit commands with cycling guards.
     for zone in zones:
@@ -2478,7 +2745,10 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 # park steps: 21 → 21.5 → 22 … while still compressing.
                 reason = "helper"
                 helper_prev_d = state.zone_head_depth_k.get(zid, 0.0)
-                helper_depth_k = _helper_walk_depth(state, zone, lo, hi, mode, now)
+                tevap_cap = TEVAP_HOLD_MAX_K if zid in tevap_ids else None
+                helper_depth_k = _helper_walk_depth(
+                    state, zone, lo, hi, mode, now, max_depth_k=tevap_cap
+                )
                 prev_d = helper_prev_d
                 hold = quantize_setpoint(zone.temp) if zone.temp is not None else center
                 hold = min(max(hold, lo), hi)
@@ -2531,6 +2801,8 @@ def tick(snap: HouseSnapshot, state: ControllerState) -> Decision:
                 leftover = state.zone_head_depth_k.get(zid)
                 if reason == "helper" and not condition_hold and helper_depth_k is not None:
                     cap = _compressing_hold_k(zone)
+                    if zid in tevap_ids:
+                        cap = min(cap, TEVAP_HOLD_MAX_K)
                     floor = 0.0
                     ceiling = min(_overshoot_ceiling_k(zone, state, helper_depth_k, walk=walk), cap)
                     depth_k = _sync_depth_views(

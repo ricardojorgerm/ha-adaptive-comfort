@@ -273,6 +273,9 @@ class HouseSnapshot:
     # threshold — plant-level min_on keys off these, not per-zone timers.
     p_ac: float | None = None
     compression_floor_w: float = 75.0
+    # 24 h compressor start rate (StartCounter.per_hour). Tevap-loading
+    # helpers roll back above TEVAP_STARTS_MAX.
+    starts_per_hour: float | None = None
 
 
 @dataclass
@@ -364,6 +367,10 @@ class ControllerState:
     # Mode that engaged the widen (heat/cool); held across ticks so a false
     # opposite-mode flip cannot restretch the wrong edge while recovering.
     cop_widen_mode: str | None = None
+    # Tevap-loading helpers: latched off after an overshoot until rooms
+    # recover inside the unwidened far-edge buffer.
+    tevap_blocked: bool = False
+    tevap_active: set[str] = field(default_factory=set)
 
     def to_dict(self) -> dict:
         return {
@@ -395,6 +402,8 @@ class ControllerState:
             "cop_widen_k": self.cop_widen_k,
             "cop_timing": self.cop_timing,
             "cop_widen_mode": self.cop_widen_mode,
+            "tevap_blocked": self.tevap_blocked,
+            "tevap_active": sorted(self.tevap_active),
             "override_mode": self.override_mode,
             "override_since": self.override_since,
             "sibling_sustain": {
@@ -462,6 +471,8 @@ class ControllerState:
         st.cop_widen_mode = str(wmode) if wmode in (MODE_HEAT, MODE_COOL) else None
         if st.cop_widen_k <= 0.0 or st.cop_timing == "none":
             st.cop_widen_mode = None
+        st.tevap_blocked = bool(data.get("tevap_blocked", False))
+        st.tevap_active = {str(z) for z in data.get("tevap_active", [])}
         omode = data.get("override_mode")
         st.override_mode = str(omode) if omode in (MODE_HEAT, MODE_COOL) else None
         try:

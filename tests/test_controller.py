@@ -295,6 +295,47 @@ def test_quiet_night_solo_zone_still_runs():
     assert by_zone["bed"].hvac_mode == MODE_COOL
 
 
+def test_quiet_night_widens_sleeper_band_only():
+    settings = Settings(hvac_mode=MODE_COOL, zone_quiet_night={"bed": True}, adaptive_blend=0.0)
+    bed = make_zone("bed", 22.8, occupied=True)
+    east = make_zone("east", 22.6, occupied=True)
+    snap = make_snapshot([bed, east], settings, local_hour=23.0)
+    state = warmed_state([bed, east])
+    decision = controller.tick(snap, state)
+    blo, bhi = decision.diag["bands"]["bed"]
+    elo, ehi = decision.diag["bands"]["east"]
+    extra = controller.QUIET_NIGHT_WIDEN_K
+    assert abs(bhi - (ehi + extra)) < 1e-9
+    assert abs(blo - (elo - extra)) < 1e-9
+
+
+def test_quiet_night_band_unchanged_by_day_and_bank():
+    settings = Settings(hvac_mode=MODE_COOL, zone_quiet_night={"bed": True}, adaptive_blend=0.0)
+    bed = make_zone("bed", 22.8, occupied=True)
+    east = make_zone("east", 22.6, occupied=True)
+    for hour in (14.0, 20.5):
+        snap = make_snapshot([bed, east], settings, local_hour=hour)
+        state = warmed_state([bed, east])
+        decision = controller.tick(snap, state)
+        blo, bhi = decision.diag["bands"]["bed"]
+        elo, ehi = decision.diag["bands"]["east"]
+        assert abs(blo - elo) < 1e-9
+        assert abs(bhi - ehi) < 1e-9
+
+
+def test_quiet_night_nick_inside_widened_band_is_not_oob():
+    """23.4 is past tight hi 23.2 but inside quiet hi 23.7 — not OOB demand."""
+    settings = Settings(hvac_mode=MODE_COOL, zone_quiet_night={"bed": True}, adaptive_blend=0.0)
+    bed = make_zone("bed", 23.4, occupied=True, free_float=[23.4] * 24)
+    east = make_zone("east", 22.6, occupied=True)
+    snap = make_snapshot([bed, east], settings, local_hour=23.0)
+    state = warmed_state([bed, east])
+    decision = controller.tick(snap, state)
+    _lo, hi = decision.diag["bands"]["bed"]
+    assert hi >= 23.4
+    assert "bed" not in decision.diag.get("demand", [])
+
+
 def test_coordination_disabled_runs_demand_only():
     settings = Settings(hvac_mode=MODE_AUTO, coordination=False)
     hot = make_zone("hot", 25.0)
@@ -1139,3 +1180,179 @@ def test_want_tokens_match_sensor_enum():
     state = warmed_state([hot, ok])
     decision = controller.tick(snap, state)
     assert set(decision.diag["want"].values()) <= allowed
+
+
+TEVAP_COP = {1: 1.3, 2: 2.5, 3: 2.8}
+
+
+def test_tevap_recruits_at_floor_when_banded_cop_wins():
+    hot = make_zone("hot", 25.0)
+    edge = make_zone("edge", 21.7)
+    snap = make_snapshot([hot, edge], cop_by_head_count_banded=TEVAP_COP)
+    state = warmed_state([hot, edge])
+    decision = controller.tick(snap, state)
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert by_zone["edge"].hvac_mode == MODE_COOL
+    assert by_zone["edge"].reason == "helper"
+    assert by_zone["edge"].head_depth_k == 0.0
+    assert "edge" in decision.diag.get("tevap_helpers", [])
+    assert decision.diag["want"]["edge"] == "helper"
+
+
+def test_tevap_skips_at_floor_without_cop_gate():
+    hot = make_zone("hot", 25.0)
+    edge = make_zone("edge", 21.7)
+    snap = make_snapshot([hot, edge], cop_by_head_count_banded={1: 2.0, 2: 2.1})
+    state = warmed_state([hot, edge])
+    decision = controller.tick(snap, state)
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert "edge" not in by_zone
+    assert "edge" not in decision.diag.get("tevap_helpers", [])
+
+
+def test_tevap_adds_all_when_n_plus_key_beats_base():
+    """3-head COP vs 1-head is enough even if the 2-head key is missing."""
+    hot = make_zone("hot", 25.0)
+    a = make_zone("a", 21.7)
+    b = make_zone("b", 21.8)
+    snap = make_snapshot([hot, a, b], cop_by_head_count_banded={1: 1.3, 3: 2.8})
+    state = warmed_state([hot, a, b])
+    decision = controller.tick(snap, state)
+    assert set(decision.diag.get("tevap_helpers", [])) == {"a", "b"}
+
+
+def test_tevap_recruits_free_rider():
+    lead = make_zone("east", 25.0, is_on=True, standing_load_w=100.0)
+    rider = make_zone(
+        "west",
+        23.0,
+        is_on=False,
+        standing_load_w=40.0,
+        mixing_gain_w=-80.0,
+        free_float=[23.0, 23.6, 24.0] + [24.2] * 21,
+        pred_60m=23.6,
+    )
+    settings = Settings(hvac_mode=MODE_COOL)
+    snap = make_snapshot([lead, rider], settings, cop_by_head_count_banded=TEVAP_COP)
+    state = warmed_state([lead, rider])
+    state.zone_since["east"] = NOW - 3600.0
+    state.zone_on["east"] = True
+    decision = controller.tick(snap, state)
+    assert "west" in decision.diag.get("tevap_helpers", [])
+    assert decision.diag["want"]["west"] == "helper"
+
+
+def test_tevap_quiet_night_wins_at_night():
+    settings = Settings(hvac_mode=MODE_COOL, zone_quiet_night={"bed": True})
+    hot = make_zone("hot", 25.0)
+    bed = make_zone("bed", 21.7)
+    snap = make_snapshot([hot, bed], settings, local_hour=23.0, cop_by_head_count_banded=TEVAP_COP)
+    state = warmed_state([hot, bed])
+    decision = controller.tick(snap, state)
+    assert "bed" not in decision.diag.get("tevap_helpers", [])
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert "bed" not in by_zone or by_zone["bed"].hvac_mode == MODE_OFF
+
+
+def test_tevap_quiet_night_option_does_not_block_by_day():
+    settings = Settings(hvac_mode=MODE_COOL, zone_quiet_night={"bed": True})
+    hot = make_zone("hot", 25.0)
+    bed = make_zone("bed", 21.7)
+    snap = make_snapshot([hot, bed], settings, local_hour=14.0, cop_by_head_count_banded=TEVAP_COP)
+    state = warmed_state([hot, bed])
+    decision = controller.tick(snap, state)
+    assert "bed" in decision.diag.get("tevap_helpers", [])
+
+
+def test_tevap_night_without_quiet_night_still_recruits():
+    hot = make_zone("hot", 25.0)
+    edge = make_zone("edge", 21.7)
+    snap = make_snapshot([hot, edge], local_hour=23.0, cop_by_head_count_banded=TEVAP_COP)
+    state = warmed_state([hot, edge])
+    decision = controller.tick(snap, state)
+    assert "edge" in decision.diag.get("tevap_helpers", [])
+
+
+def test_tevap_residual_hold_recruits_off_coil():
+    settings = Settings(hvac_mode=MODE_COOL)
+    hold = make_zone(
+        "hold",
+        22.5,
+        is_on=True,
+        park_residuals=True,
+        park_extraction_w=120.0,
+        standing_load_w=80.0,
+    )
+    edge = make_zone("edge", 21.7)
+    snap = make_snapshot([hold, edge], settings, cop_by_head_count_banded=TEVAP_COP)
+    state = warmed_state([hold, edge])
+    state.mode = MODE_COOL
+    state.zone_parked_since["hold"] = NOW - 700.0
+    state.zone_on["hold"] = True
+    decision = controller.tick(snap, state)
+    assert "edge" in decision.diag.get("tevap_helpers", [])
+
+
+def test_tevap_releases_when_sibling_demand_ends():
+    hot = make_zone("hot", 25.0)
+    edge = make_zone("edge", 21.7)
+    snap = make_snapshot([hot, edge], cop_by_head_count_banded=TEVAP_COP)
+    state = warmed_state([hot, edge])
+    decision = controller.tick(snap, state)
+    assert "edge" in decision.diag.get("tevap_helpers", [])
+    satisfied = make_zone("hot", 22.5)
+    still_edge = make_zone("edge", 21.7, is_on=True)
+    snap2 = make_snapshot([satisfied, still_edge], cop_by_head_count_banded=TEVAP_COP)
+    decision = controller.tick(snap2, decision.state)
+    assert "edge" not in decision.diag.get("tevap_helpers", [])
+    assert decision.diag["want"].get("edge") != "helper"
+
+
+def test_tevap_hold_caps_at_half_k_never_chase():
+    hot = make_zone("hot", 25.0)
+    edge = make_zone("edge", 21.7)
+    snap = make_snapshot([hot, edge], cop_by_head_count_banded=TEVAP_COP)
+    state = warmed_state([hot, edge])
+    decision = controller.tick(snap, state)
+    cmd = {c.zone_id: c for c in decision.commands}["edge"]
+    assert cmd.head_depth_k == 0.0
+    edge_on = make_zone("edge", 21.7, is_on=True)
+    snap2 = make_snapshot(
+        [hot, edge_on], now=NOW + controller.COMMAND_SPACING_S, cop_by_head_count_banded=TEVAP_COP
+    )
+    decision = controller.tick(snap2, decision.state)
+    cmd2 = {c.zone_id: c for c in decision.commands}["edge"]
+    assert cmd2.head_depth_k == 0.5
+    snap3 = make_snapshot(
+        [hot, edge_on],
+        now=NOW + 2 * controller.COMMAND_SPACING_S,
+        cop_by_head_count_banded=TEVAP_COP,
+    )
+    decision = controller.tick(snap3, decision.state)
+    assert decision.state.zone_head_depth_k["edge"] == 0.5
+    assert decision.state.zone_head_depth_k["edge"] >= 0.0
+
+
+def test_tevap_rollback_on_overshoot():
+    hot = make_zone("hot", 25.0)
+    edge = make_zone("edge", 21.7)
+    snap = make_snapshot([hot, edge], cop_by_head_count_banded=TEVAP_COP)
+    state = warmed_state([hot, edge])
+    decision = controller.tick(snap, state)
+    assert "edge" in decision.diag.get("tevap_helpers", [])
+    over = make_zone("edge", 21.0, is_on=True)
+    snap2 = make_snapshot([hot, over], cop_by_head_count_banded=TEVAP_COP)
+    decision = controller.tick(snap2, decision.state)
+    assert decision.state.tevap_blocked is True
+    assert "edge" not in decision.diag.get("tevap_helpers", [])
+
+
+def test_tevap_rollback_on_high_starts():
+    hot = make_zone("hot", 25.0)
+    edge = make_zone("edge", 21.7)
+    snap = make_snapshot([hot, edge], cop_by_head_count_banded=TEVAP_COP, starts_per_hour=2.0)
+    state = warmed_state([hot, edge])
+    decision = controller.tick(snap, state)
+    assert "edge" not in decision.diag.get("tevap_helpers", [])
+    by_zone = {c.zone_id: c for c in decision.commands}
+    assert "edge" not in by_zone

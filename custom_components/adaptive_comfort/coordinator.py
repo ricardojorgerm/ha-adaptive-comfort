@@ -1928,6 +1928,7 @@ class AdaptiveComfortRuntime:
                 [z for z in self.zones.values() if z.is_on],
                 {zid for zid, since in self.controller_state.zone_parked_since.items() if since},
             ),
+            starts_per_hour=self.starts.per_hour(now_ts),
         )
 
     def _record_predictions(

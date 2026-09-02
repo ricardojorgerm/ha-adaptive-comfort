@@ -164,6 +164,11 @@ def test_controller_state_persists_restart_fields():
     assert restored.window_suggest_out_since["a"] == 60.0
     assert restored.override_mode == MODE_HEAT
     assert restored.override_since == 999.0
+    st.tevap_blocked = True
+    st.tevap_active = {"edge"}
+    restored = ControllerState.from_dict(st.to_dict())
+    assert restored.tevap_blocked is True
+    assert restored.tevap_active == {"edge"}
 
 
 def test_process_power_events_drops_concurrent_same_ts():

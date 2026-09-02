@@ -90,6 +90,12 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   Cold-start / thin tables: pack extra in-band coils (occupancy-blind, including
   past center toward the far edge) so a burst is not a solo cold coil. Learned
   banded `cop(N_demand) > cop(N_spread) × COP_TABLE_ADVANTAGE` consolidates.
+  **Tevap-loading helpers** recruit off, in-band coils (including at-floor and
+  free-ride) while a sibling is in demand or residual hold, commanded at
+  zero-hold / +0.5 K never a chase, released when that sibling load ends.
+  Quiet-night still wins; Eco/Away skip. Gate: live-band
+  `cop(N+k) ≥ cop(N) × COP_TEVAP_ADVANTAGE` (1.15); rollback if a Tevap helper
+  overshoots or `starts_per_hour > 1.5`.
   None-preset demand holds the **reactive** band edge (cool: warm / higher Tevap;
   heat: cold); `cop_by_depth` may raise the in-band chase cap. After demand rooms
   return in-band, N≥2 already-on coils residual-park together (`pack_stay`) rather
@@ -241,15 +247,17 @@ If you find yourself importing `homeassistant.*` inside `core/`, you are in the 
   stack; presence Away replaces Eco; vacant +1.5 K does not stack on Away.
   Edges clamp into `target ± (band_k + 3)` (18.8–26.2 at defaults).
   **Quiet night** (`zone_quiet_night`, per zone, default off): 22:00–08:00,
-  heat or cool, **None only** (Boost skips; Eco/Away skip this). Other rooms cover
-  first and may chase the extended far edge (vacant-widen slack on the
+  heat or cool, **None only** (Boost skips; Eco/Away skip this). The sleeper's
+  band grows by `QUIET_NIGHT_WIDEN_K` (0.5 K extra half-band, center fixed) —
+  missing-coil slack, not a cover-room change. Other rooms cover first and may
+  chase the extended far edge (vacant-widen slack on the
   conditioning side); recruit the sleeper after that (or `OVERRIDE_DELTA_K`),
   then keep the pack. This zone is not selected as helper / fan-assist /
-  preferred anchor until cover is spent. Out-of-band demand still uses the
-  same comfort band as other rooms.
+  preferred anchor until cover is spent. Pre-sleep bank still uses the
+  unwidened conditioning hold edge.
   In-band standing load may be carried by another zone (vacant cover allowed).
   Two hours before night (`QUIET_NIGHT_BANK_H`), this zone may run to the
-  **conditioning hold edge** of that band (cool: `lo + BAND_HOLD_MARGIN_K`;
+  **conditioning hold edge** of the unwidened band (cool: `lo + BAND_HOLD_MARGIN_K`;
   heat: `hi − BAND_HOLD_MARGIN_K`) so mix can hold overnight. Boost
   center-seeks and skips quiet-night. Mirrored heads all defer — no office-only
   command.
